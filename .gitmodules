@@ -1,0 +1,3 @@
+[submodule "pioasm"]
+	path = pioasm
+	url = https://github.com/dominicpoeschko/pioasm.git
