@@ -32,7 +32,6 @@ namespace Kvasir { namespace UART {
     namespace Detail {
 
         // Use chip-agnostic pin configuration
-        constexpr auto DefaultChip = PinConfig::ChipVariant::RP2040;   // TODO: Make configurable
 
         static constexpr double calcf_Baud(std::uint32_t f_clockSpeed,
                                            std::uint32_t divint,
@@ -90,10 +89,10 @@ namespace Kvasir { namespace UART {
                      int Pin>
             static constexpr bool isValidPinLocationCTS(Kvasir::Register::PinLocation<Port,
                                                                                       Pin>) {
-                return Instance == 0 ? PinConfig::isValidUartPin<DefaultChip, Instance>(
+                return Instance == 0 ? PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Cts0)
-                                     : PinConfig::isValidUartPin<DefaultChip, Instance>(
+                                     : PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Cts1);
             }
@@ -104,10 +103,10 @@ namespace Kvasir { namespace UART {
                      int Pin>
             static constexpr bool isValidPinLocationRTS(Kvasir::Register::PinLocation<Port,
                                                                                       Pin>) {
-                return Instance == 0 ? PinConfig::isValidUartPin<DefaultChip, Instance>(
+                return Instance == 0 ? PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Rts0)
-                                     : PinConfig::isValidUartPin<DefaultChip, Instance>(
+                                     : PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Rts1);
             }
@@ -118,10 +117,10 @@ namespace Kvasir { namespace UART {
                      int Pin>
             static constexpr bool isValidPinLocationRX(Kvasir::Register::PinLocation<Port,
                                                                                      Pin>) {
-                return Instance == 0 ? PinConfig::isValidUartPin<DefaultChip, Instance>(
+                return Instance == 0 ? PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Rx0)
-                                     : PinConfig::isValidUartPin<DefaultChip, Instance>(
+                                     : PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Rx1);
             }
@@ -132,10 +131,10 @@ namespace Kvasir { namespace UART {
                      int Pin>
             static constexpr bool isValidPinLocationTX(Kvasir::Register::PinLocation<Port,
                                                                                      Pin>) {
-                return Instance == 0 ? PinConfig::isValidUartPin<DefaultChip, Instance>(
+                return Instance == 0 ? PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Tx0)
-                                     : PinConfig::isValidUartPin<DefaultChip, Instance>(
+                                     : PinConfig::isValidUartPin<PinConfig::CurrentChip, Instance>(
                                          Pin,
                                          PinConfig::UartPinType::Tx1);
             }
