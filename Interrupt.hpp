@@ -53,7 +53,11 @@ struct InterruptImpl<PinConfig::ChipVariant::RP2040> : CoreInterrupts {
           = {nonMaskableInt.index(), sVCall.index(), hardFault.index()};
         static constexpr std::array noSetPriority = {nonMaskableInt.index(), hardFault.index()};
 
-        using FaultInterruptIndexs           = brigand::list<decltype(hardFault), decltype(memoryManagement), decltype(busFault), decltype(usageFault), decltype(secureFault)>;
+        using FaultInterruptIndexs           = brigand::list<decltype(hardFault),
+                                                             decltype(memoryManagement),
+                                                             decltype(busFault),
+                                                             decltype(usageFault),
+                                                             decltype(secureFault)>;
         using FaultInterruptIndexsNeedEnable = brigand::list<>;
     };
 };
@@ -127,7 +131,11 @@ struct InterruptImpl<PinConfig::ChipVariant::RP2350A> : CoreInterrupts {
           = {nonMaskableInt.index(), sVCall.index(), hardFault.index()};
         static constexpr std::array noSetPriority = {nonMaskableInt.index(), hardFault.index()};
 
-        using FaultInterruptIndexs           = brigand::list<decltype(hardFault), decltype(memoryManagement), decltype(busFault), decltype(usageFault), decltype(secureFault)>;
+        using FaultInterruptIndexs           = brigand::list<decltype(hardFault),
+                                                             decltype(memoryManagement),
+                                                             decltype(busFault),
+                                                             decltype(usageFault),
+                                                             decltype(secureFault)>;
         using FaultInterruptIndexsNeedEnable = brigand::list<>;
     };
 };

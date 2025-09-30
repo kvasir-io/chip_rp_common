@@ -75,16 +75,16 @@ namespace Kvasir { namespace USB {
         enum class Recipient : std::uint8_t { device, interface, endpoint, other };
 
         enum class Request : std::uint8_t {
-            getStatus     = 0,
-            clearFeature  = 1,
-            setFeature    = 3,
-            setAddress    = 5,
-            getDescriptor = 6,
-            setDescriptor,
-            getConfiguration,
-            setConfiguration,
-            getInterface,
-            setInterface,
+            getStatus           = 0,
+            clearFeature        = 1,
+            setFeature          = 3,
+            setAddress          = 5,
+            getDescriptor       = 6,
+            setDescriptor       = 7,
+            getConfiguration    = 8,
+            setConfiguration    = 9,
+            getInterface        = 10,
+            setInterface        = 11,
             setLineCoding       = 0x20,
             getLineCoding       = 0x21,
             setControlLineState = 0x22
@@ -474,7 +474,7 @@ namespace Kvasir { namespace USB {
               }()} {}
         };
 
-        RuntimeDescriptorStringImpl const get() const { return RuntimeDescriptorStringImpl{f()}; }
+        RuntimeDescriptorStringImpl get() const { return RuntimeDescriptorStringImpl{f()}; }
     };
 
     template<typename F>
@@ -681,17 +681,17 @@ namespace Kvasir { namespace USB {
                 std::uint32_t buffers
                   = *reinterpret_cast<std::uint32_t volatile*>(Regs::BUFF_STATUS::Addr::value);
                 std::uint32_t remaining_buffers = buffers;
-                std::size_t   bit               = 1u;
+                std::size_t   bit               = 1U;
                 for(std::size_t i = 0; remaining_buffers && i < 16 * 2; i++) {
                     if(remaining_buffers & bit) {
                         // clear this in advance
                         *reinterpret_cast<std::uint32_t volatile*>(Regs::BUFF_STATUS::Addr::value)
                           = bit;
                         // IN transfer for even i, OUT transfer for odd i
-                        handleBufferDone(i >> 1u, !(i & 1u));
+                        handleBufferDone(i >> 1U, !(i & 1U));
                         remaining_buffers &= ~bit;
                     }
-                    bit <<= 1u;
+                    bit <<= 1U;
                 }
             }
 
@@ -1028,9 +1028,7 @@ namespace Kvasir { namespace USB {
 
         static void ConfiguredCallback() { recv(); }
 
-        static void ep0HandlerOut() {
-                UC_LOG_D("unexpected EP0 OUT");
-        }
+        static void ep0HandlerOut() { UC_LOG_D("unexpected EP0 OUT"); }
 
         static void ep2OUTHandler() {
             UC_LOG_D("got data");
@@ -1423,4 +1421,3 @@ namespace Kvasir { namespace USB {
         }
     };
 }}   // namespace Kvasir::USB
-

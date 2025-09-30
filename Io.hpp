@@ -33,20 +33,22 @@ namespace Kvasir { namespace Io {
     template<int Port,
              int Pin>
     constexpr bool isValidPinLocation() {
-        if(!(Port < PinLocationTraits<PinConfig::CurrentChip>::portEnd
-             && Port >= PinLocationTraits<PinConfig::CurrentChip>::portBegin))
+        if(Port >= PinLocationTraits<PinConfig::CurrentChip>::portEnd
+           || Port < PinLocationTraits<PinConfig::CurrentChip>::portBegin)
         {
             return false;
         }
 
-        if(!(Pin < PinLocationTraits<PinConfig::CurrentChip>::pinEnd
-             && Pin >= PinLocationTraits<PinConfig::CurrentChip>::pinBegin))
+        if(Pin >= PinLocationTraits<PinConfig::CurrentChip>::pinEnd
+           || Pin < PinLocationTraits<PinConfig::CurrentChip>::pinBegin)
         {
             return false;
         }
 
         // Use unified pin configuration for validation
-        if(Pin < 0 || Pin >= static_cast<int>(PinConfig::ChipTraits<PinConfig::CurrentChip>::pinCount)) {
+        if(Pin < 0
+           || Pin >= static_cast<int>(PinConfig::ChipTraits<PinConfig::CurrentChip>::pinCount))
+        {
             return false;
         }
 

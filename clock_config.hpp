@@ -33,15 +33,11 @@ namespace Kvasir { namespace DefaultClockSettings {
             constexpr std::uint32_t postdiv_min = 1;
 
             // Calculate REFDIV range based on minimum reference frequency constraint
-            std::uint32_t refdiv_range_max = static_cast<std::uint32_t>(crystalSpeed / ref_min);
-            if(refdiv_range_max > refdiv_max) {
-                refdiv_range_max = refdiv_max;
-            }
-            if(refdiv_range_max < refdiv_min) {
-                refdiv_range_max = refdiv_min;
-            }
+            auto refdiv_range_max = static_cast<std::uint32_t>(crystalSpeed / ref_min);
+            refdiv_range_max      = std::min(refdiv_range_max, refdiv_max);
+            refdiv_range_max      = std::max(refdiv_range_max, refdiv_min);
 
-            PllSettings bestSettings{0, 0, 0, 0};
+            PllSettings bestSettings{.fbdiv = 0, .pd1 = 0, .pd2 = 0, .refdiv = 0};
             double      bestMargin = clockSpeed;
             double      bestVco    = 0.0;
 
@@ -62,7 +58,10 @@ namespace Kvasir { namespace DefaultClockSettings {
                     for(std::uint32_t pd2 = postdiv_min; pd2 <= postdiv_max; ++pd2) {
                         for(std::uint32_t pd1 = postdiv_min; pd1 <= postdiv_max; ++pd1) {
                             // Check for integer frequency ratios (from vcocalc.py line 50)
-                            if(static_cast<std::uint64_t>(vco * 1000) % (pd1 * pd2) != 0) {
+                            if(static_cast<std::uint64_t>(vco * 1000)
+                                 % static_cast<std::uint64_t>(pd1 * pd2)
+                               != 0)
+                            {
                                 continue;
                             }
 
@@ -79,7 +78,10 @@ namespace Kvasir { namespace DefaultClockSettings {
                                                   && (margin - bestMargin) > -tolerance;
 
                             if(margin < bestMargin || (marginEqual && vcoIsBetter)) {
-                                bestSettings = PllSettings{fbdiv, pd1, pd2, refdiv};
+                                bestSettings = PllSettings{.fbdiv  = fbdiv,
+                                                           .pd1    = pd1,
+                                                           .pd2    = pd2,
+                                                           .refdiv = refdiv};
                                 bestMargin   = margin;
                                 bestVco      = vco;
                             }
@@ -122,9 +124,15 @@ namespace Kvasir { namespace DefaultClockSettings {
         constexpr std::uint32_t calculated_clkdiv
           = (ClockSpeed + max_flash_freq - 1) / max_flash_freq;
 
-        constexpr std::uint32_t clkdiv = calculated_clkdiv < min_clkdiv ? min_clkdiv
-                                       : calculated_clkdiv > max_clkdiv ? max_clkdiv
-                                                                        : calculated_clkdiv;
+        constexpr std::uint32_t clkdiv = [&]() {
+            if(calculated_clkdiv < min_clkdiv) {
+                return min_clkdiv;
+            }
+            if(calculated_clkdiv > max_clkdiv) {
+                return max_clkdiv;
+            }
+            return calculated_clkdiv;
+        }();
 
         constexpr std::uint32_t flash_freq = ClockSpeed / clkdiv;
         static_assert(flash_freq <= max_flash_freq,
@@ -149,23 +157,6 @@ namespace Kvasir { namespace DefaultClockSettings {
                                              write(QMI::M0_RFMT::SUFFIX_WIDTHValC::q),
                                              write(QMI::M0_RFMT::ADDR_WIDTHValC::q),
                                              write(QMI::M0_RFMT::PREFIX_WIDTHValC::s)));
-#if 0   //does not work need to find out why
-        apply(QMI::M0_RCMD::overrideDefaults(
-          write(QMI::M0_RCMD::prefix, value<std::uint32_t, 0xEB>()),
-          write(QMI::M0_RCMD::suffix, value<std::uint32_t, 0xA0>())));
-
-        asm volatile("ldrb %0, [%0]" ::"r"(0x14000000) : "memory");
-
-        apply(QMI::M0_RFMT::overrideDefaults(write(QMI::M0_RFMT::dtr, value<std::uint32_t, 0>()),
-                                             write(QMI::M0_RFMT::DUMMY_LENValC::_16),
-                                             write(QMI::M0_RFMT::SUFFIX_LENValC::_8),
-                                             write(QMI::M0_RFMT::PREFIX_LENValC::none),
-                                             write(QMI::M0_RFMT::DATA_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::DUMMY_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::SUFFIX_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::ADDR_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::PREFIX_WIDTHValC::s)));
-#endif
     }
 
     template<auto ClockSpeed,
@@ -289,4 +280,3 @@ namespace Kvasir { namespace DefaultClockSettings {
     void peripheryClockInit() {}
 
 }}   // namespace Kvasir::DefaultClockSettings
-

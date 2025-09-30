@@ -191,17 +191,17 @@ namespace Kvasir { namespace PinConfig {
     constexpr PwmChannelInfo getPwmChannelInfo(int pin) {
         if constexpr(Chip == ChipVariant::RP2040 || Chip == ChipVariant::RP2350A) {
             if(pin >= 30) {
-                return {0, false};
+                return {.channel = 0, .isChannelA = false};
             }
         } else if constexpr(Chip == ChipVariant::RP2350B) {
             if(pin >= 48) {
-                return {0, false};
+                return {.channel = 0, .isChannelA = false};
             }
         }
 
-        std::uint32_t channel    = static_cast<std::uint32_t>((pin % 16) / 2);
-        bool          isChannelA = (pin % 2) == 0;
-        return {channel, isChannelA};
+        auto channel    = static_cast<std::uint32_t>((pin % 16) / 2);
+        bool isChannelA = (pin % 2) == 0;
+        return {.channel = channel, .isChannelA = isChannelA};
     }
 
     template<ChipVariant Chip,
@@ -217,7 +217,8 @@ namespace Kvasir { namespace PinConfig {
             return pinType == expectedType
                 && (expectedType == UartPinType::Tx0 || expectedType == UartPinType::Rx0
                     || expectedType == UartPinType::Cts0 || expectedType == UartPinType::Rts0);
-        } else if(Instance == 1) {
+        }
+        if(Instance == 1) {
             return pinType == expectedType
                 && (expectedType == UartPinType::Tx1 || expectedType == UartPinType::Rx1
                     || expectedType == UartPinType::Cts1 || expectedType == UartPinType::Rts1);
@@ -237,7 +238,8 @@ namespace Kvasir { namespace PinConfig {
         if(Instance == 0) {
             return pinType == expectedType
                 && (expectedType == I2cPinType::Sda0 || expectedType == I2cPinType::Scl0);
-        } else if(Instance == 1) {
+        }
+        if(Instance == 1) {
             return pinType == expectedType
                 && (expectedType == I2cPinType::Sda1 || expectedType == I2cPinType::Scl1);
         }
@@ -257,7 +259,8 @@ namespace Kvasir { namespace PinConfig {
             return pinType == expectedType
                 && (expectedType == SpiPinType::Rx0 || expectedType == SpiPinType::Tx0
                     || expectedType == SpiPinType::Cs0 || expectedType == SpiPinType::Sck0);
-        } else if(Instance == 1) {
+        }
+        if(Instance == 1) {
             return pinType == expectedType
                 && (expectedType == SpiPinType::Rx1 || expectedType == SpiPinType::Tx1
                     || expectedType == SpiPinType::Cs1 || expectedType == SpiPinType::Sck1);

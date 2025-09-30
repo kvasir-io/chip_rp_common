@@ -34,12 +34,12 @@ namespace Kvasir { namespace SPI {
                      int Pin>
             static constexpr bool isValidPinLocationMISO(Kvasir::Register::PinLocation<Port,
                                                                                        Pin>) {
-                return Instance == 0
-                       ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(Pin,
-                                                                         PinConfig::SpiPinType::Rx0)
-                       : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                           Pin,
-                           PinConfig::SpiPinType::Rx1);
+                return Instance == 0 ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
+                                         Pin,
+                                         PinConfig::SpiPinType::Rx0)
+                                     : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
+                                         Pin,
+                                         PinConfig::SpiPinType::Rx1);
             }
 
             static constexpr bool isValidPinLocationMOSI(Io::NotUsed<>) { return true; }
@@ -48,12 +48,12 @@ namespace Kvasir { namespace SPI {
                      int Pin>
             static constexpr bool isValidPinLocationMOSI(Kvasir::Register::PinLocation<Port,
                                                                                        Pin>) {
-                return Instance == 0
-                       ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(Pin,
-                                                                         PinConfig::SpiPinType::Tx0)
-                       : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                           Pin,
-                           PinConfig::SpiPinType::Tx1);
+                return Instance == 0 ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
+                                         Pin,
+                                         PinConfig::SpiPinType::Tx0)
+                                     : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
+                                         Pin,
+                                         PinConfig::SpiPinType::Tx1);
             }
 
             template<int Port,
@@ -74,12 +74,12 @@ namespace Kvasir { namespace SPI {
                      int Pin>
             static constexpr bool isValidPinLocationCS(Kvasir::Register::PinLocation<Port,
                                                                                      Pin>) {
-                return Instance == 0
-                       ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(Pin,
-                                                                         PinConfig::SpiPinType::Cs0)
-                       : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                           Pin,
-                           PinConfig::SpiPinType::Cs1);
+                return Instance == 0 ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
+                                         Pin,
+                                         PinConfig::SpiPinType::Cs0)
+                                     : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
+                                         Pin,
+                                         PinConfig::SpiPinType::Cs1);
             }
 
             template<typename MISOPIN>
