@@ -212,7 +212,7 @@ namespace Kvasir { namespace PinConfig {
             return false;
         }
 
-        auto pinType = UartPinMap<Chip>::pins[pin];
+        auto pinType = UartPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
         if(Instance == 0) {
             return pinType == expectedType
                 && (expectedType == UartPinType::Tx0 || expectedType == UartPinType::Rx0
@@ -234,7 +234,7 @@ namespace Kvasir { namespace PinConfig {
             return false;
         }
 
-        auto pinType = I2cPinMap<Chip>::pins[pin];
+        auto pinType = I2cPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
         if(Instance == 0) {
             return pinType == expectedType
                 && (expectedType == I2cPinType::Sda0 || expectedType == I2cPinType::Scl0);
@@ -254,7 +254,7 @@ namespace Kvasir { namespace PinConfig {
             return false;
         }
 
-        auto pinType = SpiPinMap<Chip>::pins[pin];
+        auto pinType = SpiPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
         if(Instance == 0) {
             return pinType == expectedType
                 && (expectedType == SpiPinType::Rx0 || expectedType == SpiPinType::Tx0

@@ -1119,7 +1119,7 @@ namespace Kvasir { namespace USB {
 
                 if(pkt.bRequest == REQUEST_BOOTSEL) {
                     UC_LOG_D("reboot to bootsel");
-                    // Kvasir::resetToUsbBoot();
+                    Kvasir::resetToUsbBoot();
                 } else if(pkt.bRequest == REQUEST_FLASH) {
                     UC_LOG_D("reboot");
                     apply(Kvasir::SystemControl::SystemReset{});

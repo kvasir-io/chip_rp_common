@@ -16,8 +16,6 @@ namespace Kvasir { namespace I2C {
 
     namespace Detail {
 
-        // Use chip-agnostic pin configuration
-
         template<unsigned Instance>
         struct Config {
             using Regs = Kvasir::Peripheral::I2C::Registers<Instance>;
@@ -63,59 +61,53 @@ namespace Kvasir { namespace I2C {
                                                   Register::PinLocation<Port, Pin>{}));
             };
 
-            /*
-            template<Mode mode>
-            struct GetModeConfig {
-                static constexpr auto config_ = []() {
-                    if constexpr(mode == Mode::_0) {
-                        return brigand::list<
-                          decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<0>())),
-                          decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<0>()))>{};
-                    } else if constexpr(mode == Mode::_1) {
-                        return brigand::list<
-                          decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<0>())),
-                          decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<1>()))>{};
-                    } else if constexpr(mode == Mode::_2) {
-                        return brigand::list<
-                          decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<1>())),
-                          decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<0>()))>{};
-                    } else if constexpr(mode == Mode::_3) {
-                        return brigand::list<
-                          decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<1>())),
-                          decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<1>()))>{};
-                    }
-                }();
-                using config = decltype(config_);
-            };
-*/
-            static constexpr double calcf_Baud(std::uint32_t f_clockSpeed,
-                                               std::uint32_t scr,
-                                               std::uint32_t cpsdvsr) {
-                return (double(f_clockSpeed) / (double(cpsdvsr) * (1.0 + double(scr))));
+            // I2C baud rate calculation helpers
+            static constexpr std::uint32_t calcPeriod(std::uint32_t f_clockSpeed,
+                                                      std::uint32_t f_baud) {
+                return (f_clockSpeed + f_baud / 2) / f_baud;
             }
 
-            static constexpr std::pair<std::uint8_t,
-                                       std::uint8_t>
-            calcBaudRegs(std::uint32_t f_clockSpeed,
-                         std::uint32_t f_baud) {
-                std::pair<std::uint8_t, std::uint8_t> ret{};
-                double                                best = std::numeric_limits<double>::max();
+            static constexpr std::uint32_t calcSpkLen(std::uint32_t lcnt) {
+                return lcnt < 16 ? 1 : lcnt / 16;
+            }
 
-                for(std::uint32_t cpsdvsr = 2; cpsdvsr < 255; cpsdvsr += 2) {
-                    for(std::uint32_t scr = 0; scr < 256; ++scr) {
-                        double f_div     = f_baud - calcf_Baud(f_clockSpeed, scr, cpsdvsr);
-                        double abs_f_div = f_div > 0.0 ? f_div : -f_div;
-                        if(best > abs_f_div) {
-                            best       = abs_f_div;
-                            ret.first  = static_cast<std::uint8_t>(scr);
-                            ret.second = static_cast<std::uint8_t>(cpsdvsr);
-                            if(abs_f_div == 0.0) {
-                                return ret;
-                            }
-                        }
-                    }
+            static constexpr std::uint32_t calcSdaTxHold(std::uint32_t f_clockSpeed,
+                                                         std::uint32_t f_baud) {
+                // Per I2C spec: 300ns hold time for <1MHz, 120ns for >=1MHz
+                if(f_baud < 1000000) {
+                    // 300ns: freq * 3 / 10000000 + 1
+                    return ((f_clockSpeed * 3) / 10000000) + 1;
+                } else {
+                    // 120ns: freq * 3 / 25000000 + 1
+                    return ((f_clockSpeed * 3) / 25000000) + 1;
                 }
-                return ret;
+            }
+
+            struct BaudRegs {
+                std::uint32_t hcnt;
+                std::uint32_t lcnt;
+                std::uint32_t spklen;
+                std::uint32_t sda_hold;
+            };
+
+            static constexpr BaudRegs calcBaudRegs(std::uint32_t f_clockSpeed,
+                                                   std::uint32_t f_baud) {
+                BaudRegs regs{};
+
+                // Calculate period in ic_clk cycles
+                std::uint32_t period = calcPeriod(f_clockSpeed, f_baud);
+
+                // Split period: 60% low, 40% high (per pico-sdk)
+                regs.lcnt = period * 3 / 5;
+                regs.hcnt = period - regs.lcnt;
+
+                // Calculate spike length
+                regs.spklen = calcSpkLen(regs.lcnt);
+
+                // Calculate SDA hold time
+                regs.sda_hold = calcSdaTxHold(f_clockSpeed, f_baud);
+
+                return regs;
             }
 
             template<std::uint32_t f_clockSpeed,
@@ -124,52 +116,85 @@ namespace Kvasir { namespace I2C {
                      std::intmax_t Denom>
             static constexpr bool isValidBaudConfig(std::ratio<Num,
                                                                Denom>) {
-                constexpr auto baudRegs     = calcBaudRegs(f_clockSpeed, f_baud);
-                constexpr auto scr          = std::get<0>(baudRegs);
-                constexpr auto cpsdvsr      = std::get<1>(baudRegs);
-                constexpr auto f_baudCalced = calcf_Baud(f_clockSpeed, scr, cpsdvsr);
-                constexpr auto err          = f_baudCalced - double(f_baud);
-                constexpr auto absErr       = err > 0.0 ? err : -err;
-                constexpr auto ret = absErr <= (double(f_baud) * (double(Num) / (double(Denom))));
-                return (cpsdvsr >= 2) && (cpsdvsr % 2 == 0) && ret;
+                constexpr auto regs = calcBaudRegs(f_clockSpeed, f_baud);
+
+                // Check datasheet minimums
+                // LCNT must be > SPKLEN + 7
+                // HCNT must be > SPKLEN + 5
+                if(regs.lcnt <= regs.spklen + 7) {
+                    return false;
+                }
+                if(regs.hcnt <= regs.spklen + 5) {
+                    return false;
+                }
+
+                // Verify actual baud rate is within tolerance
+                constexpr auto period       = regs.hcnt + regs.lcnt;
+                constexpr auto f_baudActual = f_clockSpeed / period;
+                constexpr auto err
+                  = f_baudActual > f_baud ? f_baudActual - f_baud : f_baud - f_baudActual;
+                constexpr auto maxErr = (f_baud * Num) / Denom;
+
+                return err <= maxErr;
             }
 
-            template<std::uint32_t f_clockSpeed,
-                     std::uint32_t f_baud>
-            static constexpr auto getBaudConfig() {
-                constexpr auto baudRegs = calcBaudRegs(f_clockSpeed, f_baud);
-                return list(
-                  write(Regs::SSPCR0::scr, Register::value<std::get<0>(baudRegs)>()),
-                  write(Regs::SSPCPSR::cpsdvsr, Register::value<std::get<1>(baudRegs)>()));
+            template<std::uint32_t f_baud>
+            static constexpr auto getSpeedModeRegister() {
+                if constexpr(f_baud <= 100'000) {
+                    //return write(Regs::IC_CON::SPEEDValC::standard);
+                    // standard mode is buggy always use fast
+                    return write(Regs::IC_CON::SPEEDValC::fast);
+                } else if constexpr(f_baud <= 1'000'000) {
+                    return write(Regs::IC_CON::SPEEDValC::fast);
+                } else {
+                    return write(Regs::IC_CON::SPEEDValC::high);
+                }
             }
+
+            template<std::uint32_t f_clockSpeed, std::uint32_t f_baud>
+            struct GetBaudConfig {
+                static constexpr auto config_ = []() {
+                    constexpr auto regs = calcBaudRegs(f_clockSpeed, f_baud);
+
+                    return list(
+                      write(Regs::IC_FS_SCL_HCNT::ic_fs_scl_hcnt, Register::value<regs.hcnt>()),
+                      write(Regs::IC_FS_SCL_LCNT::ic_fs_scl_lcnt, Register::value<regs.lcnt>()),
+                      write(Regs::IC_FS_SPKLEN::ic_fs_spklen, Register::value<regs.spklen>()),
+                      Regs::IC_SDA_HOLD::overrideDefaults(write(Regs::IC_SDA_HOLD::ic_sda_tx_hold,
+                                                                Register::value<regs.sda_hold>())));
+                }();
+                using config = decltype(config_);
+            };
         };
     }   // namespace Detail
 
     namespace Traits { namespace I2C {
         template<unsigned Instance>
         static constexpr auto getIsrIndexs() {
+            static_assert(Instance < 2, "I2C Instance must be 0 or 1");
             if constexpr(Instance == 0) {
                 return brigand::list<decltype(Kvasir::Interrupt::i2c0)>{};
-
-            } else if(Instance == 1) {
+            } else {
                 return brigand::list<decltype(Kvasir::Interrupt::i2c1)>{};
             }
         }
 
         template<unsigned Instance>
         static constexpr auto getEnable() {
+            static_assert(Instance < 2, "I2C Instance must be 0 or 1");
             if constexpr(Instance == 0) {
                 return clear(Peripheral::RESETS::Registers<>::RESET::i2c0);
-            } else if(Instance == 1) {
+            } else {
                 return clear(Peripheral::RESETS::Registers<>::RESET::i2c1);
             }
         }
 
         template<unsigned Instance>
         static constexpr auto getDisable() {
+            static_assert(Instance < 2, "I2C Instance must be 0 or 1");
             if constexpr(Instance == 0) {
                 return set(Peripheral::RESETS::Registers<>::RESET::i2c0);
-            } else if(Instance == 1) {
+            } else {
                 return set(Peripheral::RESETS::Registers<>::RESET::i2c1);
             }
         }
@@ -247,7 +272,7 @@ namespace Kvasir { namespace I2C {
             static_assert(
               Config::template isValidBaudConfig<I2CConfig::clockSpeed,
                                                  I2CConfig::baudRate>(I2CConfig::maxBaudRateError),
-              "invalid baud configuration baudRate error to big");
+              "invalid baud configuration baudRate error too big");
             static_assert(Config::isValidPinLocationSDA(I2CConfig::sdaPinLocation),
                           "invalid SDAPin");
             static_assert(Config::isValidPinLocationSCL(I2CConfig::sclPinLocation),
@@ -262,14 +287,11 @@ namespace Kvasir { namespace I2C {
                        std::decay_t<decltype(I2CConfig::sclPinLocation)>>::pinConfig{});
 
             static constexpr auto initStepPeripheryConfig
-              = list(Regs::IC_CON::overrideDefaults(write(Regs::IC_CON::MASTER_MODEValC::enabled)),
-
-                     //TODO speed type and baud
-                     write(Regs::IC_FS_SCL_HCNT::ic_fs_scl_hcnt, Kvasir::Register::value<266>()),
-                     write(Regs::IC_FS_SCL_LCNT::ic_fs_scl_lcnt, Kvasir::Register::value<399>()),
-                     write(Regs::IC_FS_SPKLEN::ic_fs_spklen, Kvasir::Register::value<24>()),
-                     Regs::IC_SDA_HOLD::overrideDefaults(
-                       write(Regs::IC_SDA_HOLD::ic_sda_tx_hold, Kvasir::Register::value<40>())),
+              = list(Regs::IC_CON::overrideDefaults(
+                       write(Regs::IC_CON::MASTER_MODEValC::enabled),
+                       Config::template getSpeedModeRegister<I2CConfig::baudRate>()),
+                     typename Config::template GetBaudConfig<I2CConfig::clockSpeed,
+                                                             I2CConfig::baudRate>::config{},
                      NoInterrupts);
 
             static constexpr auto initStepInterruptConfig
@@ -278,6 +300,24 @@ namespace Kvasir { namespace I2C {
 
             static constexpr auto initStepPeripheryEnable
               = list(Nvic::makeEnable(InterruptIndexs{}));
+
+            static constexpr auto calcTransferTimeout(std::size_t numBytes) {
+                using namespace std::chrono_literals;
+                constexpr std::uint32_t bitsPerDataByte = 9;
+                constexpr std::uint32_t safetyFactor    = 4;
+                constexpr auto          baseTimeout     = 10ms;
+                constexpr std::uint32_t microsecondsPerDataByte
+                  = (bitsPerDataByte * 1'000'000 * safetyFactor) / I2CConfig::baudRate;
+
+                std::uint32_t const timeoutUs = (numBytes + 1) * microsecondsPerDataByte;
+
+                return std::chrono::microseconds(timeoutUs) + baseTimeout;
+            }
+
+            static constexpr auto abort
+              = list(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::disabled),
+                                                       set(Regs::IC_ENABLE::abort)),
+                     NoInterrupts);
         };
     }   // namespace Detail
 
@@ -288,7 +328,7 @@ namespace Kvasir { namespace I2C {
         using Regs                              = typename base::Regs;
         using tp                                = typename Clock::time_point;
 
-        enum class State { idle, blocked, sending, receiveing };
+        enum class State { idle, blocked, sending, receiving };
         enum class OperationState { succeeded, failed, ongoing };
         inline static std::atomic<State>          state_{State::idle};
         inline static std::atomic<std::uint8_t>   receiveSize_{0};
@@ -329,6 +369,9 @@ namespace Kvasir { namespace I2C {
             auto op = operationState_.load(std::memory_order_relaxed);
             if(op == OperationState::ongoing) {
                 if(currentTime > timeoutTime) {
+                    apply(base::abort);
+                    buffer_.clear();
+                    operationState_.store(OperationState::failed, std::memory_order_relaxed);
                     state_.store(State::blocked, std::memory_order_relaxed);
                     return OperationState::failed;
                 }
@@ -345,7 +388,7 @@ namespace Kvasir { namespace I2C {
         }
 
         static void release() {
-            assert(state_.load(std::memory_order_relaxed) != State::idle);   // TODO
+            assert(state_.load(std::memory_order_relaxed) != State::idle);
             state_.store(State::idle, std::memory_order_relaxed);
         }
 
@@ -354,7 +397,7 @@ namespace Kvasir { namespace I2C {
                          std::uint8_t address,
                          C const&     c) {
             assert(state_.load(std::memory_order_relaxed) != State::sending);
-            assert(state_.load(std::memory_order_relaxed) != State::receiveing);
+            assert(state_.load(std::memory_order_relaxed) != State::receiving);
             assert(!c.empty());
             assert(c.size() <= buffer_.max_size());
 
@@ -363,7 +406,7 @@ namespace Kvasir { namespace I2C {
             state_.store(State::sending, std::memory_order_relaxed);
             operationState_.store(OperationState::ongoing, std::memory_order_relaxed);
             stop        = true;
-            timeoutTime = currentTime + 100ms;   // TODO baud*size
+            timeoutTime = currentTime + base::calcTransferTimeout(c.size());
             apply(write(Regs::IC_TAR::ic_tar, address));
             apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
             apply(base::TxInterrupts);
@@ -373,16 +416,16 @@ namespace Kvasir { namespace I2C {
                             std::uint8_t address,
                             std::uint8_t size) {
             assert(state_.load(std::memory_order_relaxed) != State::sending);
-            assert(state_.load(std::memory_order_relaxed) != State::receiveing);
+            assert(state_.load(std::memory_order_relaxed) != State::receiving);
             assert(size <= buffer_.max_size());
             assert(size != 0);
 
             buffer_.clear();
             receiveSize_.store(size, std::memory_order_relaxed);
-            state_.store(State::receiveing, std::memory_order_relaxed);
+            state_.store(State::receiving, std::memory_order_relaxed);
             operationState_.store(OperationState::ongoing, std::memory_order_relaxed);
             stop        = true;
-            timeoutTime = currentTime + 100ms;   // TODO baud*size
+            timeoutTime = currentTime + base::calcTransferTimeout(size);
 
             apply(write(Regs::IC_TAR::ic_tar, address));
             apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
@@ -404,7 +447,7 @@ namespace Kvasir { namespace I2C {
                                  C const&     c,
                                  std::uint8_t size) {
             assert(state_.load(std::memory_order_relaxed) != State::sending);
-            assert(state_.load(std::memory_order_relaxed) != State::receiveing);
+            assert(state_.load(std::memory_order_relaxed) != State::receiving);
             assert(c.size() <= buffer_.max_size());
             assert(!c.empty());
             assert(size <= buffer_.max_size());
@@ -416,17 +459,12 @@ namespace Kvasir { namespace I2C {
             state_.store(State::sending, std::memory_order_relaxed);
             operationState_.store(OperationState::ongoing, std::memory_order_relaxed);
             stop        = false;
-            timeoutTime = currentTime + 100ms;   // TODO baud*size
+            timeoutTime = currentTime + base::calcTransferTimeout(c.size() + size);
 
             apply(write(Regs::IC_TAR::ic_tar, address));
             apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
             apply(base::TxInterrupts);
         }
-
-        static constexpr auto abort
-          = list(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::disabled),
-                                                   set(Regs::IC_ENABLE::abort)),
-                 base::NoInterrupts);
 
         // ISR
         static void onIsr() {
@@ -435,14 +473,12 @@ namespace Kvasir { namespace I2C {
 
             auto lstate  = state_.load(std::memory_order_relaxed);
             auto lostate = operationState_.load(std::memory_order_relaxed);
-            // TODO K_ASSERT(lstate != State::blocked && lstate != State::idle);
-            // TODO operation state release
             if(lstate == State::sending) {
                 if(error) {
                     lstate  = State::blocked;
                     lostate = OperationState::failed;
                     UC_LOG_C("abort send");
-                    apply(abort);
+                    apply(base::abort);
                 } else {
                     if(!buffer_.empty()) {
                         auto const data = buffer_.front();
@@ -472,7 +508,7 @@ namespace Kvasir { namespace I2C {
                             apply(base::NoInterrupts);
                         } else {
                             auto const lreceiveSize = receiveSize_.load(std::memory_order_relaxed);
-                            lstate                  = State::receiveing;
+                            lstate                  = State::receiving;
                             if(lreceiveSize == 1) {
                                 apply(Regs::IC_DATA_CMD::overrideDefaults(
                                   write(Regs::IC_DATA_CMD::RESTARTValC::enable),
@@ -487,12 +523,12 @@ namespace Kvasir { namespace I2C {
                         }
                     }
                 }
-            } else if(lstate == State::receiveing) {
+            } else if(lstate == State::receiving) {
                 if(error) {
                     UC_LOG_C("abort recv");
                     lstate  = State::blocked;
                     lostate = OperationState::failed;
-                    apply(abort);
+                    apply(base::abort);
                 } else {
                     auto const lreceiveSize = receiveSize_.load(std::memory_order_relaxed);
                     auto const data         = apply(read(Regs::IC_DATA_CMD::dat));
