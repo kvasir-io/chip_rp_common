@@ -73,12 +73,12 @@ namespace detail {
 }   // namespace detail
 
 inline void resetToUsbBoot() {
-    static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL  = 0x0002;
-    static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
+    static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL = 0x0002;
 
-    [[maybe_unused]] auto ret = detail::reboot(REBOOT_TYPE_BOOTSEL & NO_RETURN_ON_SUCCESS, 0, 0, 0);
-    UC_LOG_C("This should not happen reboot returned {}", ret);
-    //normal reboot
+    auto ret = detail::reboot(REBOOT_TYPE_BOOTSEL, 0, 0, 0);
+    if(ret != 0) {
+        UC_LOG_C("This should not happen reboot returned {}", ret);
+    }
     apply(Kvasir::SystemControl::SystemReset{});
 }
 
@@ -104,8 +104,10 @@ inline auto serialNumber() {
             }
         }
 
-        std::ranges::copy(std::as_bytes(std::span{std::next(buffer.data() + 2), 2}),
-                          serial_number.begin());
+        // Extract bytes in reverse order from each word to match pico-sdk behavior
+        // pico-sdk accesses bytes[15:8] which is buffer[3] then buffer[2], both word-reversed
+        auto const swapped = std::array{std::byteswap(buffer[3]), std::byteswap(buffer[2])};
+        std::ranges::copy(std::as_bytes(std::span{swapped}), serial_number.begin());
     }
 
     return serial_number;
