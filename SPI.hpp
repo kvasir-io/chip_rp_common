@@ -319,7 +319,7 @@ namespace Kvasir { namespace SPI {
         static_assert(
           (Config::template isValidBaudConfig<SPIConfig::clockSpeed,
                                               SPIConfig::baudRate>(SPIConfig::maxBaudRateError)),
-          "invalid baud configuration baudRate error to big");
+          "invalid baud configuration baudRate error too big");
         static_assert(Config::isValidPinLocationMISO(SPIConfig::misoPinLocation),
                       "invalid MISOPin");
         static_assert(Config::isValidPinLocationMOSI(SPIConfig::mosiPinLocation),
@@ -329,7 +329,6 @@ namespace Kvasir { namespace SPI {
         static_assert(Config::isValidPinLocationCS(SPIConfig::csPinLocation),
                       "invalid CSPin");
 
-        //TODO mutal exlcude function
         static_assert(!Io::Detail::PinLocationEqual(SPIConfig::misoPinLocation,
                                                     SPIConfig::mosiPinLocation),
                       "MISO and MOSI are the same pin");
@@ -496,6 +495,9 @@ namespace Kvasir { namespace SPI {
                                      std::size_t      size,
                                      F                f) {
             busy = true;
+
+            std::atomic_signal_fence(std::memory_order_release);
+
             Dma::template start<DmaChannelA,
                                 DmaPriority,
                                 base::TxDmaTrigger,
@@ -525,6 +527,9 @@ namespace Kvasir { namespace SPI {
             }
 
             busy = true;
+
+            std::atomic_signal_fence(std::memory_order_release);
+
             Dma::template start<DmaChannelA,
                                 DmaPriority,
                                 base::TxDmaTrigger,

@@ -69,8 +69,9 @@ namespace Kvasir { namespace UART {
                  std::intmax_t Denom>
         static constexpr bool isValidBaudConfig(std::ratio<Num,
                                                            Denom>) {
-            constexpr auto baudRegs     = calcBaudRegs(f_clockSpeed, f_baud);
-            constexpr auto divint       = std::get<0>(baudRegs);
+            constexpr auto baudRegs = calcBaudRegs(f_clockSpeed, f_baud);
+            constexpr auto divint   = std::get<0>(baudRegs);
+            static_assert(divint != 0, "baudrate too heigh");
             constexpr auto divfrac      = std::get<1>(baudRegs);
             constexpr auto f_baudCalced = calcf_Baud(f_clockSpeed, divint, divfrac);
             constexpr auto err          = f_baudCalced - double(f_baud);
@@ -349,7 +350,7 @@ namespace Kvasir { namespace UART {
 
         static_assert(Detail::isValidBaudConfig<UartConfig::clockSpeed,
                                                 UartConfig::baudRate>(UartConfig::maxBaudRateError),
-                      "invalid baud configuration baudRate error to big");
+                      "invalid baud configuration baudRate error too big");
         static_assert(Config::isValidPinLocationTX(UartConfig::txPinLocation),
                       "invalid TXPin");
         static_assert(Config::isValidPinLocationRX(UartConfig::rxPinLocation),
@@ -370,7 +371,7 @@ namespace Kvasir { namespace UART {
                  typename Config::template GetBaudConfig<UartConfig::clockSpeed,
                                                          UartConfig::baudRate>::config{},
                  Kvasir::Register::SequencePoint{},
-
+                 // LCR_H writes below will latch the baud divisors (PL011 requirement)
                  typename Config::template GetTxPinConfig<
                    std::decay_t<decltype(UartConfig::txPinLocation)>>::enable{},
                  typename Config::template GetRxPinConfig<
@@ -419,15 +420,10 @@ namespace Kvasir { namespace UART {
 
         inline static bool busy = false;
 
-        // inline static std::atomic<OperationState> operationState_ = OperationState::succeeded;
         static OperationState operationState() {
             if(!busy) {
                 return OperationState::succeeded;
             }
-            /*            if(!Dma::template wd<DmaChannel>().isValid() && apply(read(Regs::INTFLAG::txc))) {
-                b = false;
-                return OperationState::succeeded;
-            }*/
             // TODO timeout
             return OperationState::ongoing;
         }
@@ -435,6 +431,10 @@ namespace Kvasir { namespace UART {
         static void send_nocopy(std::span<std::byte const> span) {
             assert(!busy);
             busy = true;
+
+            std::atomic_signal_fence(std::memory_order_release);
+
+            // TODO timeout
             Dma::template start<DmaChannel,
                                 DmaPriority,
                                 base::TxDmaTrigger,

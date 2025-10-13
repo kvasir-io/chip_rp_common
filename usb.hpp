@@ -1299,7 +1299,9 @@ namespace Kvasir { namespace USB {
             } else {
                 len     = apply(read(BufferRegs::template EP<1>::OUT_BUFFER_CONTROL_1::length));
                 using B = typename BufferRegs::template DOUBLEBUFFER<1>;
-                std::memcpy(x.data(), reinterpret_cast<void*>(B::template OUT<1>::Addr::value), 64);
+                std::memcpy(x.data(),
+                            reinterpret_cast<void*>(B::template OUT<1>::Addr::value),
+                            len);
             }
             recvBuffer.push(std::span{x.data(), len});
             recv();
@@ -1347,7 +1349,7 @@ namespace Kvasir { namespace USB {
 
                 if(pkt.bRequest == REQUEST_BOOTSEL) {
                     UC_LOG_D("reboot to bootsel");
-                    //Kvasir::resetToUsbBoot();
+                    Kvasir::resetToUsbBoot();
                 } else if(pkt.bRequest == REQUEST_FLASH) {
                     UC_LOG_D("reboot");
                     apply(Kvasir::SystemControl::SystemReset{});

@@ -187,20 +187,25 @@ namespace Kvasir { namespace PinConfig {
         bool          isChannelA;
     };
 
-    template<ChipVariant Chip>
-    constexpr PwmChannelInfo getPwmChannelInfo(int pin) {
+    template<ChipVariant Chip,
+             int         Pin>
+    constexpr PwmChannelInfo getPwmChannelInfo() {
         if constexpr(Chip == ChipVariant::RP2040 || Chip == ChipVariant::RP2350A) {
-            if(pin >= 30) {
-                return {.channel = 0, .isChannelA = false};
-            }
+            static_assert(Pin >= 0 && Pin < 30, "Pin number out of range for RP2040/RP2350A");
         } else if constexpr(Chip == ChipVariant::RP2350B) {
-            if(pin >= 48) {
-                return {.channel = 0, .isChannelA = false};
-            }
+            static_assert(Pin >= 0 && Pin < 48, "Pin number out of range for RP2350B");
         }
 
-        auto channel    = static_cast<std::uint32_t>((pin % 16) / 2);
-        bool isChannelA = (pin % 2) == 0;
+        // GPIO 0-31 map to PWM channels 0-7 (repeating every 16 pins)
+        // GPIO 32-47 map to PWM channels 8-11 (repeating every 8 pins)
+        constexpr auto channel = [] {
+            if constexpr(Pin < 32) {
+                return static_cast<std::uint32_t>((Pin % 16) / 2);
+            } else {
+                return static_cast<std::uint32_t>(8 + ((Pin % 8) / 2));
+            }
+        }();
+        constexpr bool isChannelA = (Pin % 2) == 0;
         return {.channel = channel, .isChannelA = isChannelA};
     }
 
