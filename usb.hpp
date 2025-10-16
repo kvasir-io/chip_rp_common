@@ -448,6 +448,10 @@ namespace Kvasir { namespace USB {
                                                                        (N - 1) * 2>>;
     DescriptorString(std::string_view s) -> DescriptorString<Kvasir::StaticVector<std::byte,
                                                                                   64 * 2>>;
+    template<char... chars>
+    DescriptorString(sc::StringConstant<chars...> sc)
+      -> DescriptorString<std::array<std::byte,
+                                     sizeof...(chars) * 2>>;
 
     template<typename F>
     struct RuntimeDescriptorString {
@@ -932,8 +936,8 @@ namespace Kvasir { namespace USB {
         using BufferRegs = typename Base::BufferRegs;
 
         static constexpr std::tuple DescriptorStrings{
-          Kvasir::USB::DescriptorString{Config::ManufacturerString},
-          Kvasir::USB::DescriptorString{Config::ProductString},
+          Kvasir::USB::DescriptorString{SC_LIFT(Config::ManufacturerString)},
+          Kvasir::USB::DescriptorString{SC_LIFT(Config::ProductString)},
           Kvasir::USB::RuntimeDescriptorString{Config::SerialNumberString}};
 
         static constexpr auto DeviceDescriptor{
