@@ -285,7 +285,7 @@ namespace Kvasir { namespace PWM {
     struct PWM_Timer {
         using Regs = Kvasir::Peripheral::PWM::Registers<>::CH<Channel>;
 
-        static constexpr auto InterruptIndex = Kvasir::Interrupt::pwm_wrap;
+        static constexpr auto InterruptIndex = Kvasir::Interrupt::pwm_wrap_0;
 
         static constexpr std::uint16_t MinTop = 1;
 
@@ -319,7 +319,7 @@ namespace Kvasir { namespace PWM {
 
         static constexpr auto initStepPeripheryEnable
           = list(set(Regs::CSR::en),
-                 set(Kvasir::Peripheral::PWM::Registers<>::INTE::ch0),
+                 set(Kvasir::Peripheral::PWM::Registers<>::IRQ0_INTE::ch0),
                  Nvic::makeEnable(InterruptIndex));
 
         static void reset() {
@@ -348,7 +348,7 @@ namespace Kvasir { namespace PWM {
         }
 
         static void onIsr() {
-            auto state = apply(read(Kvasir::Peripheral::PWM::Registers<>::INTS::ch0));
+            auto state = apply(read(Kvasir::Peripheral::PWM::Registers<>::IRQ0_INTS::ch0));
             if(state) {
                 Callback{}();
             }
