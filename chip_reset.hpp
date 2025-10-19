@@ -1,6 +1,9 @@
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
-#include "peripherals/POWMAN.hpp"
+
+#if __has_include("peripherals/POWMAN")
+    #include "peripherals/POWMAN.hpp"
+#endif
 #include "peripherals/WATCHDOG.hpp"
 
 #include <cstdint>
@@ -28,6 +31,7 @@ namespace Kvasir { namespace PM {
     };
 
     inline ResetCause reset_cause() {
+#if __has_include("peripherals/POWMAN")
         using ChipReset = Kvasir::Peripheral::POWMAN::Registers<>::CHIP_RESET;
         using WdReason  = Kvasir::Peripheral::WATCHDOG::Registers<>::REASON;
 
@@ -73,7 +77,7 @@ namespace Kvasir { namespace PM {
         if(chip_reset[ChipReset::had_swcore_pd]) {
             return ResetCause::swcore_pd;
         }
-
+#endif
         return ResetCause::unknown;
     }
 }}   // namespace Kvasir::PM

@@ -1,16 +1,59 @@
 #pragma once
 
-#include "peripherals/TICKS.hpp"
+#if __has_include("peripherals/TICKS.hpp")
+    #include "peripherals/TICKS.hpp"
+#endif
+
 #include "peripherals/WATCHDOG.hpp"
 
 #include <chrono>
 
 namespace Kvasir {
 
+namespace Detail {
+
+    template<typename Reg>
+    constexpr auto getDisableTick() {
+        if constexpr(requires { Reg::overrideDefaults(clear(Reg::enable)); }) {
+            return Reg::overrideDefaults(clear(Reg::enable));
+        } else {
+            return Reg::WATCHDOG_CTRL::overrideDefaults(clear(Reg::WATCHDOG_CTRL::enable));
+        }
+    }
+
+    template<typename Reg>
+    constexpr auto getEnableTick() {
+        if constexpr(requires { set(Reg::enable); }) {
+            return set(Reg::enable);
+        } else {
+            return Reg::WATCHDOG_CTRL::overrideDefaults(set(Reg::WATCHDOG_CTRL::enable));
+        }
+    }
+
+    template<typename Reg,
+             auto CyclesPerTick>
+    constexpr auto setTick() {
+        if constexpr(requires { write(Reg::cycles, Kvasir::Register::value<CyclesPerTick>()); }) {
+            return write(Reg::cycles, Kvasir::Register::value<CyclesPerTick>());
+        } else {
+            return write(Reg::WATCHDOG_CYCLES::watchdog_cycles,
+                         Kvasir::Register::value<CyclesPerTick>());
+        }
+    }
+
+    constexpr auto getTicksReg() {
+#if __has_include("peripherals/TICKS.hpp")
+        return Kvasir::Peripheral::TICKS::Registers<>;
+#else
+        return Kvasir::Peripheral::WATCHDOG::Registers<>::TICK{};
+#endif
+    }
+}   // namespace Detail
+
 template<typename Config>
 struct Watchdog {
     using Regs      = Kvasir::Peripheral::WATCHDOG::Registers<>;
-    using TicksRegs = Kvasir::Peripheral::TICKS::Registers<>;
+    using TicksRegs = decltype(Detail::getTicksReg());
 
     static constexpr std::uint64_t TotalCycles{
       static_cast<std::uint64_t>(
@@ -32,16 +75,16 @@ struct Watchdog {
     static_assert(ReadloadValue > 0,
                   "Watchdog timeout too short: ReadloadValue must be greater than 0");
 
-    static constexpr auto initStepPeripheryConfig = list(
-      TicksRegs::WATCHDOG_CTRL::overrideDefaults(clear(TicksRegs::WATCHDOG_CTRL::enable)),
-      Regs::CTRL::overrideDefaults(clear(Regs::CTRL::enable)),
+    static constexpr auto initStepPeripheryConfig
+      = list(Detail::getDisableTick<TicksRegs>(),
+             Regs::CTRL::overrideDefaults(clear(Regs::CTRL::enable)),
 
-      Kvasir::Register::sequencePoint,
-      write(TicksRegs::WATCHDOG_CYCLES::watchdog_cycles, Kvasir::Register::value<CyclesPerTick>()),
-      write(Regs::LOAD::load, Kvasir::Register::value<ReadloadValue>()),
+             Kvasir::Register::sequencePoint,
+             Detail::setTick<TicksRegs, CyclesPerTick>(),
+             write(Regs::LOAD::load, Kvasir::Register::value<ReadloadValue>()),
 
-      Kvasir::Register::sequencePoint,
-      TicksRegs::WATCHDOG_CTRL::overrideDefaults(set(TicksRegs::WATCHDOG_CTRL::enable)));
+             Kvasir::Register::sequencePoint,
+             Detail::getEnableTick<TicksRegs>());
 
     static constexpr auto initStepPeripheryEnable = list(Regs::CTRL::overrideDefaults(
       set(Regs::CTRL::enable),

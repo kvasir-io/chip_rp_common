@@ -285,7 +285,25 @@ namespace Kvasir { namespace PWM {
     struct PWM_Timer {
         using Regs = Kvasir::Peripheral::PWM::Registers<>::CH<Channel>;
 
-        static constexpr auto InterruptIndex = Kvasir::Interrupt::pwm_wrap_0;
+        using InterruptIndexs = decltype(PinConfig::PwmTraits<PinConfig::CurrentChip>::Interrupts);
+
+        template<typename R>
+        static constexpr auto getIsrSetEnable() {
+            if constexpr(requires { set(R::IRQ0_INTE::ch0); }) {
+                return set(R::IRQ0_INTE::ch0);
+            } else {
+                return set(R::IRQ_INTE::ch0);
+            }
+        }
+
+        template<typename R>
+        static constexpr auto getIsrIsEnable() {
+            if constexpr(requires { read(R::IRQ0_INTS::ch0); }) {
+                return read(R::IRQ0_INTS::ch0);
+            } else {
+                return read(R::IRQ_INTS::ch0);
+            }
+        }
 
         static constexpr std::uint16_t MinTop = 1;
 
@@ -314,13 +332,11 @@ namespace Kvasir { namespace PWM {
                  detail::setDuty<InitialDuty, Channel, true>());
 
         static constexpr auto initStepInterruptConfig
-          = list(Nvic::makeSetPriority<Config::isrPriority>(InterruptIndex),
-                 Nvic::makeClearPending(InterruptIndex));
+          = list(Nvic::makeSetPriority<Config::isrPriority>(InterruptIndexs{}),
+                 Nvic::makeClearPending(InterruptIndexs{}));
 
         static constexpr auto initStepPeripheryEnable
-          = list(set(Regs::CSR::en),
-                 set(Kvasir::Peripheral::PWM::Registers<>::IRQ0_INTE::ch0),
-                 Nvic::makeEnable(InterruptIndex));
+          = list(set(Regs::CSR::en), getIsrSetEnable<Regs>(), Nvic::makeEnable(InterruptIndexs{}));
 
         static void reset() {
             apply(initStepPeripheryConfig, initStepInterruptConfig, initStepPeripheryEnable);
@@ -348,7 +364,7 @@ namespace Kvasir { namespace PWM {
         }
 
         static void onIsr() {
-            auto state = apply(read(Kvasir::Peripheral::PWM::Registers<>::IRQ0_INTS::ch0));
+            auto state = apply(getIsrIsEnable<Regs>());
             if(state) {
                 Callback{}();
             }
@@ -362,8 +378,13 @@ namespace Kvasir { namespace PWM {
                   set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch7));
         }
 
-        static constexpr Nvic::Isr<std::addressof(onIsr), std::decay_t<decltype(InterruptIndex)>>
-          isr{};
+        template<typename... Ts>
+        static constexpr auto makeIsr(brigand::list<Ts...>) {
+            return brigand::list<
+              Kvasir::Nvic::Isr<std::addressof(onIsr), Nvic::Index<Ts::value>>...>{};
+        }
+
+        using Isr = decltype(makeIsr(InterruptIndexs{}));
     };
 
 }}   // namespace Kvasir::PWM

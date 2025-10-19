@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Interrupt.hpp"
 #include "PinConfig.hpp"
+#include "chip/Interrupt.hpp"
 #include "core/core.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 #include "peripherals/DMA.hpp"
@@ -83,17 +83,7 @@ namespace Kvasir { namespace DMA {
         // Helper to get chip-specific DMA interrupt list
         template<PinConfig::ChipVariant Chip>
         static constexpr auto getDmaInterrupts() {
-            if constexpr(Chip == PinConfig::ChipVariant::RP2040) {
-                return brigand::list<decltype(Kvasir::Interrupt::dma_0),
-                                     decltype(Kvasir::Interrupt::dma_1)>{};
-            } else if constexpr(Chip == PinConfig::ChipVariant::RP2350A
-                                || Chip == PinConfig::ChipVariant::RP2350B)
-            {
-                return brigand::list<decltype(Kvasir::Interrupt::dma_0),
-                                     decltype(Kvasir::Interrupt::dma_1),
-                                     decltype(Kvasir::Interrupt::dma_2),
-                                     decltype(Kvasir::Interrupt::dma_3)>{};
-            }
+            return PinConfig::DmaTraits<Chip>::Interrupts;
         }
 
         using InterruptIndexs = decltype(getDmaInterrupts<PinConfig::CurrentChip>());

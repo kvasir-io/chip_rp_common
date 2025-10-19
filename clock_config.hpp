@@ -1,13 +1,15 @@
 #pragma once
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/CLOCKS.hpp"
-#include "peripherals/QMI.hpp"
+
+#if __has_include("peripherals/QMI.hpp")
+    #include "peripherals/QMI.hpp"
+#endif
 
 #include <cmath>
 #include <cstdint>
 
 namespace Kvasir { namespace DefaultClockSettings {
-
     namespace detail {
         struct PllSettings {
             std::uint32_t fbdiv;
@@ -93,27 +95,38 @@ namespace Kvasir { namespace DefaultClockSettings {
             return bestSettings;
         }
 
+        namespace impl {
+            template<auto CrystalSpeed,
+                     typename Reg>
+
+            static constexpr auto getXoscFreqRange() {
+                if constexpr(CrystalSpeed >= 1'000'000 && CrystalSpeed <= 15'000'000) {
+                    return Reg::FREQ_RANGEValC::_1_15mhz;
+                } else if constexpr(CrystalSpeed >= 10'000'000 && CrystalSpeed <= 30'000'000) {
+                    return Reg::FREQ_RANGEValC::_10_30mhz;
+                } else if constexpr(CrystalSpeed >= 25'000'000 && CrystalSpeed <= 60'000'000) {
+                    return Reg::FREQ_RANGEValC::_25_60mhz;
+                } else if constexpr(CrystalSpeed >= 40'000'000 && CrystalSpeed <= 100'000'000) {
+                    return Reg::FREQ_RANGEValC::_40_100mhz;
+                } else {
+                    static_assert(CrystalSpeed >= 1'000'000 && CrystalSpeed <= 100'000'000,
+                                  "Crystal frequency must be between 1 MHz and 100 MHz");
+                    return Reg::FREQ_RANGEValC::_1_15mhz;
+                }
+            }
+        }   // namespace impl
+
         template<auto CrystalSpeed>
         static constexpr auto getXoscFreqRange() {
-            if constexpr(CrystalSpeed >= 1'000'000 && CrystalSpeed <= 15'000'000) {
-                return Kvasir::Peripheral::XOSC::Registers<>::CTRL::FREQ_RANGEValC::_1_15mhz;
-            } else if constexpr(CrystalSpeed >= 10'000'000 && CrystalSpeed <= 30'000'000) {
-                return Kvasir::Peripheral::XOSC::Registers<>::CTRL::FREQ_RANGEValC::_10_30mhz;
-            } else if constexpr(CrystalSpeed >= 25'000'000 && CrystalSpeed <= 60'000'000) {
-                return Kvasir::Peripheral::XOSC::Registers<>::CTRL::FREQ_RANGEValC::_25_60mhz;
-            } else if constexpr(CrystalSpeed >= 40'000'000 && CrystalSpeed <= 100'000'000) {
-                return Kvasir::Peripheral::XOSC::Registers<>::CTRL::FREQ_RANGEValC::_40_100mhz;
-            } else {
-                static_assert(CrystalSpeed >= 1'000'000 && CrystalSpeed <= 100'000'000,
-                              "Crystal frequency must be between 1 MHz and 100 MHz");
-                return Kvasir::Peripheral::XOSC::Registers<>::CTRL::FREQ_RANGEValC::_1_15mhz;
-            }
+            using Reg = Kvasir::Peripheral::XOSC::Registers<>::CTRL;
+            return impl::getXoscFreqRange<CrystalSpeed, Reg>();
         }
     }   // namespace detail
 
     // Flash configuration function for W25Q32RV optimal settings
     template<auto ClockSpeed>
     void flashInit() {
+#if __has_include("peripherals/QMI.hpp")
         using namespace Kvasir::Peripheral::QMI;
         using QMI = Registers<0>;
 
@@ -157,6 +170,7 @@ namespace Kvasir { namespace DefaultClockSettings {
                                              write(QMI::M0_RFMT::SUFFIX_WIDTHValC::q),
                                              write(QMI::M0_RFMT::ADDR_WIDTHValC::q),
                                              write(QMI::M0_RFMT::PREFIX_WIDTHValC::s)));
+#endif
     }
 
     template<auto ClockSpeed,
@@ -278,5 +292,4 @@ namespace Kvasir { namespace DefaultClockSettings {
     template<auto ClockSpeed,
              auto CrystalSpeed>
     void peripheryClockInit() {}
-
 }}   // namespace Kvasir::DefaultClockSettings
