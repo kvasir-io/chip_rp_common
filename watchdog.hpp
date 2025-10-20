@@ -43,7 +43,7 @@ namespace Detail {
 
     constexpr auto getTicksReg() {
 #if __has_include("peripherals/TICKS.hpp")
-        return Kvasir::Peripheral::TICKS::Registers<>;
+        return Kvasir::Peripheral::TICKS::Registers<>{};
 #else
         return Kvasir::Peripheral::WATCHDOG::Registers<>::TICK{};
 #endif

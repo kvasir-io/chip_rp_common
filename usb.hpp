@@ -559,9 +559,7 @@ namespace Kvasir { namespace USB {
 
                 if(get<4>(status)) {
                     auto const sof = get<0>(apply(read(Regs::SOF_RD::count)));
-                    if(sofFunction) {
-                        sofFunction(static_cast<std::uint16_t>(sof));
-                    }
+                    if(sofFunction) { sofFunction(static_cast<std::uint16_t>(sof)); }
                 }
 
                 if(get<0>(status)) {
@@ -569,9 +567,7 @@ namespace Kvasir { namespace USB {
                     handleSetupPacket(getSetupPacket());
                 }
 
-                if(get<1>(status)) {
-                    handleBufferStatus();
-                }
+                if(get<1>(status)) { handleBufferStatus(); }
 
                 if(get<2>(status)) {
                     apply(Regs::SIE_STATUS::overrideDefaults(set(Regs::SIE_STATUS::bus_reset)));
@@ -1062,9 +1058,7 @@ namespace Kvasir { namespace USB {
             using Buffer = typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL;
 
             auto const av = apply(read(Buffer::available_0), read(Buffer::available_1));
-            if(get<0>(av) && get<1>(av)) {
-                return false;
-            }
+            if(get<0>(av) && get<1>(av)) { return false; }
 
             if(!get<0>(av) && !buffer_cnt3) {
                 using BC = typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL_0;
@@ -1157,9 +1151,7 @@ namespace Kvasir { namespace USB {
 
             assert(64 >= data.size());
             auto const av = apply(read(Buffer::available_0), read(Buffer::available_1));
-            if(get<0>(av) && get<1>(av)) {
-                return false;
-            }
+            if(get<0>(av) && get<1>(av)) { return false; }
 
             if(!get<0>(av) && !buffer_cnt) {
                 Base::template startINTransfer<2, 0>(data, next_pid2);
@@ -1316,9 +1308,7 @@ namespace Kvasir { namespace USB {
             using Buffer = typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL;
 
             auto const av = apply(read(Buffer::available_0), read(Buffer::available_1));
-            if(get<0>(av) && get<1>(av)) {
-                return false;
-            }
+            if(get<0>(av) && get<1>(av)) { return false; }
 
             if(!get<0>(av) && !buffer_cnt3) {
                 using BC = typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL_0;
@@ -1387,9 +1377,7 @@ namespace Kvasir { namespace USB {
 
             assert(64 >= data.size());
             auto const av = apply(read(Buffer::available_0), read(Buffer::available_1));
-            if(get<0>(av) && get<1>(av)) {
-                return false;
-            }
+            if(get<0>(av) && get<1>(av)) { return false; }
 
             if(!get<0>(av) && !buffer_cnt) {
                 Base::template startINTransfer<1, 0>(data, next_pid2);

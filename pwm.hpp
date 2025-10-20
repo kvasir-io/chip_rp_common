@@ -271,9 +271,7 @@ namespace Kvasir { namespace PWM {
 
         static bool setFrequencyChecked(std::uint32_t frequency) {
             auto const divTopO = detail::calcDivAndTop<Config::clockSpeed>(frequency, MinTop);
-            if(!divTopO.has_value()) {
-                return false;
-            }
+            if(!divTopO.has_value()) { return false; }
             auto const& [div16, top] = *divTopO;
             apply(write(Regs::DIV::div_16, div16), write(Regs::TOP::top, top));
 
@@ -354,9 +352,7 @@ namespace Kvasir { namespace PWM {
 
         static bool setFrequencyChecked(std::uint32_t frequency) {
             auto const divTopO = detail::calcDivAndTop<Config::clockSpeed>(frequency, MinTop);
-            if(!divTopO.has_value()) {
-                return false;
-            }
+            if(!divTopO.has_value()) { return false; }
             auto const& [div16, top] = *divTopO;
             apply(write(Regs::DIV::div_16, div16), write(Regs::TOP::top, top));
 
@@ -365,9 +361,7 @@ namespace Kvasir { namespace PWM {
 
         static void onIsr() {
             auto state = apply(getIsrIsEnable<Regs>());
-            if(state) {
-                Callback{}();
-            }
+            if(state) { Callback{}(); }
             apply(set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch0),
                   set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch1),
                   set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch2),

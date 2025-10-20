@@ -177,9 +177,7 @@ namespace Kvasir { namespace SPI {
                             best       = abs_f_div;
                             ret.first  = static_cast<std::uint8_t>(scr);
                             ret.second = static_cast<std::uint8_t>(cpsdvsr);
-                            if(abs_f_div == 0.0) {
-                                return ret;
-                            }
+                            if(abs_f_div == 0.0) { return ret; }
                         }
                     }
                 }
@@ -407,9 +405,7 @@ namespace Kvasir { namespace SPI {
 
     public:
         static bool acquire() {
-            if(booked.load(std::memory_order_relaxed)) {
-                return false;
-            }
+            if(booked.load(std::memory_order_relaxed)) { return false; }
             booked.store(true, std::memory_order_relaxed);
             return true;
         }
@@ -418,9 +414,7 @@ namespace Kvasir { namespace SPI {
 
         static OperationState operationState() {
             auto const bsy = get<0>(apply(read(Regs::SSPSR::bsy)));
-            if(!busy && !bsy) {
-                return OperationState::succeeded;
-            }
+            if(!busy && !bsy) { return OperationState::succeeded; }
             return OperationState::ongoing;
         }
 
@@ -522,9 +516,7 @@ namespace Kvasir { namespace SPI {
                                              std::byte*       firstOut,
                                              std::size_t      size,
                                              F                f) {
-            while(apply(read(Regs::SSPSR::rne))) {
-                apply(read(Regs::SSPDR::data));
-            }
+            while(apply(read(Regs::SSPSR::rne))) { apply(read(Regs::SSPDR::data)); }
 
             busy = true;
 

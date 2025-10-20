@@ -52,9 +52,7 @@ namespace Kvasir { namespace DefaultClockSettings {
 
                 for(std::uint32_t fbdiv = fbdiv_min; fbdiv <= fbdiv_max; ++fbdiv) {
                     double const vco = refFreq * fbdiv;
-                    if(vco < vco_min || vco > vco_max) {
-                        continue;
-                    }
+                    if(vco < vco_min || vco > vco_max) { continue; }
 
                     // pd1 is inner loop to prefer higher pd1:pd2 ratios for lower power
                     for(std::uint32_t pd2 = postdiv_min; pd2 <= postdiv_max; ++pd2) {
@@ -138,12 +136,8 @@ namespace Kvasir { namespace DefaultClockSettings {
           = (ClockSpeed + max_flash_freq - 1) / max_flash_freq;
 
         constexpr std::uint32_t clkdiv = [&]() {
-            if(calculated_clkdiv < min_clkdiv) {
-                return min_clkdiv;
-            }
-            if(calculated_clkdiv > max_clkdiv) {
-                return max_clkdiv;
-            }
+            if(calculated_clkdiv < min_clkdiv) { return min_clkdiv; }
+            if(calculated_clkdiv > max_clkdiv) { return max_clkdiv; }
             return calculated_clkdiv;
         }();
 
@@ -213,14 +207,12 @@ namespace Kvasir { namespace DefaultClockSettings {
 
         apply(write(XOSC::CTRL::ENABLEValC::en), write(detail::getXoscFreqRange<CrystalSpeed>()));
         // wait for XOSC stable
-        while(!apply(read(XOSC::STATUS::stable))) {
-        }
+        while(!apply(read(XOSC::STATUS::stable))) {}
         {   //sys pll
             // reset pll
             apply(set(RST::RESET::pll_sys));
             apply(clear(RST::RESET::pll_sys));
-            while(!apply(read(RST::RESET_DONE::pll_sys))) {
-            }
+            while(!apply(read(RST::RESET_DONE::pll_sys))) {}
 
             apply(PLL::CS::overrideDefaults(clear(PLL::CS::bypass),
                                             write(PLL::CS::refdiv, value<pllSettings.refdiv>())));
@@ -232,8 +224,7 @@ namespace Kvasir { namespace DefaultClockSettings {
                                              set(PLL::PWR::postdivpd)));
 
             // wait for PLL lock
-            while(!apply(read(PLL::CS::lock))) {
-            }
+            while(!apply(read(PLL::CS::lock))) {}
 
             apply(
               PLL::PRIM::overrideDefaults(write(PLL::PRIM::postdiv1, value<pllSettings.pd1>()),
@@ -258,8 +249,7 @@ namespace Kvasir { namespace DefaultClockSettings {
             // reset pll
             apply(set(RST::RESET::pll_usb));
             apply(clear(RST::RESET::pll_usb));
-            while(!apply(read(RST::RESET_DONE::pll_usb))) {
-            }
+            while(!apply(read(RST::RESET_DONE::pll_usb))) {}
 
             apply(USBPLL::CS::overrideDefaults(
               clear(USBPLL::CS::bypass),
@@ -272,8 +262,7 @@ namespace Kvasir { namespace DefaultClockSettings {
                                                 set(USBPLL::PWR::postdivpd)));
 
             // wait for PLL lock
-            while(!apply(read(USBPLL::CS::lock))) {
-            }
+            while(!apply(read(USBPLL::CS::lock))) {}
 
             apply(USBPLL::PRIM::overrideDefaults(
               write(USBPLL::PRIM::postdiv1, value<usb_pllSettings.pd1>()),

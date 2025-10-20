@@ -76,9 +76,7 @@ inline void resetToUsbBoot() {
     static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL = 0x0002;
 
     auto ret = detail::reboot(REBOOT_TYPE_BOOTSEL, 0, 0, 0);
-    if(ret != 0) {
-        UC_LOG_C("This should not happen reboot returned {}", ret);
-    }
+    if(ret != 0) { UC_LOG_C("This should not happen reboot returned {}", ret); }
     apply(Kvasir::SystemControl::SystemReset{});
 }
 

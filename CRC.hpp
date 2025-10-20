@@ -32,8 +32,7 @@ namespace Kvasir { namespace CRC {
                                   data.size(),
                                   [&]() { running = false; });
 
-        while(running) {
-        }
+        while(running) {}
 
         auto const v   = apply(read(DMA::Regs::SNIFF_DATA::sniff_data));
         auto const crc = static_cast<std::uint16_t>(get<0>(v));

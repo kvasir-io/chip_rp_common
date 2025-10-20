@@ -53,12 +53,8 @@ namespace Kvasir { namespace Io {
         }
 
         for(auto dp : PinLocationTraits<PinConfig::CurrentChip>::PinsDisabled[Port]) {
-            if(dp == PinLocationTraits<PinConfig::CurrentChip>::ListEndIndicator) {
-                break;
-            }
-            if(dp == Pin) {
-                return false;
-            }
+            if(dp == PinLocationTraits<PinConfig::CurrentChip>::ListEndIndicator) { break; }
+            if(dp == Pin) { return false; }
         }
 
         return true;

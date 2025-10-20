@@ -65,9 +65,7 @@ namespace Kvasir { namespace PinConfig {
              unsigned    Instance>
     constexpr bool isValidUartPin(int         pin,
                                   UartPinType expectedType) {
-        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) {
-            return false;
-        }
+        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) { return false; }
 
         auto pinType = UartPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
         if(Instance == 0) {
@@ -87,9 +85,7 @@ namespace Kvasir { namespace PinConfig {
              unsigned    Instance>
     constexpr bool isValidI2cPin(int        pin,
                                  I2cPinType expectedType) {
-        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) {
-            return false;
-        }
+        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) { return false; }
 
         auto pinType = I2cPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
         if(Instance == 0) {
@@ -107,9 +103,7 @@ namespace Kvasir { namespace PinConfig {
              unsigned    Instance>
     constexpr bool isValidSpiPin(int        pin,
                                  SpiPinType expectedType) {
-        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) {
-            return false;
-        }
+        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) { return false; }
 
         auto pinType = SpiPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
         if(Instance == 0) {

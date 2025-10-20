@@ -120,9 +120,7 @@ namespace Kvasir { namespace Pio {
         }
 
         static bool ready() {
-            if(running) {
-                return false;
-            }
+            if(running) { return false; }
             return whenRdy > Clock::now() || whenRdy == typename Clock::time_point{};
         }
 

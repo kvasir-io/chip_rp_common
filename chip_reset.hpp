@@ -46,37 +46,19 @@ namespace Kvasir { namespace PM {
                                 read(ChipReset::had_swcore_pd));
 
         // Watchdog resets
-        if(wd_reasons[WdReason::force]) {
-            return ResetCause::watchdog_force;
-        }
-        if(wd_reasons[WdReason::timer]) {
-            return ResetCause::watchdog_timer;
-        }
+        if(wd_reasons[WdReason::force]) { return ResetCause::watchdog_force; }
+        if(wd_reasons[WdReason::timer]) { return ResetCause::watchdog_timer; }
 
         // Debug/rescue resets
-        if(chip_reset[ChipReset::had_rescue]) {
-            return ResetCause::rescue;
-        }
-        if(chip_reset[ChipReset::had_dp_reset_req]) {
-            return ResetCause::dp_reset_req;
-        }
+        if(chip_reset[ChipReset::had_rescue]) { return ResetCause::rescue; }
+        if(chip_reset[ChipReset::had_dp_reset_req]) { return ResetCause::dp_reset_req; }
 
         // Power-related resets
-        if(chip_reset[ChipReset::had_glitch_detect]) {
-            return ResetCause::glitch_detect;
-        }
-        if(chip_reset[ChipReset::had_bor]) {
-            return ResetCause::bor;
-        }
-        if(chip_reset[ChipReset::had_por]) {
-            return ResetCause::por;
-        }
-        if(chip_reset[ChipReset::had_run_low]) {
-            return ResetCause::run_low;
-        }
-        if(chip_reset[ChipReset::had_swcore_pd]) {
-            return ResetCause::swcore_pd;
-        }
+        if(chip_reset[ChipReset::had_glitch_detect]) { return ResetCause::glitch_detect; }
+        if(chip_reset[ChipReset::had_bor]) { return ResetCause::bor; }
+        if(chip_reset[ChipReset::had_por]) { return ResetCause::por; }
+        if(chip_reset[ChipReset::had_run_low]) { return ResetCause::run_low; }
+        if(chip_reset[ChipReset::had_swcore_pd]) { return ResetCause::swcore_pd; }
 #endif
         return ResetCause::unknown;
     }

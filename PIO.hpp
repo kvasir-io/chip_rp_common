@@ -41,31 +41,15 @@ namespace Kvasir { namespace Pio {
              unsigned SmInstance>
     static constexpr typename Dma::TriggerSource getTxDmaTrigger() {
         if constexpr(PioInstance == 0) {
-            if constexpr(SmInstance == 0) {
-                return Dma::TriggerSource::pio0_tx0;
-            }
-            if constexpr(SmInstance == 1) {
-                return Dma::TriggerSource::pio0_tx1;
-            }
-            if constexpr(SmInstance == 2) {
-                return Dma::TriggerSource::pio0_tx2;
-            }
-            if constexpr(SmInstance == 3) {
-                return Dma::TriggerSource::pio0_tx3;
-            }
+            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio0_tx0; }
+            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio0_tx1; }
+            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio0_tx2; }
+            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio0_tx3; }
         } else {
-            if constexpr(SmInstance == 0) {
-                return Dma::TriggerSource::pio1_tx0;
-            }
-            if constexpr(SmInstance == 1) {
-                return Dma::TriggerSource::pio1_tx1;
-            }
-            if constexpr(SmInstance == 2) {
-                return Dma::TriggerSource::pio1_tx2;
-            }
-            if constexpr(SmInstance == 3) {
-                return Dma::TriggerSource::pio1_tx3;
-            }
+            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio1_tx0; }
+            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio1_tx1; }
+            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio1_tx2; }
+            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio1_tx3; }
         }
     }
 
@@ -74,31 +58,15 @@ namespace Kvasir { namespace Pio {
              unsigned SmInstance>
     static constexpr typename Dma::TriggerSource getRxDmaTrigger() {
         if constexpr(PioInstance == 0) {
-            if constexpr(SmInstance == 0) {
-                return Dma::TriggerSource::pio0_rx0;
-            }
-            if constexpr(SmInstance == 1) {
-                return Dma::TriggerSource::pio0_rx1;
-            }
-            if constexpr(SmInstance == 2) {
-                return Dma::TriggerSource::pio0_rx2;
-            }
-            if constexpr(SmInstance == 3) {
-                return Dma::TriggerSource::pio0_rx3;
-            }
+            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio0_rx0; }
+            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio0_rx1; }
+            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio0_rx2; }
+            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio0_rx3; }
         } else {
-            if constexpr(SmInstance == 0) {
-                return Dma::TriggerSource::pio1_rx0;
-            }
-            if constexpr(SmInstance == 1) {
-                return Dma::TriggerSource::pio1_rx1;
-            }
-            if constexpr(SmInstance == 2) {
-                return Dma::TriggerSource::pio1_rx2;
-            }
-            if constexpr(SmInstance == 3) {
-                return Dma::TriggerSource::pio1_rx3;
-            }
+            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio1_rx0; }
+            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio1_rx1; }
+            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio1_rx2; }
+            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio1_rx3; }
         }
     }
 

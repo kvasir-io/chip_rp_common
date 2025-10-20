@@ -55,9 +55,7 @@ namespace Kvasir { namespace UART {
                 if(best > abs_f_div) {
                     best       = abs_f_div;
                     ret.second = static_cast<std::uint8_t>(divfrac);
-                    if(abs_f_div == 0.0) {
-                        return ret;
-                    }
+                    if(abs_f_div == 0.0) { return ret; }
                 }
             }
             return ret;
@@ -421,9 +419,7 @@ namespace Kvasir { namespace UART {
         inline static bool busy = false;
 
         static OperationState operationState() {
-            if(!busy) {
-                return OperationState::succeeded;
-            }
+            if(!busy) { return OperationState::succeeded; }
             // TODO timeout
             return OperationState::ongoing;
         }

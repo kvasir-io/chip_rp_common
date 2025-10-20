@@ -182,9 +182,7 @@ namespace Kvasir { namespace DMA {
 
             if constexpr(DMAConfig::callbackFunctionSize > 0) {
                 for(std::size_t i{}; auto& f : callbackFunctions) {
-                    if(((channels & (1 << i)) != 0) && f) {
-                        f();
-                    }
+                    if(((channels & (1 << i)) != 0) && f) { f(); }
                     ++i;
                 }
             }

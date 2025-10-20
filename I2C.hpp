@@ -121,12 +121,8 @@ namespace Kvasir { namespace I2C {
                 // Check datasheet minimums
                 // LCNT must be > SPKLEN + 7
                 // HCNT must be > SPKLEN + 5
-                if(regs.lcnt <= regs.spklen + 7) {
-                    return false;
-                }
-                if(regs.hcnt <= regs.spklen + 5) {
-                    return false;
-                }
+                if(regs.lcnt <= regs.spklen + 7) { return false; }
+                if(regs.hcnt <= regs.spklen + 5) { return false; }
 
                 // Verify actual baud rate is within tolerance
                 constexpr auto period       = regs.hcnt + regs.lcnt;
