@@ -114,14 +114,15 @@ namespace Kvasir { namespace Pio {
               true>(PioRegs::template FIFO<Config::SmInstance>::TXF::Addr::value,
                     reinterpret_cast<std::uint32_t>(leds.data()),
                     leds.size() * sizeof(RGB));
-
             apply(
               write(PioRegs::FDEBUG::txstall, Kvasir::Register::value<1 << Config::SmInstance>()));
+
+            running = true;
         }
 
         static bool ready() {
             if(running) { return false; }
-            return whenRdy > Clock::now() || whenRdy == typename Clock::time_point{};
+            return Clock::now() >= whenRdy || whenRdy == typename Clock::time_point{};
         }
 
         static void handler() {
