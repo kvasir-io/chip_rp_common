@@ -267,7 +267,7 @@ inline void resetToUsbBoot() {
     } else {
         static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL = 0x0002;
 
-        auto const ret = detail::reboot(REBOOT_TYPE_BOOTSEL, 0, 0, 0);
+        [[maybe_unused]] auto const ret = detail::reboot(REBOOT_TYPE_BOOTSEL, 0, 0, 0);
         UC_LOG_C("reboot ret {}", ret);
     }
 
@@ -280,3 +280,4 @@ inline auto serialNumber() {
     return serial_number;
 }
 }   // namespace Kvasir
+
