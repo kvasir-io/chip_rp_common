@@ -155,15 +155,6 @@ namespace Kvasir { namespace DefaultClockSettings {
           write(QMI::M0_TIMING::max_select, value<std::uint32_t, 0>()),
           write(QMI::M0_TIMING::min_deselect, value<std::uint32_t, 0>())));
 
-        apply(QMI::M0_RFMT::overrideDefaults(write(QMI::M0_RFMT::dtr, value<std::uint32_t, 0>()),
-                                             write(QMI::M0_RFMT::DUMMY_LENValC::_16),
-                                             write(QMI::M0_RFMT::SUFFIX_LENValC::_8),
-                                             write(QMI::M0_RFMT::PREFIX_LENValC::_8),
-                                             write(QMI::M0_RFMT::DATA_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::DUMMY_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::SUFFIX_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::ADDR_WIDTHValC::q),
-                                             write(QMI::M0_RFMT::PREFIX_WIDTHValC::s)));
 #endif
     }
 

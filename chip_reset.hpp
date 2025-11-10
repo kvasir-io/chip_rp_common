@@ -1,3 +1,5 @@
+#pragma once
+
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
 
