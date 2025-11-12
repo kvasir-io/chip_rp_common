@@ -280,4 +280,3 @@ inline auto serialNumber() {
     return serial_number;
 }
 }   // namespace Kvasir
-

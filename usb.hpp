@@ -12,6 +12,19 @@
 #include <span>
 
 namespace Kvasir { namespace USB {
+    namespace detail {
+        static void device_memory_memcpy(void*       dst,
+                                         void const* src,
+                                         std::size_t n) {
+#ifdef __ARM_FEATURE_UNALIGNED
+            std::uint8_t*       dst_byte = static_cast<std::uint8_t*>(dst);
+            std::uint8_t const* src_byte = static_cast<std::uint8_t const*>(src);
+            while(n--) { *dst_byte++ = *src_byte++; }
+#else
+            std::memcpy(dst, src, n);
+#endif
+        }
+    }   // namespace detail
 
     enum class DescriptorType : std::uint8_t {
         Device               = 0x01,
@@ -621,7 +634,7 @@ namespace Kvasir { namespace USB {
 
             static Kvasir::USB::SetupPacket getSetupPacket() {
                 Kvasir::USB::SetupPacket ret;
-                std::memcpy(
+                detail::device_memory_memcpy(
                   std::addressof(ret),
                   reinterpret_cast<void const*>(BufferRegs::SETUP_PACKET_LOW::Addr::value),
                   sizeof(Kvasir::USB::SetupPacket));
@@ -705,13 +718,15 @@ namespace Kvasir { namespace USB {
 
                 if(!data.empty()) {
                     if constexpr(Buffer == 0) {
-                        std::memcpy(reinterpret_cast<void*>(B::template IN<0>::Addr::value),
-                                    data.data(),
-                                    data.size());
+                        detail::device_memory_memcpy(
+                          reinterpret_cast<void*>(B::template IN<0>::Addr::value),
+                          data.data(),
+                          data.size());
                     } else {
-                        std::memcpy(reinterpret_cast<void*>(B::template IN<1>::Addr::value),
-                                    data.data(),
-                                    data.size());
+                        detail::device_memory_memcpy(
+                          reinterpret_cast<void*>(B::template IN<1>::Addr::value),
+                          data.data(),
+                          data.size());
                     }
                 }
 
@@ -1039,15 +1054,17 @@ namespace Kvasir { namespace USB {
             if(!buffer) {
                 len     = apply(read(BufferRegs::template EP<2>::OUT_BUFFER_CONTROL_0::length));
                 using B = typename BufferRegs::template DOUBLEBUFFER<2>;
-                std::memcpy(x.data(),
-                            reinterpret_cast<void*>(B::template OUT<0>::Addr::value),
-                            len);
+                detail::device_memory_memcpy(
+                  x.data(),
+                  reinterpret_cast<void*>(B::template OUT<0>::Addr::value),
+                  len);
             } else {
                 len     = apply(read(BufferRegs::template EP<2>::OUT_BUFFER_CONTROL_1::length));
                 using B = typename BufferRegs::template DOUBLEBUFFER<2>;
-                std::memcpy(x.data(),
-                            reinterpret_cast<void*>(B::template OUT<1>::Addr::value),
-                            len);
+                detail::device_memory_memcpy(
+                  x.data(),
+                  reinterpret_cast<void*>(B::template OUT<1>::Addr::value),
+                  len);
             }
             recvBuffer.push(std::span{x.data(), len});
             recv();
@@ -1289,15 +1306,17 @@ namespace Kvasir { namespace USB {
             if(!buffer) {
                 len     = apply(read(BufferRegs::template EP<1>::OUT_BUFFER_CONTROL_0::length));
                 using B = typename BufferRegs::template DOUBLEBUFFER<1>;
-                std::memcpy(x.data(),
-                            reinterpret_cast<void*>(B::template OUT<0>::Addr::value),
-                            len);
+                detail::device_memory_memcpy(
+                  x.data(),
+                  reinterpret_cast<void*>(B::template OUT<0>::Addr::value),
+                  len);
             } else {
                 len     = apply(read(BufferRegs::template EP<1>::OUT_BUFFER_CONTROL_1::length));
                 using B = typename BufferRegs::template DOUBLEBUFFER<1>;
-                std::memcpy(x.data(),
-                            reinterpret_cast<void*>(B::template OUT<1>::Addr::value),
-                            len);
+                detail::device_memory_memcpy(
+                  x.data(),
+                  reinterpret_cast<void*>(B::template OUT<1>::Addr::value),
+                  len);
             }
             recvBuffer.push(std::span{x.data(), len});
             recv();
