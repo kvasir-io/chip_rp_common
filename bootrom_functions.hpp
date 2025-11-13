@@ -2,7 +2,7 @@
 #include <cassert>
 #include <cstdint>
 #include <functional>
-
+#include <kvasir/Util/StaticString.hpp>
 #if __has_include("peripherals/QMI.hpp")
     #include "peripherals/QMI.hpp"
 #endif
@@ -256,6 +256,59 @@ namespace detail {
         }
     }
 
+    static inline std::optional<Kvasir::StaticString<30>> read_white_label_serial_number() {
+        constexpr std::uint32_t OTP_DATA_BASE                         = 0x40130000;
+        constexpr std::uint16_t OTP_DATA_USB_WHITE_LABEL_ADDR_ROW     = 0x005c;
+        constexpr std::uint32_t INDEX_USB_DEVICE_SERIAL_NUMBER_STRDEF = 6;
+        constexpr std::size_t   MAX_SERIAL_LENGTH                     = 30;
+
+        auto otp_read_ecc = [](std::uint16_t row) -> std::uint16_t {
+            return *reinterpret_cast<std::uint16_t const volatile*>(OTP_DATA_BASE
+                                                                    + row * sizeof(std::uint16_t));
+        };
+
+        std::uint16_t const white_label_addr = otp_read_ecc(OTP_DATA_USB_WHITE_LABEL_ADDR_ROW);
+
+        if(white_label_addr == 0 || white_label_addr == 0xFFFF) { return std::nullopt; }
+
+        std::uint16_t const string_definition
+          = otp_read_ecc(white_label_addr + INDEX_USB_DEVICE_SERIAL_NUMBER_STRDEF);
+
+        if(string_definition == 0x0000 || string_definition == 0xFFFF) { return std::nullopt; }
+
+        constexpr std::uint8_t UNICODE_FLAG_BIT = 0x80;
+        constexpr std::uint8_t LENGTH_MASK      = 0x7F;
+
+        bool const         is_unicode      = (string_definition & UNICODE_FLAG_BIT) != 0;
+        std::size_t const  character_count = string_definition & LENGTH_MASK;
+        std::uint8_t const data_row_offset
+          = static_cast<std::uint8_t>((string_definition >> 8) & 0xFF);
+
+        if(is_unicode || character_count == 0 || character_count > MAX_SERIAL_LENGTH) {
+            return std::nullopt;
+        }
+
+        std::uint16_t const      string_data_start_row = white_label_addr + data_row_offset;
+        Kvasir::StaticString<30> result;
+        result.resize(character_count);
+
+        auto              output_iter = result.begin();
+        std::size_t const num_rows    = (character_count + 1) / 2;
+
+        for(std::size_t row_index = 0; row_index < num_rows; ++row_index) {
+            std::uint16_t const packed_chars
+              = otp_read_ecc(static_cast<std::uint16_t>(string_data_start_row + row_index));
+
+            *output_iter++ = static_cast<char>(packed_chars & 0xFF);
+
+            if(output_iter != result.end()) {
+                *output_iter++ = static_cast<char>((packed_chars >> 8) & 0xFF);
+            }
+        }
+
+        return result;
+    }
+
 }   // namespace detail
 
 inline void resetToUsbBoot() {
@@ -279,4 +332,31 @@ inline auto serialNumber() {
     static std::array<std::byte, 8> const serial_number = detail::read_serial_number();
     return serial_number;
 }
+
+inline auto serialNumberString() {
+    auto const               rawSerialBytes = Kvasir::serialNumber();
+    Kvasir::StaticString<16> hexSerialString;
+    static constexpr std::array<char, 16>
+      hexDigits{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+
+    for(auto const& byte : rawSerialBytes) {
+        hexSerialString.push_back(hexDigits[(static_cast<int>(byte) & 0xF0) >> 4]);
+        hexSerialString.push_back(hexDigits[static_cast<int>(byte) & 0x0F]);
+    }
+
+    return hexSerialString;
+}
+
+inline auto whiteLabelSerialNumber() {
+    static std::optional<Kvasir::StaticString<30>> const serial_number
+      = detail::read_white_label_serial_number();
+    return serial_number;
+}
+
+inline Kvasir::StaticString<30> bootromUSBSerialNumber() {
+    auto const whiteLabelSerial = Kvasir::whiteLabelSerialNumber();
+    if(whiteLabelSerial.has_value()) { return whiteLabelSerial.value(); }
+    return serialNumberString();
+}
+
 }   // namespace Kvasir
