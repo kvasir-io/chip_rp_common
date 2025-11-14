@@ -480,17 +480,9 @@ namespace Kvasir { namespace I2C {
                         auto const data = buffer_.front();
                         buffer_.pop();
                         if(buffer_.empty() && stop) {
-                            /*                    Regs::IC_DATA_CMD::overrideDefaultsRuntime(
+                            Regs::IC_DATA_CMD::overrideDefaultsRuntime(
                               write(Regs::IC_DATA_CMD::STOPValC::enable),
                               write(Regs::IC_DATA_CMD::dat, static_cast<std::uint8_t>(data)));
-*/
-                            //TODO fix in kvasir
-                            std::uint32_t v = static_cast<std::uint8_t>(data);
-                            v               = v | 0x200;
-                            *reinterpret_cast<std::uint32_t volatile*>(
-                              Regs::IC_DATA_CMD::Addr::value)
-                              = v;
-
                         } else {
                             Regs::IC_DATA_CMD::overrideDefaultsRuntime(
                               write(Regs::IC_DATA_CMD::dat, static_cast<std::uint8_t>(data)));
