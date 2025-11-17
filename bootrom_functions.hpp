@@ -56,6 +56,8 @@ namespace detail {
         using RomFlashFlushCache      = void (*)(void);
         using XipEnableFunction       = void (*)(void);
 
+        RomConnectInternalFlash const       connectInternalFlash;
+        RomFlashExitXip const               flashExitXip;
         RomFlashFlushCache const            flushCache;
         std::array<std::uint32_t, 64> const xipEnableRamCopy;
         XipEnableFunction const             xipEnable;
@@ -75,8 +77,15 @@ namespace detail {
             }
         }
 
-        [[KVASIR_RAM_FUNC_ATTRIBUTES]] FlashXipDisabler()
-          : flushCache{Kvasir::RomFunctions::getRomFunctionPointer<'F',
+        FlashXipDisabler()
+          : connectInternalFlash{Kvasir::RomFunctions::getRomFunctionPointer<
+              'I',
+              'F',
+              RomConnectInternalFlash>()}
+          , flashExitXip{Kvasir::RomFunctions::getRomFunctionPointer<'E',
+                                                                     'X',
+                                                                     RomFlashExitXip>()}
+          , flushCache{Kvasir::RomFunctions::getRomFunctionPointer<'F',
                                                                    'C',
                                                                    RomFlashFlushCache>()}
           , xipEnableRamCopy{getXipEnable()}
@@ -87,20 +96,35 @@ namespace detail {
             using QMI   = Registers<0>;
             flashTiming = apply(read(QMI::M0_TIMING::FULLREGISTER));
 #endif
-            Kvasir::RomFunctions::call<'I', 'F', RomConnectInternalFlash>();
-            Kvasir::RomFunctions::call<'E', 'X', RomFlashExitXip>();
         }
 
-        [[KVASIR_RAM_FUNC_ATTRIBUTES]] ~FlashXipDisabler() {
+        [[KVASIR_RAM_FUNC_ATTRIBUTES]] void disable() {
+            connectInternalFlash();
+            flashExitXip();
+        }
+
+        [[KVASIR_RAM_FUNC_ATTRIBUTES]] void enable() {
             flushCache();
             xipEnable();
-
 #if __has_include("peripherals/QMI.hpp")
             using namespace Kvasir::Peripheral::QMI;
             using QMI = Registers<0>;
             apply(write(QMI::M0_TIMING::FULLREGISTER, flashTiming));
 #endif
         }
+    };
+
+    struct XipGuard {
+        FlashXipDisabler& disabler;
+
+        [[KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] explicit XipGuard(FlashXipDisabler& d) : disabler(d) {
+            disabler.disable();
+        }
+
+        [[KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] ~XipGuard() { disabler.enable(); }
+
+        XipGuard(XipGuard const&)            = delete;
+        XipGuard& operator=(XipGuard const&) = delete;
     };
 
     static inline int get_sys_info(std::uint32_t* out_buffer,
@@ -128,54 +152,94 @@ namespace detail {
     }
 
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
-    flash_erase_and_write(std::uint32_t       offset,
-                          std::uint8_t const* data,
-                          std::size_t         size) {
-        auto erase = RomFunctions::getRomFunctionPointer<
-          'R',
-          'E',
-          void (*)(std::uint32_t, std::size_t, std::uint32_t, std::uint8_t)>();
-        auto write = RomFunctions::getRomFunctionPointer<
-          'R',
-          'P',
-          void (*)(std::uint32_t, std::uint8_t const*, std::size_t)>();
-
-        FlashXipDisabler xipDisabler{};
+    flash_erase_and_write_impl(FlashXipDisabler& xipDisabler,
+                               void (*erase)(std::uint32_t,
+                                             std::size_t,
+                                             std::uint32_t,
+                                             std::uint8_t),
+                               void (*write)(std::uint32_t,
+                                             std::uint8_t const*,
+                                             std::size_t),
+                               std::uint32_t       offset,
+                               std::uint8_t const* data,
+                               std::size_t         size) {
+        XipGuard guard{xipDisabler};
         erase(offset, 4096, 1 << 16, 0xD8);
         write(offset, data, size);
     }
 
-    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void flash_erase(std::uint32_t offset,
-                                                                  std::size_t   blocks) {
+    static inline void flash_erase_and_write(std::uint32_t       offset,
+                                             std::uint8_t const* data,
+                                             std::size_t         size) {
         auto erase = RomFunctions::getRomFunctionPointer<
           'R',
           'E',
           void (*)(std::uint32_t, std::size_t, std::uint32_t, std::uint8_t)>();
-
-        FlashXipDisabler xipDisabler{};
-        erase(offset, blocks * 4096, 1 << 16, 0xD8);
-    }
-
-    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void flash_write(std::uint32_t       offset,
-                                                                  std::uint8_t const* data,
-                                                                  std::size_t         size) {
         auto write = RomFunctions::getRomFunctionPointer<
           'R',
           'P',
           void (*)(std::uint32_t, std::uint8_t const*, std::size_t)>();
 
         FlashXipDisabler xipDisabler{};
+        flash_erase_and_write_impl(xipDisabler, erase, write, offset, data, size);
+    }
+
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
+    flash_erase_impl(FlashXipDisabler& xipDisabler,
+                     void (*erase)(std::uint32_t,
+                                   std::size_t,
+                                   std::uint32_t,
+                                   std::uint8_t),
+                     std::uint32_t offset,
+                     std::size_t   blocks) {
+        XipGuard guard{xipDisabler};
+        erase(offset, blocks * 4096, 1 << 16, 0xD8);
+    }
+
+    static inline void flash_erase(std::uint32_t offset,
+                                   std::size_t   blocks) {
+        auto erase = RomFunctions::getRomFunctionPointer<
+          'R',
+          'E',
+          void (*)(std::uint32_t, std::size_t, std::uint32_t, std::uint8_t)>();
+
+        FlashXipDisabler xipDisabler{};
+        flash_erase_impl(xipDisabler, erase, offset, blocks);
+    }
+
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
+    flash_write_impl(FlashXipDisabler& xipDisabler,
+                     void (*write)(std::uint32_t,
+                                   std::uint8_t const*,
+                                   std::size_t),
+                     std::uint32_t       offset,
+                     std::uint8_t const* data,
+                     std::size_t         size) {
+        XipGuard guard{xipDisabler};
         write(offset, data, size);
     }
 
+    static inline void flash_write(std::uint32_t       offset,
+                                   std::uint8_t const* data,
+                                   std::size_t         size) {
+        auto write = RomFunctions::getRomFunctionPointer<
+          'R',
+          'P',
+          void (*)(std::uint32_t, std::uint8_t const*, std::size_t)>();
+
+        FlashXipDisabler xipDisabler{};
+        flash_write_impl(xipDisabler, write, offset, data, size);
+    }
+
+#if __has_include("peripherals/XIP_SSI.hpp")
     //rp2040 function
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
-    flash_do_cmd([[maybe_unused]] std::span<std::byte const> txBuffer,
-                 [[maybe_unused]] std::span<std::byte>       rxBuffer) {
-#if __has_include("peripherals/XIP_SSI.hpp")
+    flash_do_cmd_impl(FlashXipDisabler&          xipDisabler,
+                      std::span<std::byte const> txBuffer,
+                      std::span<std::byte>       rxBuffer) {
         using QSPI_CS  = Kvasir::Peripheral::IO_QSPI::Registers<>::GPIO_QSPI_SS_CTRL::OUTOVERValC;
         using SSI_Regs = Kvasir::Peripheral::XIP_SSI::Registers<>;
-        FlashXipDisabler xipDisabler{};
+        XipGuard guard{xipDisabler};
 
         apply(write(QSPI_CS::low));
 
@@ -200,13 +264,21 @@ namespace detail {
         }
 
         apply(write(QSPI_CS::high));
-#endif
     }
 
+    //rp2040 function
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
+    flash_do_cmd(std::span<std::byte const> txBuffer,
+                 std::span<std::byte>       rxBuffer) {
+        FlashXipDisabler xipDisabler{};
+        flash_do_cmd_impl(xipDisabler, txBuffer, rxBuffer);
+    }
+
+#endif
     static inline std::array<std::byte,
-                             8>
-    read_serial_number() {
+                             8> read_serial_number() {
         if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
+#if __has_include("peripherals/XIP_SSI.hpp")
             static constexpr std::byte   Cmd{0x4b};
             static constexpr std::size_t DummyBytes = 5;
             static constexpr std::size_t DataBytes  = 8;
@@ -222,6 +294,7 @@ namespace detail {
             std::array<std::byte, DataBytes> id;
             std::copy(rxBuffer.begin() + DummyBytes, rxBuffer.end(), id.begin());
             return id;
+#endif
         } else {
             std::array<std::uint32_t, 4> buffer{};
 
