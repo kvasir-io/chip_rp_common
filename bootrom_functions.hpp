@@ -391,9 +391,11 @@ inline void resetToUsbBoot() {
 
         RomFunctions::call<'U', 'B', romResetToUsbBoot>(0, 0);
     } else {
-        static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL = 0x0002;
+        static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
+        static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL  = 0x0002;
 
-        [[maybe_unused]] auto const ret = detail::reboot(REBOOT_TYPE_BOOTSEL, 0, 0, 0);
+        [[maybe_unused]] auto const ret
+          = detail::reboot(REBOOT_TYPE_BOOTSEL | NO_RETURN_ON_SUCCESS, 1, 0, 0);
         UC_LOG_C("reboot ret {}", ret);
     }
 
