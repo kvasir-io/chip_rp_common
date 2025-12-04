@@ -50,6 +50,18 @@ private:
         return false;
     }
 
+    static bool AbortDoneCallback(std::size_t epNum,
+                                  bool        in) {
+        if(epNum == EP_IN::ep_num && in) {
+            EP_IN::abortDone();
+            return true;
+        } else if(epNum == EP_OUT::ep_num && !in) {
+            EP_OUT::abortDone();
+            return true;
+        }
+        return false;
+    }
+
     static bool SetupPacketRequestCallback([[maybe_unused]] SetupPacket const& pkt) {
         return false;
     }
@@ -58,13 +70,23 @@ private:
         currentSendData = std::span<std::byte const>{};
         sendRdy         = false;
         recvBuffer.clear();
+        EP_IN::abort();
+        EP_OUT::abort();
         EP_IN::reset();
         EP_OUT::reset();
     }
 
-    static void ConfiguredCallback() {
-        sendRdy = true;
-        recv();
+    static void ConfiguredCallback(std::uint8_t configuration) {
+        if(configuration == 0) {
+            currentSendData = std::span<std::byte const>{};
+            sendRdy         = false;
+            recvBuffer.clear();
+            EP_OUT::abort();
+            EP_OUT::resetPid();
+        } else {
+            sendRdy = true;
+            recv();
+        }
     }
 
     static void SetupEndpointsCallback() {
@@ -79,22 +101,28 @@ private:
         std::array<std::byte, MaxPacketSize> tempBuffer{};
         std::size_t const                    len = EP_OUT::readCurrentBuffer(tempBuffer);
         recvBuffer.push(std::span{tempBuffer.data(), len});
+
+        EP_OUT::bufferFinished();
         recv();
     }
 
-    static void onEndpointIn() { sendNext(); }
+    static void onEndpointIn() {
+        EP_IN::bufferFinished();
+        sendNext();
+    }
 
-    static void sendNext() {
+    static bool sendNext() {
         if(currentSendData.size() > MaxPacketSize) {
             auto const sub  = currentSendData.subspan(0, MaxPacketSize);
             currentSendData = currentSendData.subspan(MaxPacketSize);
-            send_impl<false>(sub);
+            return send_impl<false>(sub);
         } else if(!currentSendData.empty()) {
             auto const sub  = currentSendData;
             currentSendData = std::span<std::byte const>{};
-            send_impl<true>(sub);
+            return send_impl<true>(sub);
         } else {
             sendRdy = true;
+            return true;
         }
     }
 
@@ -110,16 +138,12 @@ public:
 
     static auto& getRecvBuffer() { return recvBuffer; }
 
-    static bool send(std::span<std::byte const> data) {
-        assert(sendRdy == true);
-        return send_impl<true>(data);
-    }
-
-    static void send_nocopy(std::span<std::byte const> data) {
-        assert(sendRdy == true);
+    static bool send_nocopy(std::span<std::byte const> data) {
+        //TODO think about locking isr
+        if(!sendRdy) { return false; }
         currentSendData = data;
         sendRdy         = false;
-        sendNext();
+        return sendNext();
     }
 };
 }   // namespace Kvasir::USB::detail

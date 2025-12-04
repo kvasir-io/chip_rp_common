@@ -11,6 +11,7 @@
 #include <span>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace Kvasir::USB::detail {
 template<typename Base, std::size_t EP, EndpointDirection Dir, EndpointTransferType Type>
@@ -19,17 +20,30 @@ private:
     using BufferRegs = typename Base::BufferRegs;
     using Regs       = typename Base::Regs;
 
+    static constexpr bool DoubleBufferd = Base::DoubleBufferd;
+
     struct EPState {
-        bool next_pid_data1{false};   // false=DATA0, true=DATA1
-        bool next_buffer_b{false};    // false=buffer_0, true=buffer_1
+        bool next_pid_data1{};   // false=DATA0, true=DATA1
+
+        using bufferType = std::conditional_t<DoubleBufferd, bool, std::monostate>;
+
+        [[no_unique_address]] bufferType next_buffer_b{};   // false=buffer_0, true=buffer_1
 
         constexpr void togglePid() { next_pid_data1 = !next_pid_data1; }
 
-        constexpr void toggleBuffer() { next_buffer_b = !next_buffer_b; }
+        constexpr void toggleBuffer() {
+            if constexpr(DoubleBufferd) { next_buffer_b = !next_buffer_b; }
+        }
+
+        constexpr void resetBuffer() {
+            if constexpr(DoubleBufferd) { next_buffer_b = false; }
+        }
+
+        constexpr void resetPid() { next_pid_data1 = false; }
 
         constexpr void reset() {
-            next_pid_data1 = false;
-            next_buffer_b  = false;
+            resetBuffer();
+            resetPid();
         }
 
         constexpr void setSetupStage() { next_pid_data1 = false; }
@@ -38,7 +52,13 @@ private:
 
         constexpr bool pid() const { return next_pid_data1; }
 
-        constexpr std::size_t buffer() const { return next_buffer_b ? 1 : 0; }
+        constexpr std::size_t buffer() const {
+            if constexpr(DoubleBufferd) {
+                return next_buffer_b ? 1 : 0;
+            } else {
+                return 0;
+            }
+        }
     };
 
 public:
@@ -63,16 +83,32 @@ private:
                            typename BufferRegs::template EP<EP>::IN_BUFFER_CONTROL,
                            typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL>;
 
+    static constexpr std::uint32_t EPBitMask = (1 << ((EP * 2) + (IsIn ? 0 : 1)));
+
     template<std::size_t Buffer,
              bool        Last>
     static void writeBufferControl(bool          pid,
                                    std::uint16_t length) {
         using BC = BufferControlReg<Buffer>;
-        apply(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
-              write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
-              write(BC::pid, pid ? 1 : 0),
-              write(BC::length, length),
-              set(BC::available));
+        BC::overrideDefaultsRuntime(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
+                                    write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
+                                    write(BC::pid, pid ? 1 : 0),
+                                    write(BC::length, length),
+                                    set(BC::available));
+    }
+
+    static void clearBufferControl() {
+        if constexpr(DoubleBufferd) {
+            apply(BothBuffersControlReg::overrideDefaults());
+        } else {
+            apply(BufferControlReg<0>::overrideDefaults());
+        }
+    }
+
+    static void resetBufferSelect() {
+        if constexpr(DoubleBufferd) {
+            apply(BothBuffersControlReg::overrideDefaults(set(BothBuffersControlReg::reset)));
+        }
     }
 
     template<std::size_t Buffer,
@@ -161,14 +197,17 @@ private:
     }
 
     static std::array<bool,
-                      2>
+                      DoubleBufferd ? 2 : 1>
     getBufferAvailable() {
-        auto const av = apply(read(BothBuffersControlReg::available_0),
-                              read(BothBuffersControlReg::available_1));
-        return {!static_cast<bool>(get<0>(av)), !static_cast<bool>(get<1>(av))};
+        if constexpr(DoubleBufferd) {
+            auto const av = apply(read(BothBuffersControlReg::available_0),
+                                  read(BothBuffersControlReg::available_1));
+            return {!static_cast<bool>(get<0>(av)), !static_cast<bool>(get<1>(av))};
+        } else {
+            auto const av = apply(read(BufferControlReg<0>::available));
+            return {!static_cast<bool>(get<0>(av))};
+        }
     }
-
-    static void resetBufferSelect() { apply(set(BothBuffersControlReg::reset)); }
 
 public:
     template<bool Last,
@@ -177,9 +216,13 @@ public:
         using namespace std::string_view_literals;
         auto const buffersAvailable = getBufferAvailable();
 
-        // Both buffers busy?
-        if(!buffersAvailable[0] && !buffersAvailable[1]) {
-            UC_LOG_W("EP{} {}: Both buffers busy, cannot transfer", EP, IsIn ? "IN"sv : "OUT"sv);
+        // All buffers busy?
+        if(std::ranges::none_of(buffersAvailable, [](bool av) { return av; })) {
+            UC_LOG_W("EP{} {}: All buffers busy, cannot transfer (buffers_av: {}) {}",
+                     EP,
+                     IsIn ? "IN"sv : "OUT"sv,
+                     buffersAvailable,
+                     BothBuffersControlReg{});
             return false;
         }
 
@@ -187,23 +230,26 @@ public:
 
         // Try expected
         if(buffersAvailable[expectedBuffer]) {
-            if(expectedBuffer == 0) {
-                startTransfer<0, Last>(data, state.pid());
+            bool const pidToUse = state.pid();
+
+            if constexpr(DoubleBufferd) {
+                if(expectedBuffer == 0) {
+                    startTransfer<0, Last>(data, pidToUse);
+                } else {
+                    startTransfer<1, Last>(data, pidToUse);
+                }
             } else {
-                startTransfer<1, Last>(data, state.pid());
+                startTransfer<0, Last>(data, pidToUse);
             }
-            state.toggleBuffer();
-            state.togglePid();
             return true;
         }
 
         // Expected buffer busy
-        UC_LOG_W("EP{} {}: Buffer {} not available (buffer0={}, buffer1={})",
+        UC_LOG_W("EP{} {}: Buffer {} not available (buffers_av: {})",
                  EP,
                  IsIn ? "IN"sv : "OUT"sv,
                  expectedBuffer,
-                 buffersAvailable[0] ? "free"sv : "busy"sv,
-                 buffersAvailable[1] ? "free"sv : "busy"sv);
+                 buffersAvailable);
 
         return false;
     }
@@ -213,28 +259,32 @@ public:
     static std::size_t readCurrentBuffer(std::span<std::byte> dest) {
         static_assert(!IsIn, "read only on OUT endpoint");
 
-        std::uint32_t const buffers = apply(read(Regs::BUFF_CPU_SHOULD_HANDLE::FULLREGISTER));
+        if constexpr(DoubleBufferd) {
+            std::uint32_t const buffers = apply(read(Regs::BUFF_CPU_SHOULD_HANDLE::FULLREGISTER));
 
-        static constexpr std::uint32_t EPBitMask = (1 << ((EP * 2) + (IsIn ? 0 : 1)));
+            bool const buffer0 = (buffers & EPBitMask) == 0;
 
-        bool const buffer0 = (buffers & EPBitMask) == 0;
-
-        if(buffer0) {
-            if(!state.next_buffer_b) {
-                UC_LOG_W(
-                  "EP{} OUT: Buffer mismatch - HW indicates buffer0 but state expects "
-                  "buffer1",
-                  EP);
+            if(buffer0) {
+                if(state.buffer() != 0) {
+                    UC_LOG_W(
+                      "EP{} OUT: Buffer mismatch - HW indicates buffer0 but state expects "
+                      "buffer1",
+                      EP);
+                    return 0;
+                }
+                return readBuffer<0>(dest);
+            } else {
+                if(state.buffer() != 1) {
+                    UC_LOG_W(
+                      "EP{} OUT: Buffer mismatch - HW indicates buffer1 but state expects "
+                      "buffer0",
+                      EP);
+                    return 0;
+                }
+                return readBuffer<1>(dest);
             }
-            return readBuffer<0>(dest);
         } else {
-            if(state.next_buffer_b) {
-                UC_LOG_W(
-                  "EP{} OUT: Buffer mismatch - HW indicates buffer1 but state expects "
-                  "buffer0",
-                  EP);
-            }
-            return readBuffer<1>(dest);
+            return readBuffer<0>(dest);
         }
     }
 
@@ -261,7 +311,27 @@ public:
         }
     }
 
+    static void abort() {
+        std::uint32_t const aborts = apply(read(Regs::EP_ABORT::FULLREGISTER));
+        apply(write(Regs::EP_ABORT::FULLREGISTER, aborts | EPBitMask));
+    }
+
+    static void abortDone() {
+        std::uint32_t const aborts = apply(read(Regs::EP_ABORT::FULLREGISTER));
+        apply(write(Regs::EP_ABORT::FULLREGISTER, aborts & ~EPBitMask));
+        clearBufferControl();
+    }
+
     static void reset() { state.reset(); }
+
+    static void resetPid() { state.resetPid(); }
+
+    static void resetBuffer() { state.resetBuffer(); }
+
+    static void bufferFinished() {
+        state.toggleBuffer();
+        state.togglePid();
+    }
 
     static void clearStall() {
         apply(clear(BothBuffersControlReg::stall));
@@ -295,7 +365,7 @@ public:
             apply(EPReg::overrideDefaults(
               set(EPReg::enable),
               write(regValue),
-              set(EPReg::double_buffered),
+              write(EPReg::double_buffered, Kvasir::Register::value<DoubleBufferd ? 1 : 0>()),
               set(EPReg::interrupt_per_buff),
               write(EPReg::buffer_address, Kvasir::Register::value<getBufferOffset()>())));
         }

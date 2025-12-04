@@ -274,6 +274,11 @@ namespace ACM {
             return DataEndpointHandler::EndpointHandlerCallback(epNum, in);
         }
 
+        static bool AbortDoneCallback(std::size_t epNum,
+                                      bool        in) {
+            return DataEndpointHandler::AbortDoneCallback(epNum, in);
+        }
+
         static void ResetCallback() {
             should_handle_line_coding = false;
             acm_connected             = false;
@@ -281,7 +286,10 @@ namespace ACM {
             DataEndpointHandler::ResetCallback();
         }
 
-        static void ConfiguredCallback() { DataEndpointHandler::ConfiguredCallback(); }
+        static void ConfiguredCallback(std::uint8_t configuration) {
+            if(configuration == 0) { acm_connected = false; }
+            DataEndpointHandler::ConfiguredCallback(configuration);
+        }
 
         // State
         static inline std::atomic<bool>    acm_connected             = false;
@@ -293,7 +301,7 @@ namespace ACM {
         static bool isConnected() { return acm_connected; }
 
         // Expose SendRecvAdapter Public API
-        static bool isSendReady() { return DataEndpointHandler::isSendReady(); }
+        static bool isSendReady() { return DataEndpointHandler::isSendReady() && isConnected(); }
 
         static auto& getRecvBuffer() { return DataEndpointHandler::getRecvBuffer(); }
 

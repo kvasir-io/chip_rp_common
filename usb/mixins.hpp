@@ -224,6 +224,23 @@ struct MixinTraits::MixinBases<Clock,
         return false;
     }
 
+    static bool callAbortDone(std::size_t epNum,
+                              bool        in) {
+        if constexpr(sizeof...(Mixins) > 0) {
+            return (
+              Mixins<Clock,
+                     Config,
+                     Derived,
+                     BaseInterface
+                       + MixinTraits::getInterfaceOffset<Clock, Config, Derived, Mixins...>(Is),
+                     BaseEndpoint
+                       + MixinTraits::getEndpointOffset<Clock, Config, Derived, Mixins...>(
+                         Is)>::AbortDoneCallback(epNum, in)
+              || ...);
+        }
+        return false;
+    }
+
     static void callReset() {
         if constexpr(sizeof...(Mixins) > 0) {
             (Mixins<Clock,
@@ -238,7 +255,7 @@ struct MixinTraits::MixinBases<Clock,
         }
     }
 
-    static void callConfigured() {
+    static void callConfigured(std::uint8_t configuration) {
         if constexpr(sizeof...(Mixins) > 0) {
             (Mixins<Clock,
                     Config,
@@ -247,7 +264,7 @@ struct MixinTraits::MixinBases<Clock,
                       + MixinTraits::getInterfaceOffset<Clock, Config, Derived, Mixins...>(Is),
                     BaseEndpoint
                       + MixinTraits::getEndpointOffset<Clock, Config, Derived, Mixins...>(
-                        Is)>::ConfiguredCallback(),
+                        Is)>::ConfiguredCallback(configuration),
              ...);
         }
     }

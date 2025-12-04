@@ -76,15 +76,10 @@ namespace detail {
         using BufferRegs  = Kvasir::Peripheral::USB_DPRAM::Registers<0>;
         using SetupPacket = Kvasir::USB::SetupPacket;
 
-        using EP0_IN
-          = EndpointOps<USBBase, 0, EndpointDirection::In, EndpointTransferType::Control>;
-        using EP0_OUT
-          = EndpointOps<USBBase, 0, EndpointDirection::Out, EndpointTransferType::Control>;
-
         struct Config : ConfigT {
             static constexpr bool UseSof = [] {
-                if constexpr(requires { ConfigT::UseSof; }) {
-                    return ConfigT::UseSof;
+                if constexpr(requires { ConfigT::StartOfFrameCallback(std::uint16_t{}); }) {
+                    return true;
                 } else {
                     return false;
                 }
@@ -113,11 +108,21 @@ namespace detail {
                     return 1;
                 }
             }();
+            static constexpr auto DoubleBufferd = [] {
+                if constexpr(requires { ConfigT::DoubleBufferd; }) {
+                    return ConfigT::DoubleBufferd;
+                } else {
+                    return true;
+                }
+            }();
         };
 
-        using SofFunctionType = std::conditional_t<Config::UseSof,
-                                                   Kvasir::StaticFunction<void(std::uint16_t), 128>,
-                                                   std::monostate>;
+        static constexpr bool DoubleBufferd = Config::DoubleBufferd;
+
+        using EP0_IN
+          = EndpointOps<USBBase, 0, EndpointDirection::In, EndpointTransferType::Control>;
+        using EP0_OUT
+          = EndpointOps<USBBase, 0, EndpointDirection::Out, EndpointTransferType::Control>;
 
         template<typename T>
         static constexpr auto wrapDescriptorString(T const& value) {
@@ -163,18 +168,20 @@ namespace detail {
         }();
 
         // State
-        static inline std::atomic<bool>          configured{false};
+        static inline std::atomic<std::uint8_t>  configuration{};
         static inline std::uint8_t               deviceBusAddr{};
         static inline bool                       pendingAddressSet{false};
         static inline std::span<std::byte const> remainingConfigDescriptor{};
-        static inline SofFunctionType            sofFunction{};
         static inline detail::EP0ControlState    ep0_ctrl{};
 
         static void onIsr() {
-            static constexpr auto CommonIsrList = Kvasir::MPL::list(read(Regs::INTS::setup_req),
-                                                                    read(Regs::INTS::buff_status),
-                                                                    read(Regs::INTS::bus_reset));
-            static constexpr auto IsrList       = []() {
+            static constexpr auto CommonIsrList
+              = Kvasir::MPL::list(read(Regs::INTS::setup_req),
+                                  read(Regs::INTS::buff_status),
+                                  read(Regs::INTS::bus_reset),
+                                  read(Regs::INTS::abort_done),
+                                  read(Regs::INTS::dev_sm_watchdog_fired));
+            static constexpr auto IsrList = []() {
                 if constexpr(Config::UseSof) {
                     return Kvasir::MPL::list(CommonIsrList, read(Regs::INTS::dev_sof));
                 } else {
@@ -192,13 +199,17 @@ namespace detail {
                                               | (1U << 23);   // ENDPOINT_ERROR
 
             if(apply(read(Regs::EP_TX_ERROR::FULLREGISTER))) {
-                UC_LOG_E("USB EP_TX_ERROR: {}", Regs::EP_TX_ERROR{});
+                UC_LOG_E("USB: EP_TX_ERROR: {}", Regs::EP_TX_ERROR{});
+                apply(
+                  write(Regs::EP_TX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
             }
             if(apply(read(Regs::EP_RX_ERROR::FULLREGISTER))) {
-                UC_LOG_E("USB EP_RX_ERROR: {}", Regs::EP_RX_ERROR{});
+                UC_LOG_E("USB: EP_RX_ERROR: {}", Regs::EP_RX_ERROR{});
+                apply(
+                  write(Regs::EP_RX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
             }
             if(sieStatus & errorMask) {
-                UC_LOG_E("USB SIE_STATUS error: {:#010x} {}",
+                UC_LOG_E("USB: SIE_STATUS error: {:#010x} {}",
                          sieStatus & errorMask,
                          Regs::SIE_STATUS{});
                 // Clear error bits (WC - write 1 to clear)
@@ -208,7 +219,7 @@ namespace detail {
             if constexpr(Config::UseSof == true) {
                 if(status[Regs::INTS::dev_sof]) {
                     auto const sof = get<0>(apply(read(Regs::SOF_RD::count)));
-                    if(sofFunction) { sofFunction(static_cast<std::uint16_t>(sof)); }
+                    ConfigT::StartOfFrameCallback(static_cast<std::uint16_t>(sof));
                 }
             }
 
@@ -217,6 +228,13 @@ namespace detail {
                 handleBusReset();
                 return;
             }
+
+            if(status[Regs::INTS::dev_sm_watchdog_fired]) {
+                UC_LOG_E("USB: watchdog");
+                apply(set(Regs::DEV_SM_WATCHDOG::fired));
+            }
+
+            if(status[Regs::INTS::abort_done]) { handleAbort(); }
 
             if(status[Regs::INTS::buff_status]) { handleBufferStatus(); }
 
@@ -245,7 +263,7 @@ namespace detail {
             ep0_ctrl.reset();
             deviceBusAddr             = 0;
             pendingAddressSet         = false;
-            configured                = false;
+            configuration             = 0;
             remainingConfigDescriptor = {};
             EP0_IN::reset();
             EP0_OUT::reset();
@@ -264,12 +282,14 @@ namespace detail {
                     // Set actual device address in hardware
                     apply(write(Regs::EP<0>::ADDR_ENDP::address, deviceBusAddr));
                     pendingAddressSet = false;
+                    EP0_IN::bufferFinished();
                     return true;
                 }
                 if(!remainingConfigDescriptor.empty()) {
                     auto const chunkSize
                       = std::min(remainingConfigDescriptor.size(), MaxPacketSize);
                     bool const isLast = (remainingConfigDescriptor.size() <= MaxPacketSize);
+                    EP0_IN::bufferFinished();
                     if(isLast) {
                         ep0IN<true>(remainingConfigDescriptor.first(chunkSize));
                         remainingConfigDescriptor = {};
@@ -280,11 +300,13 @@ namespace detail {
                     return true;
                 }
                 if(ep0_ctrl.stage() == ControlStage::Data) {
+                    EP0_IN::bufferFinished();
                     ep0_ctrl.transition(ControlStage::Status);
                     ep0OUT<true>(0);
                     return true;
                 }
                 if(ep0_ctrl.stage() == ControlStage::Status) {
+                    EP0_IN::bufferFinished();
                     ep0_ctrl.transition(ControlStage::Idle);
                     return true;
                 }
@@ -292,6 +314,7 @@ namespace detail {
             }
             if(ep_num == 0 && !in) {
                 if(ep0_ctrl.stage() == ControlStage::Status) {
+                    EP0_OUT::bufferFinished();
                     ep0_ctrl.transition(ControlStage::Idle);
                     return true;
                 }
@@ -320,6 +343,29 @@ namespace detail {
                 // IN transfer for even endpointBitIndex, OUT transfer for odd endpointBitIndex
                 handleBufferDone(endpointBitIndex >> 1U, (endpointBitIndex & 1U) == 0);
                 buffers &= ~bit;
+            }
+        }
+
+        static void handleAbortDone(std::size_t ep_num,
+                                    bool        in) {
+            using namespace std::string_view_literals;
+            if(!MixinsBase::callAbortDone(ep_num, in)) {
+                UC_LOG_W("USB: Unhandled endpoint abort done (EP{} {})",
+                         ep_num,
+                         in ? "IN"sv : "OUT"sv);
+            }
+        }
+
+        static void handleAbort() {
+            std::uint32_t aborts = apply(read(Regs::EP_ABORT_DONE::FULLREGISTER));
+            while(aborts) {
+                auto const endpointBitIndex = static_cast<std::uint32_t>(std::countr_zero(aborts));
+                auto const bit              = 1U << endpointBitIndex;
+                // clear this in advance
+                apply(write(Regs::EP_ABORT_DONE::FULLREGISTER, bit));
+                // IN transfer for even endpointBitIndex, OUT transfer for odd endpointBitIndex
+                handleAbortDone(endpointBitIndex >> 1U, (endpointBitIndex & 1U) == 0);
+                aborts &= ~bit;
             }
         }
 
@@ -431,10 +477,14 @@ namespace detail {
                 return true;
 
             case SetupPacket::Request::setConfiguration:
+                using namespace std::string_view_literals;
                 acknowledgeSetupRequest();
-                configured = true;
-                MixinsBase::callConfigured();
-                UC_LOG_I("USB: Device configured (config={})", pkt.wValue & 0xff);
+                configuration = (pkt.wValue & 0xff);
+
+                MixinsBase::callConfigured(configuration);
+                UC_LOG_I("USB: Device {} (config={})",
+                         configuration == 0 ? "unconfigured"sv : "configured"sv,
+                         configuration.load());
                 return true;
 
             default: return false;
@@ -495,11 +545,13 @@ namespace detail {
         // We can make them private with c++26 friend pack indexing
         //Mixin API
         static void ep0INDataPhase(std::span<std::byte const> data) {
+            assert(MaxPacketSize >= data.size());
             ep0_ctrl.transition(ControlStage::Data);
             ep0IN<true>(data);
         }
 
         static void ep0OUTDataPhase(std::size_t size) {
+            assert(MaxPacketSize >= size);
             ep0_ctrl.transition(ControlStage::Data);
             ep0OUT<true>(size);
         }
@@ -511,6 +563,7 @@ namespace detail {
                     UC_LOG_E("USB: Invalid out data (received={}, expected={})", len, data.size());
                     return false;
                 }
+                EP0_OUT::bufferFinished();
                 return true;
             } else {
                 UC_LOG_E("USB: out read attempted while not in data phase");
@@ -545,14 +598,16 @@ namespace detail {
                  Regs::INTE::overrideDefaults(set(Regs::INTE::buff_status),
                                               set(Regs::INTE::bus_reset),
                                               set(Regs::INTE::setup_req),
+                                              set(Regs::INTE::abort_done),
+                                              set(Regs::INTE::dev_sm_watchdog_fired),
                                               getSofEnable()),
                  Regs::DEV_SM_WATCHDOG::overrideDefaults(
                    clear(Regs::DEV_SM_WATCHDOG::enable),
-                   write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024>())),
+                   write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024 * 8>())),
                  Kvasir::Register::SequencePoint{},
                  Regs::DEV_SM_WATCHDOG::overrideDefaults(
                    set(Regs::DEV_SM_WATCHDOG::enable),
-                   write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024>())));
+                   write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024 * 8>())));
 
         static constexpr auto initStepInterruptConfig
           = list(Kvasir::Nvic::makeSetPriority<Config::isrPriority>(InterruptIndexes),
@@ -565,22 +620,17 @@ namespace detail {
             endpointConfig();
             apply(Kvasir::Nvic::makeEnable(InterruptIndexes));
 
-            apply(Regs::SIE_CTRL::overrideDefaults(set(Regs::SIE_CTRL::pullup_en),
-                                                   set(Regs::SIE_CTRL::ep0_int_1buf),
-                                                   clear(Regs::SIE_CTRL::pulldown_en),
-                                                   set(Regs::SIE_CTRL::ep0_double_buf)));
+            apply(Regs::SIE_CTRL::overrideDefaults(
+              set(Regs::SIE_CTRL::pullup_en),
+              set(Regs::SIE_CTRL::ep0_int_1buf),
+              clear(Regs::SIE_CTRL::pulldown_en),
+              write(Regs::SIE_CTRL::ep0_double_buf,
+                    Kvasir::Register::value<DoubleBufferd ? 1 : 0>())));
         };
 
     public:
         //Public API
-        static bool isConfigured() { return configured; }
-
-        template<typename F>
-        static void setSofCallback(F&& callback)
-            requires(Config::UseSof)
-        {
-            sofFunction = std::forward<F>(callback);
-        }
+        static bool isConfigured() { return configuration != 0; }
     };
 }   // namespace detail
 

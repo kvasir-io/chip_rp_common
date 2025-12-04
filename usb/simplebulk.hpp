@@ -94,9 +94,16 @@ private:
         return DataEndpointHandler::EndpointHandlerCallback(epNum, in);
     }
 
+    static bool AbortDoneCallback(std::size_t epNum,
+                                  bool        in) {
+        return DataEndpointHandler::AbortDoneCallback(epNum, in);
+    }
+
     static void ResetCallback() { DataEndpointHandler::ResetCallback(); }
 
-    static void ConfiguredCallback() { DataEndpointHandler::ConfiguredCallback(); }
+    static void ConfiguredCallback(std::uint8_t configuration) {
+        DataEndpointHandler::ConfiguredCallback(configuration);
+    }
 
 public:
     // Expose SendRecvAdapter Public API

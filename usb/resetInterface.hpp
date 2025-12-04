@@ -56,9 +56,14 @@ private:
         return false;
     }
 
+    static bool AbortDoneCallback(std::size_t,
+                                  bool) {
+        return false;
+    }
+
     static void ResetCallback() {}
 
-    static void ConfiguredCallback() {}
+    static void ConfiguredCallback(std::uint8_t) {}
 
     static void SetupEndpointsCallback() {}
 };
