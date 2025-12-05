@@ -124,19 +124,28 @@ namespace detail {
         using EP0_OUT
           = EndpointOps<USBBase, 0, EndpointDirection::Out, EndpointTransferType::Control>;
 
-        template<typename T>
-        static constexpr auto wrapDescriptorString(T const& value) {
-            if constexpr(std::is_invocable_v<T>) {
-                return Kvasir::USB::RuntimeDescriptorString{value};
-            } else {
-                return Kvasir::USB::DescriptorString{value};
-            }
-        }
-
         static constexpr std::tuple DescriptorStrings{
-          wrapDescriptorString(Config::ManufacturerString),
-          wrapDescriptorString(Config::ProductString),
-          wrapDescriptorString(Config::SerialNumberString)};
+          []() {
+              if constexpr(std::is_invocable_v<decltype(Config::ManufacturerString)>) {
+                  return Kvasir::USB::RuntimeDescriptorString{Config::ManufacturerString};
+              } else {
+                  return Kvasir::USB::DescriptorString{SC_LIFT(Config::ManufacturerString)};
+              }
+          }(),
+          []() {
+              if constexpr(std::is_invocable_v<decltype(Config::ProductString)>) {
+                  return Kvasir::USB::RuntimeDescriptorString{Config::ProductString};
+              } else {
+                  return Kvasir::USB::DescriptorString{SC_LIFT(Config::ProductString)};
+              }
+          }(),
+          []() {
+              if constexpr(std::is_invocable_v<decltype(Config::SerialNumberString)>) {
+                  return Kvasir::USB::RuntimeDescriptorString{Config::SerialNumberString};
+              } else {
+                  return Kvasir::USB::DescriptorString{SC_LIFT(Config::SerialNumberString)};
+              }
+          }()};
 
         static constexpr auto DeviceDescriptor{
           USB::Descriptors::makeDeviceDescriptorArray<Config::ProductVersionBCD,
