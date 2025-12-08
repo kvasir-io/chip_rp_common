@@ -188,8 +188,10 @@ namespace detail {
               = Kvasir::MPL::list(read(Regs::INTS::setup_req),
                                   read(Regs::INTS::buff_status),
                                   read(Regs::INTS::bus_reset),
-                                  read(Regs::INTS::abort_done),
-                                  read(Regs::INTS::dev_sm_watchdog_fired));
+#if __has_include("chip/rp2350.hpp")
+                                  read(Regs::INTS::dev_sm_watchdog_fired),
+#endif
+                                  read(Regs::INTS::abort_done));
             static constexpr auto IsrList = []() {
                 if constexpr(Config::UseSof) {
                     return Kvasir::MPL::list(CommonIsrList, read(Regs::INTS::dev_sof));
@@ -207,6 +209,7 @@ namespace detail {
                                               | (1U << 24)    // CRC_ERROR
                                               | (1U << 23);   // ENDPOINT_ERROR
 
+#if __has_include("chip/rp2350.hpp")
             if(apply(read(Regs::EP_TX_ERROR::FULLREGISTER))) {
                 UC_LOG_E("USB: EP_TX_ERROR: {}", Regs::EP_TX_ERROR{});
                 apply(
@@ -217,6 +220,7 @@ namespace detail {
                 apply(
                   write(Regs::EP_RX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
             }
+#endif
             if(sieStatus & errorMask) {
                 UC_LOG_E("USB: SIE_STATUS error: {:#010x} {}",
                          sieStatus & errorMask,
@@ -238,10 +242,12 @@ namespace detail {
                 return;
             }
 
+#if __has_include("chip/rp2350.hpp")
             if(status[Regs::INTS::dev_sm_watchdog_fired]) {
                 UC_LOG_E("USB: watchdog");
                 apply(set(Regs::DEV_SM_WATCHDOG::fired));
             }
+#endif
 
             if(status[Regs::INTS::abort_done]) { handleAbort(); }
 
@@ -547,6 +553,33 @@ namespace detail {
             }
         }
 
+        static constexpr auto getWatchdogEnable() {
+#if __has_include("chip/rp2350.hpp")
+            return Kvasir::Mpl::list(
+              Regs::DEV_SM_WATCHDOG::overrideDefaults(
+                clear(Regs::DEV_SM_WATCHDOG::enable),
+                write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024 * 8>())),
+              Kvasir::Register::SequencePoint{},
+              Regs::DEV_SM_WATCHDOG::overrideDefaults(
+                set(Regs::DEV_SM_WATCHDOG::enable),
+                write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024 * 8>())));
+#else
+            return Kvasir::MPL::list();
+#endif
+        }
+
+        static constexpr auto getIstEnable() {
+            return Kvasir::MPL::list(
+              Regs::INTE::overrideDefaults(set(Regs::INTE::buff_status),
+                                           set(Regs::INTE::bus_reset),
+                                           set(Regs::INTE::setup_req),
+                                           set(Regs::INTE::abort_done),
+#if __has_include("chip/rp2350.hpp")
+                                           set(Regs::INTE::dev_sm_watchdog_fired),
+#endif
+                                           getSofEnable()));
+        }
+
         static constexpr auto InterruptIndexes
           = brigand::list<decltype(Kvasir::Interrupt::usbctrl)>{};
 
@@ -604,19 +637,8 @@ namespace detail {
                                              set(Regs::PWR::vbus_detect_override_en)),
                  Regs::MAIN_CTRL::overrideDefaults(set(Regs::MAIN_CTRL::controller_en),
                                                    clear(Regs::MAIN_CTRL::phy_iso)),
-                 Regs::INTE::overrideDefaults(set(Regs::INTE::buff_status),
-                                              set(Regs::INTE::bus_reset),
-                                              set(Regs::INTE::setup_req),
-                                              set(Regs::INTE::abort_done),
-                                              set(Regs::INTE::dev_sm_watchdog_fired),
-                                              getSofEnable()),
-                 Regs::DEV_SM_WATCHDOG::overrideDefaults(
-                   clear(Regs::DEV_SM_WATCHDOG::enable),
-                   write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024 * 8>())),
-                 Kvasir::Register::SequencePoint{},
-                 Regs::DEV_SM_WATCHDOG::overrideDefaults(
-                   set(Regs::DEV_SM_WATCHDOG::enable),
-                   write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024 * 8>())));
+                 getIstEnable(),
+                 getWatchdogEnable());
 
         static constexpr auto initStepInterruptConfig
           = list(Kvasir::Nvic::makeSetPriority<Config::isrPriority>(InterruptIndexes),

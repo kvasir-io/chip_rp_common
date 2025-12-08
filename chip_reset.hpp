@@ -62,6 +62,7 @@ namespace Kvasir { namespace PM {
         if(chip_reset[ChipReset::had_run_low]) { return ResetCause::run_low; }
         if(chip_reset[ChipReset::had_swcore_pd]) { return ResetCause::swcore_pd; }
 #endif
+        //TODO rp2040
         return ResetCause::unknown;
     }
 }}   // namespace Kvasir::PM

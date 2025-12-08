@@ -69,7 +69,7 @@ namespace detail {
         static std::array<std::uint32_t,
                           64> getXipEnable() {
             if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
-#if __has_include("peripherals/XIP_SSI.hpp")
+#if __has_include("chip/rp2040.hpp")
                 return Kvasir::Startup::second_stage_bootloader;
 #endif
             } else {
@@ -231,8 +231,7 @@ namespace detail {
         flash_write_impl(xipDisabler, write, offset, data, size);
     }
 
-#if __has_include("peripherals/XIP_SSI.hpp")
-    //rp2040 function
+#if __has_include("chip/rp2040.hpp")
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
     flash_do_cmd_impl(FlashXipDisabler&          xipDisabler,
                       std::span<std::byte const> txBuffer,
@@ -266,7 +265,6 @@ namespace detail {
         apply(write(QSPI_CS::high));
     }
 
-    //rp2040 function
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
     flash_do_cmd(std::span<std::byte const> txBuffer,
                  std::span<std::byte>       rxBuffer) {
@@ -278,7 +276,7 @@ namespace detail {
     static inline std::array<std::byte,
                              8> read_serial_number() {
         if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
-#if __has_include("peripherals/XIP_SSI.hpp")
+#if __has_include("chip/rp2040.hpp")
             static constexpr std::byte   Cmd{0x4b};
             static constexpr std::size_t DummyBytes = 5;
             static constexpr std::size_t DataBytes  = 8;
@@ -296,6 +294,7 @@ namespace detail {
             return id;
 #endif
         } else {
+#if __has_include("chip/rp2350.hpp")
             std::array<std::uint32_t, 4> buffer{};
 
             static constexpr std::uint32_t CHIP_INFO = 0x0001;
@@ -326,9 +325,11 @@ namespace detail {
             }
 
             return serial_number;
+#endif
         }
     }
 
+#if __has_include("chip/rp2350.hpp")
     static inline std::optional<Kvasir::StaticString<30>> read_white_label_serial_number() {
         constexpr std::uint32_t OTP_DATA_BASE                         = 0x40130000;
         constexpr std::uint16_t OTP_DATA_USB_WHITE_LABEL_ADDR_ROW     = 0x005c;
@@ -381,6 +382,7 @@ namespace detail {
 
         return result;
     }
+#endif
 
 }   // namespace detail
 
@@ -422,15 +424,19 @@ inline auto serialNumberString() {
     return hexSerialString;
 }
 
+#if __has_include("chip/rp2350.hpp")
 inline auto whiteLabelSerialNumber() {
     static std::optional<Kvasir::StaticString<30>> const serial_number
       = detail::read_white_label_serial_number();
     return serial_number;
 }
+#endif
 
 inline Kvasir::StaticString<30> bootromUSBSerialNumber() {
+#if __has_include("chip/rp2350.hpp")
     auto const whiteLabelSerial = Kvasir::whiteLabelSerialNumber();
     if(whiteLabelSerial.has_value()) { return whiteLabelSerial.value(); }
+#endif
     return serialNumberString();
 }
 

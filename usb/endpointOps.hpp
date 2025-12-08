@@ -90,11 +90,28 @@ private:
     static void writeBufferControl(bool          pid,
                                    std::uint16_t length) {
         using BC = BufferControlReg<Buffer>;
-        BC::overrideDefaultsRuntime(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
-                                    write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
-                                    write(BC::pid, pid ? 1 : 0),
-                                    write(BC::length, length),
-                                    set(BC::available));
+
+        static constexpr bool delayAvailable =
+#if __has_include("chip/rp2350.hpp")
+          false;
+#else
+          true;
+#endif
+        BC::overrideDefaultsRuntime(
+          write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
+          write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
+          write(BC::pid, pid ? 1 : 0),
+          write(BC::length, length),
+          write(BC::available, Kvasir::Register::value<std::uint16_t, delayAvailable ? 0 : 1>()));
+
+        if constexpr(delayAvailable) {
+            BC::overrideDefaultsRuntime(
+              write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
+              write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
+              write(BC::pid, pid ? 1 : 0),
+              write(BC::length, length),
+              set(BC::available));
+        }
     }
 
     static void clearBufferControl() {
