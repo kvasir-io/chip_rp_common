@@ -555,7 +555,7 @@ namespace detail {
 
         static constexpr auto getWatchdogEnable() {
 #if __has_include("chip/rp2350.hpp")
-            return Kvasir::Mpl::list(
+            return Kvasir::MPL::list(
               Regs::DEV_SM_WATCHDOG::overrideDefaults(
                 clear(Regs::DEV_SM_WATCHDOG::enable),
                 write(Regs::DEV_SM_WATCHDOG::limit, Kvasir::Register::value<1024 * 8>())),
