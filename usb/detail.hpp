@@ -6,9 +6,9 @@
 
 namespace Kvasir::USB::detail {
 
-static void device_memory_memcpy(void*       dst,
-                                 void const* src,
-                                 std::size_t n) {
+static inline void device_memory_memcpy(void*       dst,
+                                        void const* src,
+                                        std::size_t n) {
 #ifdef __ARM_FEATURE_UNALIGNED
     // Prevent compiler from optimizing into unaligned accesses
     asm volatile("" : "+r"(dst), "+r"(src));
