@@ -180,7 +180,8 @@ namespace detail {
         static inline std::atomic<std::uint8_t>  configuration{};
         static inline std::uint8_t               deviceBusAddr{};
         static inline bool                       pendingAddressSet{false};
-        static inline std::span<std::byte const> remainingConfigDescriptor{};
+        static inline std::span<std::byte const> remainingDescriptor{};
+        static inline std::array<std::byte, 256> stringDescriptorBuffer{};
         static inline detail::EP0ControlState    ep0_ctrl{};
 
         static void onIsr() {
@@ -276,10 +277,10 @@ namespace detail {
 
         static void handleBusReset() {
             ep0_ctrl.reset();
-            deviceBusAddr             = 0;
-            pendingAddressSet         = false;
-            configuration             = 0;
-            remainingConfigDescriptor = {};
+            deviceBusAddr       = 0;
+            pendingAddressSet   = false;
+            configuration       = 0;
+            remainingDescriptor = {};
             EP0_IN::reset();
             EP0_OUT::reset();
 
@@ -300,17 +301,16 @@ namespace detail {
                     EP0_IN::bufferFinished();
                     return true;
                 }
-                if(!remainingConfigDescriptor.empty()) {
-                    auto const chunkSize
-                      = std::min(remainingConfigDescriptor.size(), MaxPacketSize);
-                    bool const isLast = (remainingConfigDescriptor.size() <= MaxPacketSize);
+                if(!remainingDescriptor.empty()) {
+                    auto const chunkSize = std::min(remainingDescriptor.size(), MaxPacketSize);
+                    bool const isLast    = (remainingDescriptor.size() <= MaxPacketSize);
                     EP0_IN::bufferFinished();
                     if(isLast) {
-                        ep0IN<true>(remainingConfigDescriptor.first(chunkSize));
-                        remainingConfigDescriptor = {};
+                        ep0IN<true>(remainingDescriptor.first(chunkSize));
+                        remainingDescriptor = {};
                     } else {
-                        ep0IN<false>(remainingConfigDescriptor.first(chunkSize));
-                        remainingConfigDescriptor = remainingConfigDescriptor.subspan(chunkSize);
+                        ep0IN<false>(remainingDescriptor.first(chunkSize));
+                        remainingDescriptor = remainingDescriptor.subspan(chunkSize);
                     }
                     return true;
                 }
@@ -394,9 +394,8 @@ namespace detail {
             if(pkt.wLength >= Self::ConfigDescriptor.size()) {
                 if constexpr(Self::ConfigDescriptor.size() > MaxPacketSize) {
                     ep0_ctrl.transition(ControlStage::Data);
-                    remainingConfigDescriptor
-                      = std::span{Self::ConfigDescriptor.begin() + MaxPacketSize,
-                                  Self::ConfigDescriptor.end()};
+                    remainingDescriptor = std::span{Self::ConfigDescriptor.begin() + MaxPacketSize,
+                                                    Self::ConfigDescriptor.end()};
                     ep0IN<false>(std::span{Self::ConfigDescriptor.begin(),
                                            Self::ConfigDescriptor.begin() + MaxPacketSize});
                 } else {
@@ -420,9 +419,9 @@ namespace detail {
             static constexpr std::array<std::byte, 2> USBLanguageDescriptor{std::byte{0x09},
                                                                             std::byte{0x04}};
 
-            auto const   index = static_cast<std::size_t>(pkt.wValue & 0xff);
-            std::uint8_t len{};
-            std::array<std::byte, MaxPacketSize> buffer;
+            auto const  index  = static_cast<std::size_t>(pkt.wValue & 0xff);
+            auto&       buffer = stringDescriptorBuffer;
+            std::size_t len{};
 
             if(index == 0) {
                 buffer[2] = USBLanguageDescriptor[0];
@@ -436,13 +435,22 @@ namespace detail {
                                                                      buffer.end());
                 // Check if insertion failed (iterator unchanged means invalid index)
                 if(end == start) { return false; }
-                len = static_cast<std::uint8_t>(std::distance(buffer.begin(), end));
+                len = static_cast<std::size_t>(std::distance(buffer.begin(), end));
             }
 
-            buffer[0] = std::byte{len};
+            buffer[0] = std::byte(len);
             buffer[1] = std::byte(DescriptorType::string);
+
+            auto const totalLen = std::min<std::size_t>(pkt.wLength, len);
             ep0_ctrl.transition(ControlStage::Data);
-            ep0IN<true>(std::span{buffer.data(), std::min<std::uint16_t>(pkt.wLength, len)});
+
+            if(totalLen <= MaxPacketSize) {
+                ep0IN<true>(std::span{buffer.data(), totalLen});
+            } else {
+                ep0IN<false>(std::span{buffer.data(), MaxPacketSize});
+                remainingDescriptor
+                  = std::span{buffer.data() + MaxPacketSize, totalLen - MaxPacketSize};
+            }
             return true;
         }
 
@@ -507,6 +515,7 @@ namespace detail {
         }
 
         static void handleSetupPacket(SetupPacket const& pkt) {
+            remainingDescriptor = {};
             ep0_ctrl.transition(ControlStage::Setup);
 
             EP0_IN::state.setDataPhase();

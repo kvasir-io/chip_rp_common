@@ -316,15 +316,22 @@ struct DescriptorString {
     constexpr DescriptorString const& get() const { return *this; }
 };
 
+template<std::size_t ByteCount>
+consteval std::size_t checkedDescriptorStringSize() {
+    static_assert(ByteCount <= 252, "String too long for USB string descriptor (max 126 chars)");
+    return ByteCount;
+}
+
 template<std::size_t N>
-DescriptorString(char const (&)[N]) -> DescriptorString<std::array<std::byte,
-                                                                   (N - 1) * 2>>;
+DescriptorString(char const (&)[N])
+  -> DescriptorString<std::array<std::byte,
+                                 checkedDescriptorStringSize<(N - 1) * 2>()>>;
 DescriptorString(std::string_view s) -> DescriptorString<Kvasir::StaticVector<std::byte,
-                                                                              64 * 2>>;
+                                                                              252>>;
 template<char... chars>
 DescriptorString(sc::StringConstant<chars...> sc)
   -> DescriptorString<std::array<std::byte,
-                                 sizeof...(chars) * 2>>;
+                                 checkedDescriptorStringSize<sizeof...(chars) * 2>()>>;
 
 template<typename F>
 struct RuntimeDescriptorString {
@@ -332,7 +339,7 @@ struct RuntimeDescriptorString {
 
     constexpr RuntimeDescriptorString(F f_) : f{f_} {}
 
-    using DT = DescriptorString<Kvasir::StaticVector<std::byte, 64>>;
+    using DT = DescriptorString<Kvasir::StaticVector<std::byte, 252>>;
 
     struct RuntimeDescriptorStringImpl : DT {
         template<typename T>
@@ -341,8 +348,8 @@ struct RuntimeDescriptorString {
               if constexpr(requires { std::string_view{v}; }) {
                   return DT{std::string_view{v}};
               } else {
-                  std::array<char, 64> b;
-                  auto const           ret = std::to_chars(b.begin(), b.end(), v);
+                  std::array<char, 126> b;
+                  auto const            ret = std::to_chars(b.begin(), b.end(), v);
                   assert(ret.ec == std::errc{});
                   return DT{
                     std::string_view{b.begin(), ret.ptr}
