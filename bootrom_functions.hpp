@@ -151,6 +151,40 @@ namespace detail {
         return RomFunctions::call<'R', 'B', rom_reboot>(flags, delay_ms, p0, p1);
     }
 
+#if __has_include("chip/rp2350.hpp")
+    static inline int flash_runtime_to_storage_addr(std::uint32_t addr) {
+        using rom_flash_runtime_to_storage_addr = int (*)(std::uint32_t addr);
+
+        return RomFunctions::call<'F', 'A', rom_flash_runtime_to_storage_addr>(addr);
+    }
+
+    // flash_op flags
+    namespace FlashOpFlags {
+        // Address translation (select one)
+        constexpr std::uint32_t ASPACE_STORAGE = 0x00000000;
+        constexpr std::uint32_t ASPACE_RUNTIME = 0x00000001;
+
+        // Security level (select one)
+        constexpr std::uint32_t SECLEVEL_SECURE     = 0x00000100;
+        constexpr std::uint32_t SECLEVEL_NONSECURE  = 0x00000200;
+        constexpr std::uint32_t SECLEVEL_BOOTLOADER = 0x00000300;
+
+        // Operation (select one)
+        constexpr std::uint32_t OP_ERASE   = 0x00000000;
+        constexpr std::uint32_t OP_PROGRAM = 0x00010000;
+        constexpr std::uint32_t OP_READ    = 0x00020000;
+    }   // namespace FlashOpFlags
+
+    static inline int flash_op(std::uint32_t flags,
+                               std::uint32_t addr,
+                               std::uint32_t size_bytes,
+                               std::uint8_t* buf) {
+        using rom_flash_op = int (*)(std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t*);
+
+        return RomFunctions::call<'F', 'O', rom_flash_op>(flags, addr, size_bytes, buf);
+    }
+#endif
+
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
     flash_erase_and_write_impl(FlashXipDisabler& xipDisabler,
                                void (*erase)(std::uint32_t,

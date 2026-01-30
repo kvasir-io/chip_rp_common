@@ -51,8 +51,30 @@ namespace Kvasir { namespace Flash {
         static inline bool valueRead{false};
 
         static T readFlashValue() {
+#if __has_include("chip/rp2350.hpp")
+            ValueStruct actualValue{};
+
+            constexpr std::uint32_t flags = Kvasir::detail::FlashOpFlags::ASPACE_STORAGE
+                                          | Kvasir::detail::FlashOpFlags::SECLEVEL_NONSECURE
+                                          | Kvasir::detail::FlashOpFlags::OP_READ;
+
+            auto const ret = Kvasir::detail::flash_op(
+              flags,
+              reinterpret_cast<std::uint32_t>(std::addressof(flashValue)),
+              sizeof(ValueStruct),
+              reinterpret_cast<std::uint8_t*>(std::addressof(actualValue)));
+
+            if(ret != 0) {
+                UC_LOG_C("flash_op read failed: {}", ret);
+                return T{};
+            }
+
+            if(actualValue.crc != calcCrc(actualValue.v)) { return T{}; }
+            return actualValue.v;
+#else
             if(flashValue.crc != calcCrc(flashValue.v)) { return T{}; }
             return flashValue.v;
+#endif
         }
 
         static T& value() {
