@@ -89,13 +89,13 @@ namespace Kvasir { namespace Pio {
         }
 
         static constexpr auto initStepPeripheryEnable = list(
-          write(PioRegs::CTRL::sm_restart, Kvasir::Register::value<1 << Config::SmInstance>()),
-          write(PioRegs::CTRL::clkdiv_restart, Kvasir::Register::value<1 << Config::SmInstance>()),
+          write(PioRegs::CTRL::sm_restart, Kvasir::Register::value<1U << Config::SmInstance>()),
+          write(PioRegs::CTRL::clkdiv_restart, Kvasir::Register::value<1U << Config::SmInstance>()),
           //JUMP to programm
           write(SmRegs::INSTR::instr, Kvasir::Register::value<Config::ProgrammOffset>()),
           //enable
           Kvasir::Register::SequencePoint{},
-          write(PioRegs::CTRL::sm_enable, Kvasir::Register::value<1 << Config::SmInstance>()));
+          write(PioRegs::CTRL::sm_enable, Kvasir::Register::value<1U << Config::SmInstance>()));
 
         static inline bool                       running{false};
         static inline typename Clock::time_point whenRdy{};
@@ -115,7 +115,7 @@ namespace Kvasir { namespace Pio {
                     reinterpret_cast<std::uint32_t>(leds.data()),
                     leds.size() * sizeof(RGB));
             apply(
-              write(PioRegs::FDEBUG::txstall, Kvasir::Register::value<1 << Config::SmInstance>()));
+              write(PioRegs::FDEBUG::txstall, Kvasir::Register::value<1U << Config::SmInstance>()));
 
             running = true;
         }
@@ -127,7 +127,7 @@ namespace Kvasir { namespace Pio {
 
         static void handler() {
             bool const stall
-              = get<0>(apply(read(PioRegs::FDEBUG::txstall))) & (1 << Config::SmInstance);
+              = get<0>(apply(read(PioRegs::FDEBUG::txstall))) & (1U << Config::SmInstance);
             if(stall && running) {
                 running = false;
                 whenRdy = Clock::now() + 60us;

@@ -65,54 +65,45 @@ namespace Kvasir { namespace Io {
     template<int Pin>
     constexpr auto get_clear_action() {
         if constexpr(Pin <= 31) {
-            return write(SIO::GPIO_OUT_CLR::gpio_out_clr, Register::value<1 << Pin>());
+            return write(SIO::GPIO_OUT_CLR::gpio_out_clr, Register::value<1U << Pin>());
         } else {
-            return write(SIO::GPIO_HI_OUT_CLR::gpio, Register::value<1 << (Pin - 32)>());
+            return write(SIO::GPIO_HI_OUT_CLR::gpio, Register::value<1U << (Pin - 32)>());
         }
     }
 
     template<int Pin>
     constexpr auto get_set_action() {
         if constexpr(Pin <= 31) {
-            return write(SIO::GPIO_OUT_SET::gpio_out_set, Register::value<1 << Pin>());
+            return write(SIO::GPIO_OUT_SET::gpio_out_set, Register::value<1U << Pin>());
         } else {
-            return write(SIO::GPIO_HI_OUT_SET::gpio, Register::value<1 << (Pin - 32)>());
+            return write(SIO::GPIO_HI_OUT_SET::gpio, Register::value<1U << (Pin - 32)>());
         }
     }
 
     template<int Pin>
     constexpr auto get_toggle_action() {
         if constexpr(Pin <= 31) {
-            return write(SIO::GPIO_OUT_XOR::gpio_out_xor, Register::value<1 << Pin>());
+            return write(SIO::GPIO_OUT_XOR::gpio_out_xor, Register::value<1U << Pin>());
         } else {
-            return write(SIO::GPIO_HI_OUT_XOR::gpio, Register::value<1 << (Pin - 32)>());
+            return write(SIO::GPIO_HI_OUT_XOR::gpio, Register::value<1U << (Pin - 32)>());
         }
     }
 
     template<int Pin>
     constexpr auto get_oe_set_action() {
         if constexpr(Pin <= 31) {
-            return write(SIO::GPIO_OE_SET::gpio_oe_set, Register::value<1 << Pin>());
+            return write(SIO::GPIO_OE_SET::gpio_oe_set, Register::value<1U << Pin>());
         } else {
-            return write(SIO::GPIO_HI_OE_SET::gpio, Register::value<1 << (Pin - 32)>());
+            return write(SIO::GPIO_HI_OE_SET::gpio, Register::value<1U << (Pin - 32)>());
         }
     }
 
     template<int Pin>
     constexpr auto get_oe_clr_action() {
         if constexpr(Pin <= 31) {
-            return write(SIO::GPIO_OE_CLR::gpio_oe_clr, Register::value<1 << Pin>());
+            return write(SIO::GPIO_OE_CLR::gpio_oe_clr, Register::value<1U << Pin>());
         } else {
-            return write(SIO::GPIO_HI_OE_CLR::gpio, Register::value<1 << (Pin - 32)>());
-        }
-    }
-
-    template<int Pin>
-    constexpr auto get_out_clr_action() {
-        if constexpr(Pin <= 31) {
-            return write(SIO::GPIO_OUT_CLR::gpio_out_clr, Register::value<1 << Pin>());
-        } else {
-            return write(SIO::GPIO_HI_OUT_CLR::gpio, Register::value<1 << (Pin - 32)>());
+            return write(SIO::GPIO_HI_OE_CLR::gpio, Register::value<1U << (Pin - 32)>());
         }
     }
 
@@ -169,6 +160,9 @@ namespace Kvasir { namespace Io {
     struct MakeAction<Action::Input<PC>, Register::PinLocation<Port, Pin>>
       : decltype(MPL::list(
           set(detail::Pad<Pin>::ie),
+#if __has_include("chip/rp2350.hpp")
+          clear(detail::Pad<Pin>::iso),
+#endif
           set(detail::Pad<Pin>::od),
           write(detail::Pad<Pin>::DRIVEValC::_2ma),
           write(detail::Pad<Pin>::pde,
@@ -185,10 +179,13 @@ namespace Kvasir { namespace Io {
         static_assert(isValidPinLocation<Port, Pin>(), "invalid PinLocation");
     };
 
-    template<Io::OutputType OT, Io::OutputSpeed OS, int Port, int Pin>
-    struct MakeAction<Action::Output<OT, OS>, Register::PinLocation<Port, Pin>>
+    template<Io::OutputType OT, Io::OutputSpeed OS, Io::OutputInit OI, int Port, int Pin>
+    struct MakeAction<Action::Output<OT, OS, OI>, Register::PinLocation<Port, Pin>>
       : decltype(MPL::list(
           set(detail::Pad<Pin>::ie),
+#if __has_include("chip/rp2350.hpp")
+          clear(detail::Pad<Pin>::iso),
+#endif
           clear(detail::Pad<Pin>::od),
           write(detail::Pad<Pin>::DRIVEValC::_12ma),
           clear(detail::Pad<Pin>::pde),
@@ -201,20 +198,31 @@ namespace Kvasir { namespace Io {
           write(detail::Ctrl<Pin>::OUTOVERValC::normal),
           write(detail::Ctrl<Pin>::FUNCSELValC::sio),
           get_oe_set_action<Pin>(),
-          get_out_clr_action<Pin>())) {
+          []() {
+              if constexpr(OI == Io::OutputInit::Low) {
+                  return get_clear_action<Pin>();
+              } else {
+                  return get_set_action<Pin>();
+              }
+          }())) {
         static_assert(isValidPinLocation<Port, Pin>(), "invalid PinLocation");
         static_assert(OT == Io::OutputType::PushPull, "only push pull supported");
     };
 
     template<Io::OutputType    OT,
              Io::OutputSpeed   OS,
+             Io::OutputInit    OI,
              PullConfiguration PC,
              int               Port,
              int               Pin,
              int               Function>
-    struct MakeAction<Action::PinFunction<Function, OT, OS, PC>, Register::PinLocation<Port, Pin>>
+    struct MakeAction<Action::PinFunction<Function, OT, OS, OI, PC>,
+                      Register::PinLocation<Port, Pin>>
       : decltype(MPL::list(
           set(detail::Pad<Pin>::ie),
+#if __has_include("chip/rp2350.hpp")
+          clear(detail::Pad<Pin>::iso),
+#endif
           clear(detail::Pad<Pin>::od),
           write(detail::Pad<Pin>::DRIVEValC::_12ma),
           write(detail::Pad<Pin>::pde,
@@ -230,7 +238,13 @@ namespace Kvasir { namespace Io {
                 Register::value<typename detail::Ctrl<Pin>::FUNCSELVal,
                                 static_cast<typename detail::Ctrl<Pin>::FUNCSELVal>(Function)>()),
           get_oe_set_action<Pin>(),
-          get_out_clr_action<Pin>())) {
+          []() {
+              if constexpr(OI == Io::OutputInit::Low) {
+                  return get_clear_action<Pin>();
+              } else {
+                  return get_set_action<Pin>();
+              }
+          }())) {
         static_assert(isValidPinLocation<Port, Pin>(), "invalid PinLocation");
         static_assert(OT == Io::OutputType::PushPull, "only push pull supported");
     };

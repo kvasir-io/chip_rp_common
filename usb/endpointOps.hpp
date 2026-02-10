@@ -83,7 +83,7 @@ private:
                            typename BufferRegs::template EP<EP>::IN_BUFFER_CONTROL,
                            typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL>;
 
-    static constexpr std::uint32_t EPBitMask = (1 << ((EP * 2) + (IsIn ? 0 : 1)));
+    static constexpr std::uint32_t EPBitMask = (1U << ((EP * 2) + (IsIn ? 0 : 1)));
 
     template<std::size_t Buffer,
              bool        Last>
@@ -409,7 +409,7 @@ private:
 public:
     constexpr void transition(ControlStage new_stage) {
         auto const valid_mask  = valid_from[std::to_underlying(new_stage)];
-        auto const current_bit = 1 << std::to_underlying(current_stage);
+        auto const current_bit = 1U << std::to_underlying(current_stage);
 
         if(!(valid_mask & current_bit)) {
             UC_LOG_E("Invalid EP0 stage transition {} -> {}", current_stage, new_stage);
