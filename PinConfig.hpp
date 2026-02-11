@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 
 namespace Kvasir { namespace PinConfig {
     enum class ChipVariant { RP2040, RP2350A, RP2350B };
@@ -67,14 +69,24 @@ namespace Kvasir { namespace PinConfig {
                                   UartPinType expectedType) {
         if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) { return false; }
 
-        auto pinType = UartPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
+        using PinElement
+          = std::remove_cv_t<std::remove_reference_t<decltype(UartPinMap<Chip>::pins[0])>>;
+
+        bool matches = false;
+        if constexpr(std::is_same_v<PinElement, UartPinType>) {
+            matches = (UartPinMap<Chip>::pins[static_cast<std::size_t>(pin)] == expectedType);
+        } else {
+            auto [first, second] = UartPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
+            matches              = (first == expectedType || second == expectedType);
+        }
+
         if(Instance == 0) {
-            return pinType == expectedType
+            return matches
                 && (expectedType == UartPinType::Tx0 || expectedType == UartPinType::Rx0
                     || expectedType == UartPinType::Cts0 || expectedType == UartPinType::Rts0);
         }
         if(Instance == 1) {
-            return pinType == expectedType
+            return matches
                 && (expectedType == UartPinType::Tx1 || expectedType == UartPinType::Rx1
                     || expectedType == UartPinType::Cts1 || expectedType == UartPinType::Rts1);
         }
