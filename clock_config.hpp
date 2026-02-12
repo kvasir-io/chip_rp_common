@@ -180,6 +180,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         using SYS_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_CTRL;
         using REF_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_CTRL;
         using USB_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_USB_CTRL;
+        using ADC_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_ADC_CTRL;
         using XOSC       = Kvasir::Peripheral::XOSC::Registers<>;
         using RST        = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL        = Kvasir::Peripheral::PLL::Registers<0>;
@@ -266,6 +267,8 @@ namespace Kvasir { namespace DefaultClockSettings {
             // enable periphery clock
             apply(USB_CLOCK::overrideDefaults(set(USB_CLOCK::enable),
                                               write(USB_CLOCK::AUXSRCValC::clksrc_pll_usb)));
+            apply(ADC_CLOCK::overrideDefaults(set(ADC_CLOCK::enable),
+                                              write(ADC_CLOCK::AUXSRCValC::clksrc_pll_usb)));
         }
     }
 

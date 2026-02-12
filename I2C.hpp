@@ -444,18 +444,25 @@ namespace Kvasir { namespace I2C {
                                  std::uint8_t size) {
             assert(state_.load(std::memory_order_relaxed) != State::sending);
             assert(state_.load(std::memory_order_relaxed) != State::receiving);
-            assert(c.size() <= buffer_.max_size());
-            assert(!c.empty());
             assert(size <= buffer_.max_size());
             assert(size != 0);
 
             buffer_.clear();
-            buffer_.push(c);
+            std::size_t sendSize;
+            if constexpr(std::is_same_v<std::decay_t<C>, std::byte>) {
+                sendSize = 1;
+                buffer_.push(c);
+            } else {
+                assert(c.size() <= buffer_.max_size());
+                assert(!c.empty());
+                sendSize = c.size();
+                buffer_.push(c);
+            }
             receiveSize_.store(size, std::memory_order_relaxed);
             state_.store(State::sending, std::memory_order_relaxed);
             operationState_.store(OperationState::ongoing, std::memory_order_relaxed);
             stop        = false;
-            timeoutTime = currentTime + base::calcTransferTimeout(c.size() + size);
+            timeoutTime = currentTime + base::calcTransferTimeout(sendSize + size);
 
             apply(write(Regs::IC_TAR::ic_tar, address));
             apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
