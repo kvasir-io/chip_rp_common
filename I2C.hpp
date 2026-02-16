@@ -366,6 +366,7 @@ namespace Kvasir { namespace I2C {
             if(op == OperationState::ongoing) {
                 if(currentTime > timeoutTime) {
                     apply(base::abort);
+                    UC_LOG_W("timeout");
                     buffer_.clear();
                     operationState_.store(OperationState::failed, std::memory_order_relaxed);
                     state_.store(State::blocked, std::memory_order_relaxed);
