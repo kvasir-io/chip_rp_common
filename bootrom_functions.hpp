@@ -364,11 +364,30 @@ namespace detail {
     }
 
 #if __has_include("chip/rp2350.hpp")
-    static inline std::optional<Kvasir::StaticString<30>> read_white_label_serial_number() {
-        constexpr std::uint32_t OTP_DATA_BASE                         = 0x40130000;
-        constexpr std::uint16_t OTP_DATA_USB_WHITE_LABEL_ADDR_ROW     = 0x005c;
-        constexpr std::uint32_t INDEX_USB_DEVICE_SERIAL_NUMBER_STRDEF = 6;
-        constexpr std::size_t   MAX_SERIAL_LENGTH                     = 30;
+    // STRDEF-only white-label OTP indices (RP2350 datasheet §13.10).
+    // VALUE entries (VID=0x0000, PID=0x0001, BCD=0x0002, LANG_ID=0x0003,
+    // CONFIG_ATTRIBUTES=0x0007) are raw 16-bit values, not strings, and are
+    // intentionally omitted here.
+    enum class WhiteLabelStrIndex : std::uint16_t {
+        usb_device_manufacturer  = 0x0004,   // max 30 chars
+        usb_device_product       = 0x0005,   // max 30 chars
+        usb_device_serial_number = 0x0006,   // max 30 chars
+        volume_label             = 0x0008,   // max 11 chars (ASCII only)
+        scsi_inquiry_vendor      = 0x0009,   // max  8 chars (ASCII only)
+        scsi_inquiry_product     = 0x000a,   // max 16 chars (ASCII only)
+        scsi_inquiry_version     = 0x000b,   // max  4 chars (ASCII only)
+        index_htm_redirect_url   = 0x000c,   // max 127 chars
+        index_htm_redirect_name  = 0x000d,   // max 127 chars
+        info_uf2_txt_model       = 0x000e,   // max 127 chars
+        info_uf2_txt_board_id    = 0x000f,   // max 127 chars
+    };
+
+    template<WhiteLabelStrIndex Index,
+             std::size_t        MaxLen>
+    static inline std::optional<Kvasir::StaticString<MaxLen>> read_white_label_string() {
+        constexpr std::uint32_t OTP_DATA_BASE                     = 0x40130000;
+        constexpr std::uint16_t OTP_DATA_USB_WHITE_LABEL_ADDR_ROW = 0x005c;
+        constexpr std::uint16_t INDEX_OFFSET = static_cast<std::uint16_t>(Index);
 
         auto otp_read_ecc = [](std::uint16_t row) -> std::uint16_t {
             return *reinterpret_cast<std::uint16_t const volatile*>(OTP_DATA_BASE
@@ -379,8 +398,7 @@ namespace detail {
 
         if(white_label_addr == 0 || white_label_addr == 0xFFFF) { return std::nullopt; }
 
-        std::uint16_t const string_definition
-          = otp_read_ecc(white_label_addr + INDEX_USB_DEVICE_SERIAL_NUMBER_STRDEF);
+        std::uint16_t const string_definition = otp_read_ecc(white_label_addr + INDEX_OFFSET);
 
         if(string_definition == 0x0000 || string_definition == 0xFFFF) { return std::nullopt; }
 
@@ -392,12 +410,10 @@ namespace detail {
         std::uint8_t const data_row_offset
           = static_cast<std::uint8_t>((string_definition >> 8) & 0xFF);
 
-        if(is_unicode || character_count == 0 || character_count > MAX_SERIAL_LENGTH) {
-            return std::nullopt;
-        }
+        if(is_unicode || character_count == 0 || character_count > MaxLen) { return std::nullopt; }
 
-        std::uint16_t const      string_data_start_row = white_label_addr + data_row_offset;
-        Kvasir::StaticString<30> result;
+        std::uint16_t const          string_data_start_row = white_label_addr + data_row_offset;
+        Kvasir::StaticString<MaxLen> result;
         result.resize(character_count);
 
         auto              output_iter = result.begin();
@@ -415,6 +431,14 @@ namespace detail {
         }
 
         return result;
+    }
+
+    static inline std::optional<Kvasir::StaticString<30>> read_white_label_serial_number() {
+        return read_white_label_string<WhiteLabelStrIndex::usb_device_serial_number, 30>();
+    }
+
+    static inline std::optional<Kvasir::StaticString<127>> read_white_label_board_id() {
+        return read_white_label_string<WhiteLabelStrIndex::info_uf2_txt_board_id, 127>();
     }
 #endif
 
@@ -463,6 +487,12 @@ inline auto whiteLabelSerialNumber() {
     static std::optional<Kvasir::StaticString<30>> const serial_number
       = detail::read_white_label_serial_number();
     return serial_number;
+}
+
+inline auto whiteLabelBoardId() {
+    static std::optional<Kvasir::StaticString<127>> const board_id
+      = detail::read_white_label_board_id();
+    return board_id;
 }
 #endif
 
