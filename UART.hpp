@@ -138,6 +138,21 @@ namespace Kvasir { namespace UART {
                                          PinConfig::UartPinType::Tx1);
             }
 
+            template<PinConfig::UartPinType ConfigType,
+                     int                    Pin>
+            static constexpr int getFunctionSel() {
+                using PinElement = std::remove_cv_t<std::remove_reference_t<
+                  decltype(PinConfig::UartPinMap<PinConfig::CurrentChip>::pins[0])>>;
+                if constexpr(!std::is_same_v<PinElement, PinConfig::UartPinType>) {
+                    // Pair-based map (RP2350A/B)
+                    constexpr auto entry = PinConfig::UartPinMap<PinConfig::CurrentChip>::pins[Pin];
+                    if constexpr(entry.first != entry.second && entry.first == ConfigType) {
+                        return 11;   // secondary function lives at F11
+                    }
+                }
+                return 2;   // primary function at F2
+            }
+
             template<typename CTSPIN>
             struct GetCtsPinConfig;
 
@@ -148,7 +163,11 @@ namespace Kvasir { namespace UART {
 
             template<int Port, int Pin>
             struct GetCtsPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<2>{},
+                static constexpr int funcSel
+                  = getFunctionSel<Instance == 0 ? PinConfig::UartPinType::Cts0
+                                                 : PinConfig::UartPinType::Cts1,
+                                   Pin>();
+                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<funcSel>{},
                                                   Register::PinLocation<Port, Pin>{}));
             };
 
@@ -162,7 +181,11 @@ namespace Kvasir { namespace UART {
 
             template<int Port, int Pin>
             struct GetRtsPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<2>{},
+                static constexpr int funcSel
+                  = getFunctionSel<Instance == 0 ? PinConfig::UartPinType::Rts0
+                                                 : PinConfig::UartPinType::Rts1,
+                                   Pin>();
+                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<funcSel>{},
                                                   Register::PinLocation<Port, Pin>{}));
             };
 
@@ -180,8 +203,12 @@ namespace Kvasir { namespace UART {
 
             template<int Port, int Pin>
             struct GetRxPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using enable    = decltype(set(Regs::UARTCR::rxe));
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<2>{},
+                using enable = decltype(set(Regs::UARTCR::rxe));
+                static constexpr int funcSel
+                  = getFunctionSel<Instance == 0 ? PinConfig::UartPinType::Rx0
+                                                 : PinConfig::UartPinType::Rx1,
+                                   Pin>();
+                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<funcSel>{},
                                                   Register::PinLocation<Port, Pin>{}));
                 using interrupt = brigand::list<decltype(set(Regs::UARTIMSC::rxim)),
                                                 decltype(set(Regs::UARTIMSC::oeim))>;
@@ -200,8 +227,12 @@ namespace Kvasir { namespace UART {
 
             template<int Port, int Pin>
             struct GetTxPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using enable    = decltype(set(Regs::UARTCR::txe));
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<2>{},
+                using enable = decltype(set(Regs::UARTCR::txe));
+                static constexpr int funcSel
+                  = getFunctionSel<Instance == 0 ? PinConfig::UartPinType::Tx0
+                                                 : PinConfig::UartPinType::Tx1,
+                                   Pin>();
+                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<funcSel>{},
                                                   Register::PinLocation<Port, Pin>{}));
             };
 
