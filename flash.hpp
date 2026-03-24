@@ -34,7 +34,7 @@ namespace Kvasir { namespace Flash {
         }
     }
 
-    template<typename Clock, typename T, typename Crc>
+    template<typename Clock, typename T, typename Crc, std::uint32_t StorageAddress>
     struct SimpleEeprom {
         static auto calcCrc(T const& v) {
             return Crc::calc(std::as_bytes(std::span{std::addressof(v), 1}));
@@ -45,7 +45,12 @@ namespace Kvasir { namespace Flash {
             typename Crc::type crc{};
         };
 
+#if __has_include("chip/rp2040.hpp")
         [[gnu::section(".eeprom"), gnu::aligned(4096)]] static inline ValueStruct flashValue{};
+#endif
+
+        static_assert(StorageAddress % 4096 == 0,
+                      "StorageAddress needs to be aligned to 4096");
 
         static inline T    ramCopy{};
         static inline bool valueRead{false};
@@ -60,7 +65,7 @@ namespace Kvasir { namespace Flash {
 
             auto const ret = Kvasir::detail::flash_op(
               flags,
-              reinterpret_cast<std::uint32_t>(std::addressof(flashValue)),
+              StorageAddress,
               sizeof(ValueStruct),
               reinterpret_cast<std::uint8_t*>(std::addressof(actualValue)));
 
@@ -92,8 +97,7 @@ namespace Kvasir { namespace Flash {
 
             asm("" : "=m"(newV)::);
 
-            eraseAndWrite(reinterpret_cast<std::uint32_t>(std::addressof(flashValue)),
-                          std::as_bytes(std::span{std::addressof(newV), 1}));
+            eraseAndWrite(StorageAddress, std::as_bytes(std::span{std::addressof(newV), 1}));
         }
 
         static void writeValue() {
