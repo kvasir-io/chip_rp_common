@@ -98,11 +98,17 @@ namespace Kvasir { namespace I2C {
                 std::uint32_t period = calcPeriod(f_clockSpeed, f_baud);
 
                 // Split period: 60% low, 40% high (per pico-sdk)
-                regs.lcnt = period * 3 / 5;
-                regs.hcnt = period - regs.lcnt;
+                std::uint32_t high_cycles = period - (period * 3 / 5);
+                std::uint32_t low_cycles  = period * 3 / 5;
 
-                // Calculate spike length
-                regs.spklen = calcSpkLen(regs.lcnt);
+                // Calculate spike length based on raw cycle counts
+                regs.spklen = calcSpkLen(low_cycles);
+
+                // Program values per RP2350 datasheet Table 1053 / Section 12.2.14:
+                //   actual t_HIGH = (HCNT + SPKLEN + 7) cycles → write HCNT = high_cycles − SPKLEN − 7
+                //   actual t_LOW  = (LCNT + 1) cycles          → write LCNT = low_cycles − 1
+                regs.hcnt = high_cycles - regs.spklen - 7;
+                regs.lcnt = low_cycles - 1;
 
                 // Calculate SDA hold time
                 regs.sda_hold = calcSdaTxHold(f_clockSpeed, f_baud);
@@ -111,26 +117,40 @@ namespace Kvasir { namespace I2C {
             }
 
             template<std::uint32_t f_clockSpeed,
+                     std::uint32_t f_baud>
+            static constexpr bool isValidSpkLen() {
+                constexpr auto regs = calcBaudRegs(f_clockSpeed, f_baud);
+                return regs.spklen <= 0xFF;   // IC_FS_SPKLEN is 8-bit
+            }
+
+            template<std::uint32_t f_clockSpeed,
+                     std::uint32_t f_baud>
+            static constexpr bool isValidHcnt() {
+                constexpr auto regs = calcBaudRegs(f_clockSpeed, f_baud);
+                return regs.hcnt <= 0xFFFF   // IC_FS_SCL_HCNT is 16-bit
+                    && regs.hcnt > regs.spklen + 5;
+            }
+
+            template<std::uint32_t f_clockSpeed,
+                     std::uint32_t f_baud>
+            static constexpr bool isValidLcnt() {
+                constexpr auto regs = calcBaudRegs(f_clockSpeed, f_baud);
+                return regs.lcnt <= 0xFFFF   // IC_FS_SCL_LCNT is 16-bit
+                    && regs.lcnt > regs.spklen + 7;
+            }
+
+            template<std::uint32_t f_clockSpeed,
                      std::uint32_t f_baud,
                      std::intmax_t Num,
                      std::intmax_t Denom>
             static constexpr bool isValidBaudConfig(std::ratio<Num,
                                                                Denom>) {
-                constexpr auto regs = calcBaudRegs(f_clockSpeed, f_baud);
-
-                // Check datasheet minimums
-                // LCNT must be > SPKLEN + 7
-                // HCNT must be > SPKLEN + 5
-                if(regs.lcnt <= regs.spklen + 7) { return false; }
-                if(regs.hcnt <= regs.spklen + 5) { return false; }
-
-                // Verify actual baud rate is within tolerance
-                constexpr auto period       = regs.hcnt + regs.lcnt;
+                constexpr auto regs         = calcBaudRegs(f_clockSpeed, f_baud);
+                constexpr auto period       = (regs.hcnt + regs.spklen + 7) + (regs.lcnt + 1);
                 constexpr auto f_baudActual = f_clockSpeed / period;
                 constexpr auto err
                   = f_baudActual > f_baud ? f_baudActual - f_baud : f_baud - f_baudActual;
                 constexpr auto maxErr = (f_baud * Num) / Denom;
-
                 return err <= maxErr;
             }
 
@@ -265,10 +285,20 @@ namespace Kvasir { namespace I2C {
                                                           clear(Regs::IC_INTR_MASK::m_rx_over),
                                                           clear(Regs::IC_INTR_MASK::m_rx_under)));
 
+            static_assert(Config::template isValidSpkLen<I2CConfig::clockSpeed,
+                                                         I2CConfig::baudRate>(),
+                          "I2C SPKLEN overflows 8-bit register (max 255) — baud rate too low or "
+                          "clock speed too high");
+            static_assert(Config::template isValidLcnt<I2CConfig::clockSpeed,
+                                                       I2CConfig::baudRate>(),
+                          "I2C LCNT invalid: must fit in 16 bits and be > SPKLEN+7");
+            static_assert(Config::template isValidHcnt<I2CConfig::clockSpeed,
+                                                       I2CConfig::baudRate>(),
+                          "I2C HCNT invalid: must fit in 16 bits and be > SPKLEN+5");
             static_assert(
               Config::template isValidBaudConfig<I2CConfig::clockSpeed,
                                                  I2CConfig::baudRate>(I2CConfig::maxBaudRateError),
-              "invalid baud configuration baudRate error too big");
+              "I2C baud rate error too large — adjust clockSpeed, baudRate, or maxBaudRateError");
             static_assert(Config::isValidPinLocationSDA(I2CConfig::sdaPinLocation),
                           "invalid SDAPin");
             static_assert(Config::isValidPinLocationSCL(I2CConfig::sclPinLocation),

@@ -363,10 +363,10 @@ public:
     }
 
     static void setupEndpoint() {
-        using EPReg             = std::conditional_t<IsIn,
-                                                     typename BufferRegs::template EP<EP>::IN_CONTROL,
-                                                     typename BufferRegs::template EP<EP>::OUT_CONTROL>;
-        using RegType           = typename EPReg::ENDPOINT_TYPEValC;
+        using EPReg   = std::conditional_t<IsIn,
+                                           typename BufferRegs::template EP<EP>::IN_CONTROL,
+                                           typename BufferRegs::template EP<EP>::OUT_CONTROL>;
+        using RegType = typename EPReg::ENDPOINT_TYPEValC;
         constexpr auto regValue = []() {
             if constexpr(Type == EndpointTransferType::Bulk) {
                 return RegType::bulk;

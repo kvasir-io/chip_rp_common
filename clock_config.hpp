@@ -75,7 +75,7 @@ namespace Kvasir { namespace DefaultClockSettings {
                             // Accept if better margin, or same margin with preferred VCO
                             constexpr double tolerance   = 1e-9;
                             bool const       marginEqual = (margin - bestMargin) < tolerance
-                                                  && (margin - bestMargin) > -tolerance;
+                                                        && (margin - bestMargin) > -tolerance;
 
                             if(margin < bestMargin || (marginEqual && vcoIsBetter)) {
                                 bestSettings = PllSettings{.fbdiv  = fbdiv,

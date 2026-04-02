@@ -430,9 +430,9 @@ namespace detail {
             } else {
                 auto const start = buffer.begin() + 2;
                 auto const end   = Kvasir::USB::insertStringDescriptor(index - 1,
-                                                                     DescriptorStrings,
-                                                                     start,
-                                                                     buffer.end());
+                                                                       DescriptorStrings,
+                                                                       start,
+                                                                       buffer.end());
                 // Check if insertion failed (iterator unchanged means invalid index)
                 if(end == start) { return false; }
                 len = static_cast<std::size_t>(std::distance(buffer.begin(), end));

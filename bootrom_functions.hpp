@@ -78,10 +78,10 @@ namespace detail {
         }
 
         FlashXipDisabler()
-          : connectInternalFlash{Kvasir::RomFunctions::getRomFunctionPointer<
-              'I',
-              'F',
-              RomConnectInternalFlash>()}
+          : connectInternalFlash{
+              Kvasir::RomFunctions::getRomFunctionPointer<'I',
+                                                          'F',
+                                                          RomConnectInternalFlash>()}
           , flashExitXip{Kvasir::RomFunctions::getRomFunctionPointer<'E',
                                                                      'X',
                                                                      RomFlashExitXip>()}
