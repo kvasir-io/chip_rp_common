@@ -6,6 +6,10 @@
     #include "peripherals/QMI.hpp"
 #endif
 
+#if __has_include("peripherals/XIP_CTRL.hpp")
+    #include "peripherals/XIP_CTRL.hpp"
+#endif
+
 #include <cmath>
 #include <cstdint>
 
@@ -155,6 +159,13 @@ namespace Kvasir { namespace DefaultClockSettings {
           write(QMI::M0_TIMING::max_select, value<std::uint32_t, 0>()),
           write(QMI::M0_TIMING::min_deselect, value<std::uint32_t, 0>())));
 
+#endif
+
+#if __has_include("peripherals/XIP_CTRL.hpp")
+        // Restore XIP cache to reset state. The debugger may disable it during flash writes;
+        // a run_low reset leaves peripheral state as-is, so this ensures the cache is always
+        // enabled regardless of reset cause.
+        apply(Kvasir::Peripheral::XIP_CTRL::Registers<>::CTRL::overrideDefaults());
 #endif
     }
 

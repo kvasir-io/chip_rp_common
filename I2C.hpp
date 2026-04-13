@@ -340,8 +340,19 @@ namespace Kvasir { namespace I2C {
                 return std::chrono::microseconds(timeoutUs) + baseTimeout;
             }
 
+            // abort: use after a TX_ABRT ISR — bus already in clean state (NAK released it),
+            // this just flushes the TX FIFO and disables the peripheral.
             static constexpr auto abort
               = list(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::disabled),
+                                                       set(Regs::IC_ENABLE::abort)),
+                     NoInterrupts);
+
+            // softAbortRequest: use when a transaction must be terminated mid-stream (timeout,
+            // recovery). ENABLE=1 is required for the ABORT bit to issue a STOP on the bus
+            // (RP2350 datasheet §12.2.11). The hardware clears the ABORT bit when done.
+            // The caller must disable the peripheral afterwards (completeCurrentRequest does this).
+            static constexpr auto softAbortRequest
+              = list(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled),
                                                        set(Regs::IC_ENABLE::abort)),
                      NoInterrupts);
         };
