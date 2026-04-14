@@ -5,6 +5,7 @@
 #include "core/Nvic.hpp"
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Io/Types.hpp"
+#include "kvasir/Register/Apply.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/I2C.hpp"
 
@@ -513,7 +514,7 @@ namespace Kvasir { namespace I2C {
 
         // ISR
         static void onIsr() {
-            bool const error = fieldEquals(Regs::IC_INTR_STAT::R_TX_ABRTVal::active);
+            bool const error = fieldEquals(Regs::IC_INTR_STAT::R_TX_ABRTValC::active);
 
             auto lstate  = state_.load(std::memory_order_relaxed);
             auto lostate = operationState_.load(std::memory_order_relaxed);
