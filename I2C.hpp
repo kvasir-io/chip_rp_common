@@ -513,8 +513,7 @@ namespace Kvasir { namespace I2C {
 
         // ISR
         static void onIsr() {
-            bool const error = get<0>(apply(read(Regs::IC_INTR_STAT::r_tx_abrt)))
-                            == Regs::IC_INTR_STAT::R_TX_ABRTVal::active;
+            bool const error = fieldEquals(Regs::IC_INTR_STAT::R_TX_ABRTVal::active);
 
             auto lstate  = state_.load(std::memory_order_relaxed);
             auto lostate = operationState_.load(std::memory_order_relaxed);

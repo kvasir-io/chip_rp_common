@@ -2,6 +2,7 @@
 
 #include "I2CBusRecovery.hpp"
 #include "kvasir/Atomic/Queue.hpp"
+#include "kvasir/Register/Apply.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 
 #include <span>
@@ -99,11 +100,10 @@ namespace Kvasir { namespace I2C {
             // Active transaction: check for timeout
             if(now > timeoutTime_) {
                 apply(makeDisable(typename base::InterruptIndexs{}));
-                auto const abrtSrc = get<0>(apply(read(Regs::IC_TX_ABRT_SOURCE::FULLREGISTER)));
-                UC_LOG_W("i2c{} timeout addr={:#04x} src={:#010x}",
+                UC_LOG_W("i2c{} timeout addr={:#04x} {}",
                          base::Instance,
                          currentRequest_.address,
-                         static_cast<std::uint32_t>(abrtSrc));
+                         typename Regs::IC_TX_ABRT_SOURCE{});
                 apply(base::softAbortRequest);
                 completeCurrentRequest(I2CRequestResult::failed);
                 apply(makeEnable(typename base::InterruptIndexs{}));
@@ -185,8 +185,7 @@ namespace Kvasir { namespace I2C {
             if(result != I2CRequestResult::succeeded) {
                 // Guard against cascading timeouts: if the master FSM is still active after
                 // aborting, the bus may still be held. Defer startNext() for a brief settle.
-                auto const mstActive = get<0>(apply(read(Regs::IC_STATUS::mst_activity)));
-                if(mstActive == Regs::IC_STATUS::MST_ACTIVITYVal::active) {
+                if(fieldEquals(Regs::IC_STATUS::MST_ACTIVITYValC::active)) {
                     UC_LOG_W("i2c{} master still active after abort -- deferring queue drain",
                              base::Instance);
                     active_ = false;
@@ -210,17 +209,16 @@ namespace Kvasir { namespace I2C {
 
     public:
         static void onIsr() {
-            bool const error = get<0>(apply(read(Regs::IC_INTR_STAT::r_tx_abrt)))
-                            == Regs::IC_INTR_STAT::R_TX_ABRTVal::active;
+            bool const error = fieldEquals(Regs::IC_INTR_STAT::R_TX_ABRTValC::active);
 
             if(state_ == State::sending) {
                 if(error) {
-                    auto const abrtSrc = get<0>(apply(read(Regs::IC_TX_ABRT_SOURCE::FULLREGISTER)));
-                    bool const isNak   = (static_cast<std::uint32_t>(abrtSrc) & 0b1001u) != 0u;
-                    UC_LOG_W("i2c{} abort send addr={:#04x} src={:#010x}",
+                    bool const isNak
+                      = fieldEquals(Regs::IC_TX_ABRT_SOURCE::ABRT_7B_ADDR_NOACKValC::active);
+                    UC_LOG_W("i2c{} abort send addr={:#04x} {}",
                              base::Instance,
                              currentRequest_.address,
-                             static_cast<std::uint32_t>(abrtSrc));
+                             typename Regs::IC_TX_ABRT_SOURCE{});
                     apply(base::abort);
                     completeCurrentRequest(isNak ? I2CRequestResult::notAcknowledged
                                                  : I2CRequestResult::failed);
@@ -257,12 +255,12 @@ namespace Kvasir { namespace I2C {
                 }
             } else if(state_ == State::receiving) {
                 if(error) {
-                    auto const abrtSrc = get<0>(apply(read(Regs::IC_TX_ABRT_SOURCE::FULLREGISTER)));
-                    bool const isNak   = (static_cast<std::uint32_t>(abrtSrc) & 0b1001u) != 0u;
-                    UC_LOG_W("i2c{} abort recv addr={:#04x} src={:#010x}",
+                    bool const isNak
+                      = fieldEquals(Regs::IC_TX_ABRT_SOURCE::ABRT_7B_ADDR_NOACKValC::active);
+                    UC_LOG_W("i2c{} abort recv addr={:#04x} {}",
                              base::Instance,
                              currentRequest_.address,
-                             static_cast<std::uint32_t>(abrtSrc));
+                             typename Regs::IC_TX_ABRT_SOURCE{});
                     apply(base::abort);
                     completeCurrentRequest(isNak ? I2CRequestResult::notAcknowledged
                                                  : I2CRequestResult::failed);
