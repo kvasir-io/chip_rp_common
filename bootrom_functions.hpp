@@ -49,6 +49,34 @@ namespace RomFunctions {
     }
 }   // namespace RomFunctions
 
+#if __has_include("chip/rp2350.hpp")
+enum class BootArch : std::uint8_t { Arm = 0, RiscV = 1 };
+
+enum class GlitchDetectorSens : std::uint8_t {
+    Default = 0,
+    Low     = 1,
+    Medium  = 2,
+    High    = 3,
+};
+
+struct CriticalFlags {
+    bool               secureBootEnabled;
+    bool               secureDebugDisable;
+    bool               debugDisable;
+    BootArch           bootArch;
+    bool               glitchDetectorEnabled;
+    GlitchDetectorSens glitchDetectorSens;
+};
+
+struct OtpPageLocks {
+    bool page1;    ///< PAGE1_LOCK1  — critical boot flags page
+    bool page2;    ///< PAGE2_LOCK1  — boot key hash page
+    bool page29;   ///< PAGE29_LOCK1 — AES key page
+    bool page30;   ///< PAGE30_LOCK1 — AES key page
+    bool page31;   ///< PAGE31_LOCK1 — IV salt page
+};
+#endif
+
 namespace detail {
     struct FlashXipDisabler {
         using RomConnectInternalFlash = void (*)(void);
@@ -433,6 +461,47 @@ namespace detail {
         return result;
     }
 
+    static inline CriticalFlags read_critical_flags() {
+        constexpr std::uint32_t      CRITICAL = 0x0002;
+        std::array<std::uint32_t, 2> buffer{};
+        auto const                   length = get_sys_info(buffer.data(), buffer.size(), CRITICAL);
+        if(length < 2 || (buffer[0] & CRITICAL) == 0) { return {}; }
+        auto const raw = buffer[1];
+        return {
+          .secureBootEnabled     = (raw & 0x01) != 0,
+          .secureDebugDisable    = (raw & 0x02) != 0,
+          .debugDisable          = (raw & 0x04) != 0,
+          .bootArch              = static_cast<BootArch>((raw >> 3) & 0x01),
+          .glitchDetectorEnabled = (raw & 0x10) != 0,
+          .glitchDetectorSens    = static_cast<GlitchDetectorSens>((raw >> 5) & 0x03),
+        };
+    }
+
+    static inline OtpPageLocks read_otp_page_locks() {
+        constexpr std::uint32_t OTP_DATA_RAW_BASE = 0x40134000;
+        // Offsets verified against SVD: baseAddr + 0x3E00 + page*8 + 4 for LOCK1
+        constexpr std::uint32_t PAGE1_LOCK1_OFFSET  = 0x3E0C;
+        constexpr std::uint32_t PAGE2_LOCK1_OFFSET  = 0x3E14;
+        constexpr std::uint32_t PAGE29_LOCK1_OFFSET = 0x3EEC;
+        constexpr std::uint32_t PAGE30_LOCK1_OFFSET = 0x3EF4;
+        constexpr std::uint32_t PAGE31_LOCK1_OFFSET = 0x3EFC;
+
+        // Bits [5:0] encode lock_s (1:0), lock_ns (3:2), lock_bl (5:4); any non-zero means locked.
+        auto is_locked = [](std::uint32_t offset) -> bool {
+            auto const val
+              = *reinterpret_cast<std::uint32_t const volatile*>(OTP_DATA_RAW_BASE + offset);
+            return (val & 0x3F) != 0;
+        };
+
+        return {
+          .page1  = is_locked(PAGE1_LOCK1_OFFSET),
+          .page2  = is_locked(PAGE2_LOCK1_OFFSET),
+          .page29 = is_locked(PAGE29_LOCK1_OFFSET),
+          .page30 = is_locked(PAGE30_LOCK1_OFFSET),
+          .page31 = is_locked(PAGE31_LOCK1_OFFSET),
+        };
+    }
+
     static inline std::optional<Kvasir::StaticString<30>> read_white_label_serial_number() {
         return read_white_label_string<WhiteLabelStrIndex::usb_device_serial_number, 30>();
     }
@@ -494,6 +563,14 @@ inline auto whiteLabelBoardId() {
       = detail::read_white_label_board_id();
     return board_id;
 }
+
+inline CriticalFlags criticalFlags() { return detail::read_critical_flags(); }
+
+inline OtpPageLocks otpPageLocks() { return detail::read_otp_page_locks(); }
+
+inline bool isSecureBootEnabled() { return criticalFlags().secureBootEnabled; }
+#else
+inline bool isSecureBootEnabled() { return false; }
 #endif
 
 inline Kvasir::StaticString<30> bootromUSBSerialNumber() {
@@ -502,6 +579,13 @@ inline Kvasir::StaticString<30> bootromUSBSerialNumber() {
     if(whiteLabelSerial.has_value()) { return whiteLabelSerial.value(); }
 #endif
     return serialNumberString();
+}
+
+inline bool isFlashBinary() {
+    // Read SCB->VTOR (0xE000ED08): the vector table base address tells us where
+    // the binary lives. On RP2350: flash = 0x10000000, RAM = 0x20000000.
+    auto const vtor = *reinterpret_cast<std::uint32_t const volatile*>(0xE000ED08U);
+    return vtor < 0x20000000U;
 }
 
 }   // namespace Kvasir
