@@ -469,7 +469,7 @@ namespace Kvasir { namespace SPI {
                                         std::span<std::byte>       outData) {
             assert(inData.size() == outData.size());
             send_receive_nocopy_impl<true>(inData.data(),
-                                           outData.size(),
+                                           outData.data(),
                                            inData.size(),
                                            std::nullopt);
         }
