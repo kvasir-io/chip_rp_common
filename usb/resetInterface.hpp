@@ -4,6 +4,7 @@
 #include "mixins.hpp"
 
 #include <cstddef>
+#include <type_traits>
 
 namespace Kvasir::USB::ResetInterface {
 
@@ -11,7 +12,9 @@ template<typename Clock,
          typename Config,
          typename Derived,
          std::size_t FirstInterfaceNumber,
-         std::size_t FirstEndpointNumber>
+         std::size_t FirstEndpointNumber,
+         typename BeforeBootselCallback = void,
+         typename BeforeFlashCallback   = void>
 struct Mixin {
 private:
     friend Derived;
@@ -41,10 +44,14 @@ private:
 
         if(pkt.bRequest == REQUEST_BOOTSEL) {
             UC_LOG_I("USB: Rebooting to BOOTSEL mode");
+            if constexpr(!std::is_same_v<BeforeBootselCallback, void>) {
+                BeforeBootselCallback{}();
+            }
             Kvasir::resetToUsbBoot();
             return true;
         } else if(pkt.bRequest == REQUEST_FLASH) {
             UC_LOG_I("USB: Rebooting to flash");
+            if constexpr(!std::is_same_v<BeforeFlashCallback, void>) { BeforeFlashCallback{}(); }
             apply(Kvasir::SystemControl::SystemReset{});
             return true;
         }
