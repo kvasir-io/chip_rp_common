@@ -114,10 +114,7 @@ namespace Kvasir { namespace I2C {
                 phase_         = Phase::Reinit;
                 break;
             case Phase::Reinit:
-                apply(
-                  action(Kvasir::Io::Action::PinFunction<3>{}, base::I2CConfig::sclPinLocation));
-                apply(
-                  action(Kvasir::Io::Action::PinFunction<3>{}, base::I2CConfig::sdaPinLocation));
+                apply(base::initStepPinConfig);
                 phase_ = Phase::Idle;
                 return TickResult::needsReinit;
             default: break;

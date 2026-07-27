@@ -45,21 +45,31 @@ namespace Kvasir { namespace I2C {
                                          PinConfig::I2cPinType::Scl1);
             }
 
-            template<typename SDAPIN>
+            // I2C is open-drain: the pad only ever drives low. Keep the driver weak
+            // and slew slow so falling edges stay within the I2C spec t_f window
+            // (>= ~12 ns for fast mode) — a 12 mA pad produces ~1.5 ns edges with
+            // heavy ringing. Standard mode (<= 100 kHz) gets 2 mA, faster modes 4 mA.
+            static constexpr Io::DriveStrength i2cDrive(std::uint32_t f_baud) {
+                return f_baud <= 100'000 ? Io::DriveStrength::mA_2 : Io::DriveStrength::mA_4;
+            }
+
+            template<typename SDAPIN, std::uint32_t f_baud>
             struct GetSDAPinConfig;
 
-            template<int Port, int Pin>
-            struct GetSDAPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<3>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, std::uint32_t f_baud>
+            struct GetSDAPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
+                using pinConfig = decltype(action(
+                  Kvasir::Io::Action::PinFunctionDrive<3, i2cDrive(f_baud), false>{},
+                  Register::PinLocation<Port, Pin>{}));
             };
-            template<typename SCLPIN>
+            template<typename SCLPIN, std::uint32_t f_baud>
             struct GetSCLPinConfig;
 
-            template<int Port, int Pin>
-            struct GetSCLPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<3>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, std::uint32_t f_baud>
+            struct GetSCLPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
+                using pinConfig = decltype(action(
+                  Kvasir::Io::Action::PinFunctionDrive<3, i2cDrive(f_baud), false>{},
+                  Register::PinLocation<Port, Pin>{}));
             };
 
             // I2C baud rate calculation helpers
@@ -309,9 +319,11 @@ namespace Kvasir { namespace I2C {
 
             static constexpr auto initStepPinConfig
               = list(typename Config::template GetSDAPinConfig<
-                       std::decay_t<decltype(I2CConfig::sdaPinLocation)>>::pinConfig{},
+                       std::decay_t<decltype(I2CConfig::sdaPinLocation)>,
+                       I2CConfig::baudRate>::pinConfig{},
                      typename Config::template GetSCLPinConfig<
-                       std::decay_t<decltype(I2CConfig::sclPinLocation)>>::pinConfig{});
+                       std::decay_t<decltype(I2CConfig::sclPinLocation)>,
+                       I2CConfig::baudRate>::pinConfig{});
 
             static constexpr auto initStepPeripheryConfig
               = list(Regs::IC_CON::overrideDefaults(

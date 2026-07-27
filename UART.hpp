@@ -153,6 +153,14 @@ namespace Kvasir { namespace UART {
                 return 2;   // primary function at F2
             }
 
+            // TX/RTS are push-pull outputs: 4 mA with slow slew (the pad default) is
+            // plenty up to ~1 MBaud; faster links get 8 mA with fast slew.
+            static constexpr Io::DriveStrength uartDrive(std::uint32_t f_baud) {
+                return f_baud <= 1'000'000 ? Io::DriveStrength::mA_4 : Io::DriveStrength::mA_8;
+            }
+
+            static constexpr bool uartSlewFast(std::uint32_t f_baud) { return f_baud > 1'000'000; }
+
             template<typename CTSPIN>
             struct GetCtsPinConfig;
 
@@ -171,22 +179,25 @@ namespace Kvasir { namespace UART {
                                                   Register::PinLocation<Port, Pin>{}));
             };
 
-            template<typename RTSPIN>
+            template<typename RTSPIN, std::uint32_t f_baud>
             struct GetRtsPinConfig;
 
-            template<typename dummy>
-            struct GetRtsPinConfig<Io::NotUsed<dummy>> {
+            template<typename dummy, std::uint32_t f_baud>
+            struct GetRtsPinConfig<Io::NotUsed<dummy>, f_baud> {
                 using pinConfig = brigand::list<>;
             };
 
-            template<int Port, int Pin>
-            struct GetRtsPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
+            template<int Port, int Pin, std::uint32_t f_baud>
+            struct GetRtsPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
                 static constexpr int funcSel
                   = getFunctionSel<Instance == 0 ? PinConfig::UartPinType::Rts0
                                                  : PinConfig::UartPinType::Rts1,
                                    Pin>();
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<funcSel>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+                using pinConfig
+                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<funcSel,
+                                                                         uartDrive(f_baud),
+                                                                         uartSlewFast(f_baud)>{},
+                                    Register::PinLocation<Port, Pin>{}));
             };
 
             template<typename RXPIN>
@@ -216,24 +227,27 @@ namespace Kvasir { namespace UART {
                 using interruptEnable = decltype(Kvasir::Nvic::makeEnable(InterruptIndex{}));
             };
 
-            template<typename TXPIN>
+            template<typename TXPIN, std::uint32_t f_baud>
             struct GetTxPinConfig;
 
-            template<typename dummy>
-            struct GetTxPinConfig<Io::NotUsed<dummy>> {
+            template<typename dummy, std::uint32_t f_baud>
+            struct GetTxPinConfig<Io::NotUsed<dummy>, f_baud> {
                 using enable    = decltype(set(Regs::UARTCR::txe));
                 using pinConfig = brigand::list<>;
             };
 
-            template<int Port, int Pin>
-            struct GetTxPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
+            template<int Port, int Pin, std::uint32_t f_baud>
+            struct GetTxPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
                 using enable = decltype(set(Regs::UARTCR::txe));
                 static constexpr int funcSel
                   = getFunctionSel<Instance == 0 ? PinConfig::UartPinType::Tx0
                                                  : PinConfig::UartPinType::Tx1,
                                    Pin>();
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<funcSel>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+                using pinConfig
+                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<funcSel,
+                                                                         uartDrive(f_baud),
+                                                                         uartSlewFast(f_baud)>{},
+                                    Register::PinLocation<Port, Pin>{}));
             };
 
             template<DataBits dbits>
@@ -389,7 +403,8 @@ namespace Kvasir { namespace UART {
 
         static constexpr auto initStepPinConfig
           = list(typename Config::template GetTxPinConfig<
-                   std::decay_t<decltype(UartConfig::txPinLocation)>>::pinConfig{},
+                   std::decay_t<decltype(UartConfig::txPinLocation)>,
+                   UartConfig::baudRate>::pinConfig{},
                  typename Config::template GetRxPinConfig<
                    std::decay_t<decltype(UartConfig::rxPinLocation)>>::pinConfig{});
 
@@ -402,7 +417,8 @@ namespace Kvasir { namespace UART {
                  Kvasir::Register::SequencePoint{},
                  // LCR_H writes below will latch the baud divisors (PL011 requirement)
                  typename Config::template GetTxPinConfig<
-                   std::decay_t<decltype(UartConfig::txPinLocation)>>::enable{},
+                   std::decay_t<decltype(UartConfig::txPinLocation)>,
+                   UartConfig::baudRate>::enable{},
                  typename Config::template GetRxPinConfig<
                    std::decay_t<decltype(UartConfig::rxPinLocation)>>::enable{},
                  typename Config::template GetDataBitConfig<UartConfig::dataBits>::config{},

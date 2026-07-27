@@ -82,6 +82,14 @@ namespace Kvasir { namespace SPI {
                                          PinConfig::SpiPinType::Cs1);
             }
 
+            // MOSI/SCLK/CS are push-pull outputs: 4 mA with slow slew (the pad
+            // default) is plenty up to ~8 MHz; faster clocks get 8 mA with fast slew.
+            static constexpr Io::DriveStrength spiDrive(std::uint32_t f_baud) {
+                return f_baud <= 8'000'000 ? Io::DriveStrength::mA_4 : Io::DriveStrength::mA_8;
+            }
+
+            static constexpr bool spiSlewFast(std::uint32_t f_baud) { return f_baud > 8'000'000; }
+
             template<typename MISOPIN>
             struct GetMISOPinConfig;
 
@@ -95,41 +103,44 @@ namespace Kvasir { namespace SPI {
                 using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<1>{},
                                                   Register::PinLocation<Port, Pin>{}));
             };
-            template<typename CSPIN>
+            template<typename CSPIN, std::uint32_t f_baud>
             struct GetCSPinConfig;
 
-            template<typename dummy>
-            struct GetCSPinConfig<Io::NotUsed<dummy>> {
+            template<typename dummy, std::uint32_t f_baud>
+            struct GetCSPinConfig<Io::NotUsed<dummy>, f_baud> {
                 using pinConfig = brigand::list<>;
             };
 
-            template<int Port, int Pin>
-            struct GetCSPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<1>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, std::uint32_t f_baud>
+            struct GetCSPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
+                using pinConfig = decltype(action(
+                  Kvasir::Io::Action::PinFunctionDrive<1, spiDrive(f_baud), spiSlewFast(f_baud)>{},
+                  Register::PinLocation<Port, Pin>{}));
             };
 
-            template<typename MOSIPIN>
+            template<typename MOSIPIN, std::uint32_t f_baud>
             struct GetMOSIPinConfig;
 
-            template<typename dummy>
-            struct GetMOSIPinConfig<Io::NotUsed<dummy>> {
+            template<typename dummy, std::uint32_t f_baud>
+            struct GetMOSIPinConfig<Io::NotUsed<dummy>, f_baud> {
                 using pinConfig = brigand::list<>;
             };
 
-            template<int Port, int Pin>
-            struct GetMOSIPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<1>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, std::uint32_t f_baud>
+            struct GetMOSIPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
+                using pinConfig = decltype(action(
+                  Kvasir::Io::Action::PinFunctionDrive<1, spiDrive(f_baud), spiSlewFast(f_baud)>{},
+                  Register::PinLocation<Port, Pin>{}));
             };
 
-            template<typename SCLKPIN>
+            template<typename SCLKPIN, std::uint32_t f_baud>
             struct GetSCLKPinConfig;
 
-            template<int Port, int Pin>
-            struct GetSCLKPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<1>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, std::uint32_t f_baud>
+            struct GetSCLKPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
+                using pinConfig = decltype(action(
+                  Kvasir::Io::Action::PinFunctionDrive<1, spiDrive(f_baud), spiSlewFast(f_baud)>{},
+                  Register::PinLocation<Port, Pin>{}));
             };
 
             template<Mode mode>
@@ -348,15 +359,17 @@ namespace Kvasir { namespace SPI {
 
         static constexpr auto powerClockEnable = list(Traits::SPI::getEnable<Instance>());
 
-        static constexpr auto initStepPinConfig
-          = list(typename Config::template GetMISOPinConfig<
-                   std::decay_t<decltype(SPIConfig::misoPinLocation)>>::pinConfig{},
-                 typename Config::template GetMOSIPinConfig<
-                   std::decay_t<decltype(SPIConfig::mosiPinLocation)>>::pinConfig{},
-                 typename Config::template GetSCLKPinConfig<
-                   std::decay_t<decltype(SPIConfig::sclkPinLocation)>>::pinConfig{},
-                 typename Config::template GetCSPinConfig<
-                   std::decay_t<decltype(SPIConfig::csPinLocation)>>::pinConfig{});
+        static constexpr auto initStepPinConfig = list(
+          typename Config::template GetMISOPinConfig<
+            std::decay_t<decltype(SPIConfig::misoPinLocation)>>::pinConfig{},
+          typename Config::template GetMOSIPinConfig<
+            std::decay_t<decltype(SPIConfig::mosiPinLocation)>,
+            SPIConfig::baudRate>::pinConfig{},
+          typename Config::template GetSCLKPinConfig<
+            std::decay_t<decltype(SPIConfig::sclkPinLocation)>,
+            SPIConfig::baudRate>::pinConfig{},
+          typename Config::template GetCSPinConfig<std::decay_t<decltype(SPIConfig::csPinLocation)>,
+                                                   SPIConfig::baudRate>::pinConfig{});
 
         static constexpr auto initStepPeripheryConfig
           = list(Config::template getBaudConfig<SPIConfig::clockSpeed, SPIConfig::baudRate>(),

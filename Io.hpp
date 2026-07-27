@@ -156,6 +156,44 @@ namespace Kvasir { namespace Io {
 
     }   // namespace detail
 
+    enum class DriveStrength { mA_2, mA_4, mA_8, mA_12 };
+
+    // Pad reset default is 4 mA with slow slew — OutputSpeed::Low maps to exactly
+    // that; higher speeds increase drive strength and enable fast slew.
+    constexpr DriveStrength driveFromOutputSpeed(OutputSpeed os) {
+        return os == OutputSpeed::Low    ? DriveStrength::mA_4
+             : os == OutputSpeed::Medium ? DriveStrength::mA_4
+             : os == OutputSpeed::High   ? DriveStrength::mA_8
+                                         : DriveStrength::mA_12;
+    }
+
+    constexpr bool slewFastFromOutputSpeed(OutputSpeed os) { return os != OutputSpeed::Low; }
+
+    template<int           Pin,
+             DriveStrength DS>
+    constexpr auto get_drive_action() {
+        if constexpr(DS == DriveStrength::mA_2) {
+            return write(detail::Pad<Pin>::DRIVEValC::_2ma);
+        } else if constexpr(DS == DriveStrength::mA_4) {
+            return write(detail::Pad<Pin>::DRIVEValC::_4ma);
+        } else if constexpr(DS == DriveStrength::mA_8) {
+            return write(detail::Pad<Pin>::DRIVEValC::_8ma);
+        } else {
+            return write(detail::Pad<Pin>::DRIVEValC::_12ma);
+        }
+    }
+
+    namespace Action {
+        template<int               Function,
+                 DriveStrength     DS,
+                 bool              SlewFast = false,
+                 PullConfiguration PC       = PullConfiguration::PullNone,
+                 OutputInit        OI       = OutputInit::Low>
+        struct PinFunctionDrive {
+            static constexpr int value = Function;
+        };
+    }   // namespace Action
+
     template<Io::PullConfiguration PC, int Port, int Pin>
     struct MakeAction<Action::Input<PC>, Register::PinLocation<Port, Pin>>
       : decltype(MPL::list(
@@ -187,10 +225,10 @@ namespace Kvasir { namespace Io {
           clear(detail::Pad<Pin>::iso),
 #endif
           clear(detail::Pad<Pin>::od),
-          write(detail::Pad<Pin>::DRIVEValC::_12ma),
+          get_drive_action<Pin, driveFromOutputSpeed(OS)>(),
           clear(detail::Pad<Pin>::pde),
           clear(detail::Pad<Pin>::pue),
-          write(detail::Pad<Pin>::slewfast, Register::value<OS == OutputSpeed::Low ? 0 : 1>()),
+          write(detail::Pad<Pin>::slewfast, Register::value<slewFastFromOutputSpeed(OS) ? 1 : 0>()),
           set(detail::Pad<Pin>::schmitt),
           write(detail::Ctrl<Pin>::IRQOVERValC::normal),
           write(detail::Ctrl<Pin>::INOVERValC::normal),
@@ -209,14 +247,14 @@ namespace Kvasir { namespace Io {
         static_assert(OT == Io::OutputType::PushPull, "only push pull supported");
     };
 
-    template<Io::OutputType    OT,
-             Io::OutputSpeed   OS,
+    template<DriveStrength     DS,
+             bool              SlewFast,
              Io::OutputInit    OI,
              PullConfiguration PC,
              int               Port,
              int               Pin,
              int               Function>
-    struct MakeAction<Action::PinFunction<Function, OT, OS, OI, PC>,
+    struct MakeAction<Action::PinFunctionDrive<Function, DS, SlewFast, PC, OI>,
                       Register::PinLocation<Port, Pin>>
       : decltype(MPL::list(
           set(detail::Pad<Pin>::ie),
@@ -224,11 +262,11 @@ namespace Kvasir { namespace Io {
           clear(detail::Pad<Pin>::iso),
 #endif
           clear(detail::Pad<Pin>::od),
-          write(detail::Pad<Pin>::DRIVEValC::_12ma),
+          get_drive_action<Pin, DS>(),
           write(detail::Pad<Pin>::pde,
                 Register::value<PC == PullConfiguration::PullDown ? 1 : 0>()),
           write(detail::Pad<Pin>::pue, Register::value<PC == PullConfiguration::PullUp ? 1 : 0>()),
-          write(detail::Pad<Pin>::slewfast, Register::value<OS == OutputSpeed::Low ? 0 : 1>()),
+          write(detail::Pad<Pin>::slewfast, Register::value<SlewFast ? 1 : 0>()),
           set(detail::Pad<Pin>::schmitt),
           write(detail::Ctrl<Pin>::IRQOVERValC::normal),
           write(detail::Ctrl<Pin>::INOVERValC::normal),
@@ -246,7 +284,25 @@ namespace Kvasir { namespace Io {
               }
           }())) {
         static_assert(isValidPinLocation<Port, Pin>(), "invalid PinLocation");
-        static_assert(OT == Io::OutputType::PushPull, "only push pull supported");
+    };
+
+    template<Io::OutputType    OT,
+             Io::OutputSpeed   OS,
+             Io::OutputInit    OI,
+             PullConfiguration PC,
+             int               Port,
+             int               Pin,
+             int               Function>
+    struct MakeAction<Action::PinFunction<Function, OT, OS, OI, PC>,
+                      Register::PinLocation<Port, Pin>>
+      : MakeAction<Action::PinFunctionDrive<Function,
+                                            driveFromOutputSpeed(OS),
+                                            slewFastFromOutputSpeed(OS),
+                                            PC,
+                                            OI>,
+                   Register::PinLocation<Port, Pin>> {
+        static_assert(OT == Io::OutputType::PushPull,
+                      "only push pull supported");
     };
 
 }}   // namespace Kvasir::Io
