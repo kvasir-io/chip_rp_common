@@ -3,6 +3,7 @@
 #include "descriptors.hpp"
 #include "endpointOps.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -32,10 +33,19 @@ private:
     using EP_OUT
       = EndpointOps<Derived, EndpointNumber, EndpointDirection::Out, EndpointTransferType::Bulk>;
 
+    static constexpr auto SendBufferSize = [] {
+        if constexpr(requires { Config::SendBufferSize; }) {
+            return Config::SendBufferSize;
+        } else {
+            return 4096;
+        }
+    }();
+
     // State
     static inline std::atomic<bool>                                sendRdy{false};
     static inline Kvasir::Atomic::Queue<std::byte, RecvBufferSize> recvBuffer{};
     static inline std::span<std::byte const>                       currentSendData{};
+    static inline std::array<std::byte, SendBufferSize>            sendBuffer{};
 
     // Callbacks (called by MixinBases)
     static bool EndpointHandlerCallback(std::size_t epNum,
@@ -144,6 +154,13 @@ public:
         currentSendData = data;
         sendRdy         = false;
         return sendNext();
+    }
+
+    static bool send(std::span<std::byte const> data) {
+        if(!sendRdy) { return false; }
+        if(data.size() > sendBuffer.size()) { return false; }
+        std::copy(data.begin(), data.end(), sendBuffer.begin());
+        return send_nocopy(std::span<std::byte const>{sendBuffer.data(), data.size()});
     }
 };
 }   // namespace Kvasir::USB::detail

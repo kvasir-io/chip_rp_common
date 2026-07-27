@@ -289,8 +289,11 @@ namespace Kvasir { namespace PWM {
         static constexpr auto getIsrSetEnable() {
             if constexpr(requires { set(R::IRQ0_INTE::ch0); }) {
                 return set(R::IRQ0_INTE::ch0);
-            } else {
+            } else if constexpr(requires { set(R::IRQ_INTE::ch0); }) {
                 return set(R::IRQ_INTE::ch0);
+            } else {
+                // RP2040: interrupt registers live at the peripheral level
+                return set(Kvasir::Peripheral::PWM::Registers<>::INTE::ch0);
             }
         }
 
@@ -298,8 +301,11 @@ namespace Kvasir { namespace PWM {
         static constexpr auto getIsrIsEnable() {
             if constexpr(requires { read(R::IRQ0_INTS::ch0); }) {
                 return read(R::IRQ0_INTS::ch0);
-            } else {
+            } else if constexpr(requires { read(R::IRQ_INTS::ch0); }) {
                 return read(R::IRQ_INTS::ch0);
+            } else {
+                // RP2040: interrupt registers live at the peripheral level
+                return read(Kvasir::Peripheral::PWM::Registers<>::INTS::ch0);
             }
         }
 

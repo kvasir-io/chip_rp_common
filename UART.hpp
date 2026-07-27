@@ -138,19 +138,28 @@ namespace Kvasir { namespace UART {
                                          PinConfig::UartPinType::Tx1);
             }
 
-            template<PinConfig::UartPinType ConfigType,
+            template<typename Map,
+                     PinConfig::UartPinType ConfigType,
                      int                    Pin>
-            static constexpr int getFunctionSel() {
-                using PinElement = std::remove_cv_t<std::remove_reference_t<
-                  decltype(PinConfig::UartPinMap<PinConfig::CurrentChip>::pins[0])>>;
+            static constexpr int getFunctionSelImpl() {
+                using PinElement
+                  = std::remove_cv_t<std::remove_reference_t<decltype(Map::pins[0])>>;
                 if constexpr(!std::is_same_v<PinElement, PinConfig::UartPinType>) {
                     // Pair-based map (RP2350A/B)
-                    constexpr auto entry = PinConfig::UartPinMap<PinConfig::CurrentChip>::pins[Pin];
+                    constexpr auto entry = Map::pins[Pin];
                     if constexpr(entry.first != entry.second && entry.first == ConfigType) {
                         return 11;   // secondary function lives at F11
                     }
                 }
                 return 2;   // primary function at F2
+            }
+
+            template<PinConfig::UartPinType ConfigType,
+                     int                    Pin>
+            static constexpr int getFunctionSel() {
+                return getFunctionSelImpl<PinConfig::UartPinMap<PinConfig::CurrentChip>,
+                                          ConfigType,
+                                          Pin>();
             }
 
             // TX/RTS are push-pull outputs: 4 mA with slow slew (the pad default) is
