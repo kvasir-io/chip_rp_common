@@ -178,21 +178,34 @@ namespace Kvasir { namespace SPI {
             calcBaudRegs(std::uint32_t f_clockSpeed,
                          std::uint32_t f_baud) {
                 std::pair<std::uint8_t, std::uint8_t> ret{};
-                double                                best = std::numeric_limits<double>::max();
+                std::pair<std::uint8_t, std::uint8_t> retClosest{};
+                double bestUnder = std::numeric_limits<double>::max();
+                double bestAbs   = std::numeric_limits<double>::max();
+                bool   haveUnder = false;
 
                 for(std::uint32_t cpsdvsr = 2; cpsdvsr < 255; cpsdvsr += 2) {
                     for(std::uint32_t scr = 0; scr < 256; ++scr) {
                         double f_div     = f_baud - calcf_Baud(f_clockSpeed, scr, cpsdvsr);
                         double abs_f_div = f_div > 0.0 ? f_div : -f_div;
-                        if(best > abs_f_div) {
-                            best       = abs_f_div;
+
+                        if(bestAbs > abs_f_div) {
+                            bestAbs           = abs_f_div;
+                            retClosest.first  = static_cast<std::uint8_t>(scr);
+                            retClosest.second = static_cast<std::uint8_t>(cpsdvsr);
+                        }
+
+                        // Prefer configurations whose rate does not exceed the requested baud,
+                        // so the configured clock never overshoots a peripheral's maximum.
+                        if(f_div >= 0.0 && bestUnder > f_div) {
+                            haveUnder  = true;
+                            bestUnder  = f_div;
                             ret.first  = static_cast<std::uint8_t>(scr);
                             ret.second = static_cast<std::uint8_t>(cpsdvsr);
-                            if(abs_f_div == 0.0) { return ret; }
+                            if(f_div == 0.0) { return ret; }
                         }
                     }
                 }
-                return ret;
+                return haveUnder ? ret : retClosest;
             }
 
             template<std::uint32_t f_clockSpeed,
@@ -225,39 +238,40 @@ namespace Kvasir { namespace SPI {
     namespace Traits { namespace SPI {
         template<unsigned Instance>
         static constexpr auto getIsrIndexs() {
+            static_assert(Instance < 2, "invalid SPI instance");
             if constexpr(Instance == 0) {
                 return brigand::list<decltype(Kvasir::Interrupt::spi0)>{};
-
-            } else if(Instance == 1) {
+            } else if constexpr(Instance == 1) {
                 return brigand::list<decltype(Kvasir::Interrupt::spi1)>{};
             }
         }
 
         template<unsigned Instance>
         static constexpr auto getEnable() {
+            static_assert(Instance < 2, "invalid SPI instance");
             if constexpr(Instance == 0) {
                 return clear(Peripheral::RESETS::Registers<>::RESET::spi0);
-            } else if(Instance == 1) {
+            } else if constexpr(Instance == 1) {
                 return clear(Peripheral::RESETS::Registers<>::RESET::spi1);
             }
         }
 
         template<unsigned Instance>
         static constexpr auto DmaRX_Trigger() {
+            static_assert(Instance < 2, "invalid SPI instance");
             if constexpr(Instance == 0) {
                 return DMA::TriggerSource::spi0_rx;
-
-            } else if(Instance == 1) {
+            } else if constexpr(Instance == 1) {
                 return DMA::TriggerSource::spi1_rx;
             }
         }
 
         template<unsigned Instance>
         static constexpr auto DmaTX_Trigger() {
+            static_assert(Instance < 2, "invalid SPI instance");
             if constexpr(Instance == 0) {
                 return DMA::TriggerSource::spi0_tx;
-
-            } else if(Instance == 1) {
+            } else if constexpr(Instance == 1) {
                 return DMA::TriggerSource::spi1_tx;
             }
         }
@@ -316,7 +330,9 @@ namespace Kvasir { namespace SPI {
         // csPinLocation
         // userConfigOverride
         static constexpr auto Instance = SPIConfig::instance;
-        using Regs                     = Kvasir::Peripheral::SPI::Registers<Instance>;
+        static_assert(Instance < 2,
+                      "invalid SPI instance");
+        using Regs = Kvasir::Peripheral::SPI::Registers<Instance>;
 
         using InterruptIndexs = decltype(Traits::SPI::getIsrIndexs<Instance>());
 
@@ -415,19 +431,19 @@ namespace Kvasir { namespace SPI {
     private:
         inline static std::atomic<bool> busy{false};
         inline static std::atomic<bool> booked{false};
+        inline static std::atomic<bool> error{false};
 
     public:
-        static bool acquire() {
-            if(booked.load(std::memory_order_relaxed)) { return false; }
-            booked.store(true, std::memory_order_relaxed);
-            return true;
-        }
+        static bool acquire() { return !booked.exchange(true, std::memory_order_acquire); }
 
-        static void release() { booked.store(false, std::memory_order_relaxed); }
+        static void release() { booked.store(false, std::memory_order_release); }
 
         static OperationState operationState() {
             auto const bsy = get<0>(apply(read(Regs::SSPSR::bsy)));
-            if(!busy && !bsy) { return OperationState::succeeded; }
+            if(!busy && !bsy) {
+                return error.load(std::memory_order_relaxed) ? OperationState::failed
+                                                             : OperationState::succeeded;
+            }
             return OperationState::ongoing;
         }
 
@@ -501,6 +517,15 @@ namespace Kvasir { namespace SPI {
         static void send_nocopy_impl(std::byte const* first,
                                      std::size_t      size,
                                      F                f) {
+            assert(!busy);
+
+            // Drain any stale data left in the RX FIFO. The RX FIFO keeps filling during a
+            // transmit-only transfer (rxdmae is enabled but no RX channel is armed), so clearing
+            // it here keeps a later send_receive from reading garbage.
+            while(apply(read(Regs::SSPSR::rne))) { apply(read(Regs::SSPDR::data)); }
+
+            error.store(false, std::memory_order_relaxed);
+
             busy = true;
 
             std::atomic_signal_fence(std::memory_order_release);
@@ -529,21 +554,19 @@ namespace Kvasir { namespace SPI {
                                              std::byte*       firstOut,
                                              std::size_t      size,
                                              F                f) {
+            assert(!busy);
+
             while(apply(read(Regs::SSPSR::rne))) { apply(read(Regs::SSPDR::data)); }
+
+            error.store(false, std::memory_order_relaxed);
+            apply(set(Regs::SSPICR::roric));   // clear any stale receive-overrun flag
 
             busy = true;
 
             std::atomic_signal_fence(std::memory_order_release);
 
-            Dma::template start<DmaChannelA,
-                                DmaPriority,
-                                base::TxDmaTrigger,
-                                Dma::TransferSize::_8,
-                                false,
-                                increment>(Regs::SSPDR::Addr::value,
-                                           reinterpret_cast<std::uint32_t>(first),
-                                           size);
-
+            // Arm the RX channel (B) before the TX channel (A) so the receiver is ready before
+            // the SSP starts clocking out data and filling the RX FIFO.
             Dma::template start<DmaChannelB,
                                 DmaPriority,
                                 base::RxDmaTrigger,
@@ -553,6 +576,10 @@ namespace Kvasir { namespace SPI {
                                        Regs::SSPDR::Addr::value,
                                        size,
                                        [f]() {
+                                           if(get<0>(apply(read(Regs::SSPRIS::rorris)))) {
+                                               error.store(true, std::memory_order_relaxed);
+                                               apply(set(Regs::SSPICR::roric));
+                                           }
                                            busy = false;
 
                                            if constexpr(!std::is_same_v<F, std::nullopt_t>) {
@@ -561,6 +588,15 @@ namespace Kvasir { namespace SPI {
                                                (void)f;
                                            }
                                        });
+
+            Dma::template start<DmaChannelA,
+                                DmaPriority,
+                                base::TxDmaTrigger,
+                                Dma::TransferSize::_8,
+                                false,
+                                increment>(Regs::SSPDR::Addr::value,
+                                           reinterpret_cast<std::uint32_t>(first),
+                                           size);
         }
 
         /*        static void onIsr() {
