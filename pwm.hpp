@@ -151,6 +151,36 @@ namespace Kvasir { namespace PWM {
                 return write(Regs::CSR::b_inv, Kvasir::Register::value<Invert>());
             }
         }
+
+        template<typename Reg,
+                 std::size_t Ch>
+        constexpr auto getChField() {
+            if constexpr(Ch == 0) {
+                return Reg::ch0;
+            } else if constexpr(Ch == 1) {
+                return Reg::ch1;
+            } else if constexpr(Ch == 2) {
+                return Reg::ch2;
+            } else if constexpr(Ch == 3) {
+                return Reg::ch3;
+            } else if constexpr(Ch == 4) {
+                return Reg::ch4;
+            } else if constexpr(Ch == 5) {
+                return Reg::ch5;
+            } else if constexpr(Ch == 6) {
+                return Reg::ch6;
+            } else if constexpr(Ch == 7) {
+                return Reg::ch7;
+            } else if constexpr(Ch == 8) {
+                return Reg::ch8;
+            } else if constexpr(Ch == 9) {
+                return Reg::ch9;
+            } else if constexpr(Ch == 10) {
+                return Reg::ch10;
+            } else if constexpr(Ch == 11) {
+                return Reg::ch11;
+            }
+        }
     }   // namespace detail
 
     template<typename Pin, typename Config_>
@@ -285,28 +315,38 @@ namespace Kvasir { namespace PWM {
 
         using InterruptIndexs = decltype(PinConfig::PwmTraits<PinConfig::CurrentChip>::Interrupts);
 
-        template<typename R>
+        template<typename R = Regs>
         static constexpr auto getIsrSetEnable() {
-            if constexpr(requires { set(R::IRQ0_INTE::ch0); }) {
-                return set(R::IRQ0_INTE::ch0);
-            } else if constexpr(requires { set(R::IRQ_INTE::ch0); }) {
-                return set(R::IRQ_INTE::ch0);
+#if __has_include("chip/rp2040.hpp")
+            using InteReg = Kvasir::Peripheral::PWM::Registers<>::INTE;
+            return set(detail::getChField<InteReg, Channel>());
+#else
+            if constexpr(requires { typename R::IRQ0_INTE; }) {
+                return set(detail::getChField<typename R::IRQ0_INTE, Channel>());
+            } else if constexpr(requires { typename R::IRQ_INTE; }) {
+                return set(detail::getChField<typename R::IRQ_INTE, Channel>());
             } else {
-                // RP2040: interrupt registers live at the peripheral level
-                return set(Kvasir::Peripheral::PWM::Registers<>::INTE::ch0);
+                using PwmRegs = Kvasir::Peripheral::PWM::Registers<>;
+                return set(detail::getChField<typename PwmRegs::IRQ0_INTE, Channel>());
             }
+#endif
         }
 
-        template<typename R>
+        template<typename R = Regs>
         static constexpr auto getIsrIsEnable() {
-            if constexpr(requires { read(R::IRQ0_INTS::ch0); }) {
-                return read(R::IRQ0_INTS::ch0);
-            } else if constexpr(requires { read(R::IRQ_INTS::ch0); }) {
-                return read(R::IRQ_INTS::ch0);
+#if __has_include("chip/rp2040.hpp")
+            using IntsReg = Kvasir::Peripheral::PWM::Registers<>::INTS;
+            return read(detail::getChField<IntsReg, Channel>());
+#else
+            if constexpr(requires { typename R::IRQ0_INTS; }) {
+                return read(detail::getChField<typename R::IRQ0_INTS, Channel>());
+            } else if constexpr(requires { typename R::IRQ_INTS; }) {
+                return read(detail::getChField<typename R::IRQ_INTS, Channel>());
             } else {
-                // RP2040: interrupt registers live at the peripheral level
-                return read(Kvasir::Peripheral::PWM::Registers<>::INTS::ch0);
+                using PwmRegs = Kvasir::Peripheral::PWM::Registers<>;
+                return read(detail::getChField<typename PwmRegs::IRQ0_INTS, Channel>());
             }
+#endif
         }
 
         static constexpr std::uint16_t MinTop = 1;
@@ -368,14 +408,8 @@ namespace Kvasir { namespace PWM {
         static void onIsr() {
             auto state = apply(getIsrIsEnable<Regs>());
             if(state) { Callback{}(); }
-            apply(set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch0),
-                  set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch1),
-                  set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch2),
-                  set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch3),
-                  set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch4),
-                  set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch5),
-                  set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch6),
-                  set(Kvasir::Peripheral::PWM::Registers<>::INTR::ch7));
+            using IntrReg = Kvasir::Peripheral::PWM::Registers<>::INTR;
+            apply(set(detail::getChField<IntrReg, Channel>()));
         }
 
         template<typename... Ts>
