@@ -10,6 +10,10 @@
     #include "peripherals/XIP_CTRL.hpp"
 #endif
 
+#if __has_include("peripherals/POWMAN.hpp")
+    #include "peripherals/POWMAN.hpp"
+#endif
+
 #include <cmath>
 #include <cstdint>
 
@@ -125,6 +129,41 @@ namespace Kvasir { namespace DefaultClockSettings {
         }
     }   // namespace detail
 
+    // Core voltage for the requested clock. Reset value is 1.10 V, the
+    // datasheet setting for 150 MHz; above that the regulator must be raised
+    // before the PLL switch. 1.15 V covers up to ~266 MHz - extend the range
+    // only together with hardware validation.
+    //
+    // POWMAN writes are ignored unless bits 31:16 carry the 0x5AFE password,
+    // hence the full-register write instead of a field write.
+    template<auto ClockSpeed>
+    void vregInit() {
+#if __has_include("peripherals/POWMAN.hpp")
+        if constexpr(ClockSpeed > 150'000'000) {
+            static_assert(ClockSpeed <= 266'000'000,
+                          "no validated core voltage for this clock - extend "
+                          "vregInit together with hardware validation");
+            using VREG = Kvasir::Peripheral::POWMAN::Registers<>::VREG;
+            using Kvasir::Register::value;
+            constexpr std::uint32_t passwd    = 0x5AFEU << 16;
+            constexpr std::uint32_t vsel_1v15 = 0b01100;
+            // The regulator ignores writes while an update is in flight; the
+            // update takes microseconds, so the polls are bounded.
+            for(int i = 0; i < 100000; ++i) {
+                if(!apply(read(VREG::update_in_progress))) { break; }
+            }
+            apply(write(VREG::FULLREGISTER, value<std::uint32_t, passwd | (vsel_1v15 << 4)>()));
+            for(int i = 0; i < 100000; ++i) {
+                if(!apply(read(VREG::update_in_progress))) { break; }
+            }
+        }
+#else
+        static_assert(ClockSpeed <= 150'000'000,
+                      "no POWMAN register description - cannot raise the core "
+                      "voltage this clock needs");
+#endif
+    }
+
     // Flash configuration function for W25Q32RV optimal settings
     template<auto ClockSpeed>
     void flashInit() {
@@ -132,7 +171,11 @@ namespace Kvasir { namespace DefaultClockSettings {
         using namespace Kvasir::Peripheral::QMI;
         using QMI = Registers<0>;
 
-        constexpr std::uint32_t max_flash_freq = 104'000'000;
+        // Kept below the flash's 104 MHz datasheet ceiling: XIP near that limit
+        // has too little margin to boot reliably. 84 MHz leaves the common
+        // clocks unchanged (150 -> 75, 250 -> 83.3) and pushes the rest to the
+        // next divider rather than onto the margin.
+        constexpr std::uint32_t max_flash_freq = 84'000'000;
         constexpr std::uint32_t min_clkdiv     = 2;
         constexpr std::uint32_t max_clkdiv     = 255;
 
@@ -146,13 +189,17 @@ namespace Kvasir { namespace DefaultClockSettings {
         }();
 
         constexpr std::uint32_t flash_freq = ClockSpeed / clkdiv;
-        static_assert(flash_freq <= max_flash_freq,
-                      "Flash frequency exceeds W25Q32RV maximum of 104 MHz");
+        static_assert(flash_freq <= max_flash_freq, "Flash frequency exceeds the 84 MHz ceiling");
+
+        // rxdelay compensates the flash's clock-to-output plus the pad round
+        // trip, in flash-clock cycles. 2 is enough up to ~80 MHz; above that
+        // the cycle is short enough to need the extra one.
+        constexpr std::uint32_t rxdelay = flash_freq > 80'000'000 ? 3 : 2;
 
         apply(QMI::M0_TIMING::overrideDefaults(
           write(QMI::M0_TIMING::clkdiv, value<std::uint32_t, clkdiv>()),
           write(QMI::M0_TIMING::cooldown, value<std::uint32_t, 1>()),
-          write(QMI::M0_TIMING::rxdelay, value<std::uint32_t, 2>()),
+          write(QMI::M0_TIMING::rxdelay, value<std::uint32_t, rxdelay>()),
           write(QMI::M0_TIMING::PAGEBREAKValC::none),
           write(QMI::M0_TIMING::select_setup, value<std::uint32_t, 0>()),
           write(QMI::M0_TIMING::select_hold, value<std::uint32_t, 0>()),
@@ -197,6 +244,10 @@ namespace Kvasir { namespace DefaultClockSettings {
         using PLL        = Kvasir::Peripheral::PLL::Registers<0>;
         using USBPLL     = Kvasir::Peripheral::PLL::Registers<1>;
 
+        // Voltage first, then flash timing, then the PLL switch - all three
+        // still running from ROSC, so the core never executes a cycle at the
+        // new frequency on the old voltage.
+        vregInit<ClockSpeed>();
         flashInit<ClockSpeed>();
 
         // disable periphery clocks

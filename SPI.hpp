@@ -83,7 +83,10 @@ namespace Kvasir { namespace SPI {
             }
 
             // MOSI/SCLK/CS are push-pull outputs: 4 mA with slow slew (the pad
-            // default) is plenty up to ~8 MHz; faster clocks get 8 mA with fast slew.
+            // default) is plenty up to ~8 MHz; faster clocks get 8 mA with fast
+            // slew. Only the default - an SPIConfig may override both, since on
+            // fast buses a stronger drive trades timing margin against ringing
+            // depending on the wiring.
             static constexpr Io::DriveStrength spiDrive(std::uint32_t f_baud) {
                 return f_baud <= 8'000'000 ? Io::DriveStrength::mA_4 : Io::DriveStrength::mA_8;
             }
@@ -103,44 +106,44 @@ namespace Kvasir { namespace SPI {
                 using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<1>{},
                                                   Register::PinLocation<Port, Pin>{}));
             };
-            template<typename CSPIN, std::uint32_t f_baud>
+            template<typename CSPIN, Io::DriveStrength Drive, bool SlewFast>
             struct GetCSPinConfig;
 
-            template<typename dummy, std::uint32_t f_baud>
-            struct GetCSPinConfig<Io::NotUsed<dummy>, f_baud> {
+            template<typename dummy, Io::DriveStrength Drive, bool SlewFast>
+            struct GetCSPinConfig<Io::NotUsed<dummy>, Drive, SlewFast> {
                 using pinConfig = brigand::list<>;
             };
 
-            template<int Port, int Pin, std::uint32_t f_baud>
-            struct GetCSPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
-                using pinConfig = decltype(action(
-                  Kvasir::Io::Action::PinFunctionDrive<1, spiDrive(f_baud), spiSlewFast(f_baud)>{},
-                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, Io::DriveStrength Drive, bool SlewFast>
+            struct GetCSPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Drive, SlewFast> {
+                using pinConfig
+                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<1, Drive, SlewFast>{},
+                                    Register::PinLocation<Port, Pin>{}));
             };
 
-            template<typename MOSIPIN, std::uint32_t f_baud>
+            template<typename MOSIPIN, Io::DriveStrength Drive, bool SlewFast>
             struct GetMOSIPinConfig;
 
-            template<typename dummy, std::uint32_t f_baud>
-            struct GetMOSIPinConfig<Io::NotUsed<dummy>, f_baud> {
+            template<typename dummy, Io::DriveStrength Drive, bool SlewFast>
+            struct GetMOSIPinConfig<Io::NotUsed<dummy>, Drive, SlewFast> {
                 using pinConfig = brigand::list<>;
             };
 
-            template<int Port, int Pin, std::uint32_t f_baud>
-            struct GetMOSIPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
-                using pinConfig = decltype(action(
-                  Kvasir::Io::Action::PinFunctionDrive<1, spiDrive(f_baud), spiSlewFast(f_baud)>{},
-                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, Io::DriveStrength Drive, bool SlewFast>
+            struct GetMOSIPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Drive, SlewFast> {
+                using pinConfig
+                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<1, Drive, SlewFast>{},
+                                    Register::PinLocation<Port, Pin>{}));
             };
 
-            template<typename SCLKPIN, std::uint32_t f_baud>
+            template<typename SCLKPIN, Io::DriveStrength Drive, bool SlewFast>
             struct GetSCLKPinConfig;
 
-            template<int Port, int Pin, std::uint32_t f_baud>
-            struct GetSCLKPinConfig<Kvasir::Register::PinLocation<Port, Pin>, f_baud> {
-                using pinConfig = decltype(action(
-                  Kvasir::Io::Action::PinFunctionDrive<1, spiDrive(f_baud), spiSlewFast(f_baud)>{},
-                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, Io::DriveStrength Drive, bool SlewFast>
+            struct GetSCLKPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Drive, SlewFast> {
+                using pinConfig
+                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<1, Drive, SlewFast>{},
+                                    Register::PinLocation<Port, Pin>{}));
             };
 
             template<Mode mode>
@@ -375,17 +378,38 @@ namespace Kvasir { namespace SPI {
 
         static constexpr auto powerClockEnable = list(Traits::SPI::getEnable<Instance>());
 
+        // Pad drive/slew for the output pins: optional `driveStrength` /
+        // `slewFast` members override the rate-tiered default from
+        // Detail::Config::spiDrive.
+        static constexpr Io::DriveStrength pinDrive = [] {
+            if constexpr(requires { SPIConfig::driveStrength; }) {
+                return SPIConfig::driveStrength;
+            } else {
+                return Config::spiDrive(SPIConfig::baudRate);
+            }
+        }();
+        static constexpr bool pinSlewFast = [] {
+            if constexpr(requires { SPIConfig::slewFast; }) {
+                return SPIConfig::slewFast;
+            } else {
+                return Config::spiSlewFast(SPIConfig::baudRate);
+            }
+        }();
+
         static constexpr auto initStepPinConfig = list(
           typename Config::template GetMISOPinConfig<
             std::decay_t<decltype(SPIConfig::misoPinLocation)>>::pinConfig{},
           typename Config::template GetMOSIPinConfig<
             std::decay_t<decltype(SPIConfig::mosiPinLocation)>,
-            SPIConfig::baudRate>::pinConfig{},
+            pinDrive,
+            pinSlewFast>::pinConfig{},
           typename Config::template GetSCLKPinConfig<
             std::decay_t<decltype(SPIConfig::sclkPinLocation)>,
-            SPIConfig::baudRate>::pinConfig{},
+            pinDrive,
+            pinSlewFast>::pinConfig{},
           typename Config::template GetCSPinConfig<std::decay_t<decltype(SPIConfig::csPinLocation)>,
-                                                   SPIConfig::baudRate>::pinConfig{});
+                                                   pinDrive,
+                                                   pinSlewFast>::pinConfig{});
 
         static constexpr auto initStepPeripheryConfig
           = list(Config::template getBaudConfig<SPIConfig::clockSpeed, SPIConfig::baudRate>(),
@@ -445,6 +469,66 @@ namespace Kvasir { namespace SPI {
                                                              : OperationState::succeeded;
             }
             return OperationState::ongoing;
+        }
+
+        // Is a transfer in flight? Use this to decide whether the next one may
+        // start, not operationState(): that reports the outcome of the last
+        // transfer, and `error` (set by an RX FIFO overrun) latches until the
+        // next transfer starts - so gating on `succeeded` waits for something
+        // only the caller can cause, with no timeout and no way out from the
+        // far end of the bus. Ask operationState() only whether the data that
+        // arrived can be trusted.
+        [[nodiscard]] static bool transferInProgress() {
+            return busy.load(std::memory_order_relaxed) || get<0>(apply(read(Regs::SSPSR::bsy)));
+        }
+
+        // Acknowledge a failed transfer. Not needed for sequencing - the next
+        // transfer clears the flag anyway - but lets a caller treat
+        // operationState() as reporting only what happened since it last looked.
+        static void clearError() { error.store(false, std::memory_order_relaxed); }
+
+        // One consistent snapshot of what decides whether the bus is stuck, to
+        // be logged before aborting. A stall has several causes - RX DMA
+        // starved short of its count, TX DMA never draining, a lost completion
+        // callback - that are only distinguishable while it is still stuck.
+        struct BusDebug {
+            bool          busyFlag;
+            bool          sspBusy;
+            bool          rxFifoNotEmpty;
+            bool          rxOverrun;
+            std::uint32_t txDmaRemaining;
+            std::uint32_t rxDmaRemaining;
+            bool          txDmaBusy;
+            bool          rxDmaBusy;
+        };
+
+        [[nodiscard]] static BusDebug busDebug() {
+            return {.busyFlag       = busy.load(std::memory_order_relaxed),
+                    .sspBusy        = static_cast<bool>(get<0>(apply(read(Regs::SSPSR::bsy)))),
+                    .rxFifoNotEmpty = static_cast<bool>(get<0>(apply(read(Regs::SSPSR::rne)))),
+                    .rxOverrun      = static_cast<bool>(get<0>(apply(read(Regs::SSPRIS::rorris)))),
+                    .txDmaRemaining = Dma::template remaining<DmaChannelA>(),
+                    .rxDmaRemaining = Dma::template remaining<DmaChannelB>(),
+                    .txDmaBusy      = !Dma::template ready<DmaChannelA>(),
+                    .rxDmaBusy      = !Dma::template ready<DmaChannelB>()};
+        }
+
+        // Abandon an in-flight transfer and leave the bus usable. Without it a
+        // caller that gives up cannot stop the DMA: the channel keeps running,
+        // `busy` is never cleared by a completion nobody is listening for, and
+        // every later transfer inherits a channel that is still live.
+        static void abortTransfer() {
+            Dma::template abort<DmaChannelA>();
+            Dma::template abort<DmaChannelB>();
+            busy.store(false, std::memory_order_relaxed);
+            error.store(false, std::memory_order_relaxed);
+            // Leftovers in the RX FIFO would be read as the first bytes of the
+            // next transfer. Bounded: the FIFO is 8 deep and with both channels
+            // aborted the master stops clocking once the TX FIFO drains.
+            for(int i = 0; i < 64; ++i) {
+                if(!apply(read(Regs::SSPSR::rne))) { break; }
+                apply(read(Regs::SSPDR::data));
+            }
         }
 
         static void send_nocopy(std::span<std::byte const> inData) {

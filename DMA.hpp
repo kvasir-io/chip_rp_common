@@ -176,6 +176,51 @@ namespace Kvasir { namespace DMA {
             return !apply(read(CHRegs::CTRL_TRIG::busy));
         }
 
+        // Transfers this channel still has to do. Diagnostic: busy with a
+        // nonzero count means the channel is starved, which no other register
+        // shows.
+        template<DMAChannel Channel>
+        static std::uint32_t remaining() {
+            using CHRegs = Regs::CH<static_cast<int>(Channel)>;
+            return get<0>(apply(read(CHRegs::TRANS_COUNT::trans_count)));
+        }
+
+        // The FIFOs drain in a few cycles; hitting this bound means the channel
+        // is wedged beyond what an abort can fix.
+        static constexpr int AbortPollLimit = 10000;
+
+        // Terminate the transfer sequence in progress on `Channel` and leave it
+        // safe to restart. Needed by any error, timeout or reset path: dropping
+        // a transfer does not stop the hardware, so without this the sequence
+        // runs on and the next start() re-arms a live channel.
+        //
+        // Per datasheet the abort bit must be polled until it reads back zero -
+        // until then transfers are still draining through the FIFOs and
+        // restarting the channel is unsafe. Returns false if that never
+        // happened, i.e. restarting the channel is still not safe.
+        template<DMAChannel Channel>
+        static bool abort() {
+            constexpr std::uint32_t bit = 1u << static_cast<int>(Channel);
+            using CHRegs                = Regs::CH<static_cast<int>(Channel)>;
+
+            apply(clear(CHRegs::CTRL_TRIG::en));   // pause the channel first
+            apply(write(Regs::CHAN_ABORT::chan_abort, bit));
+            bool drained = false;
+            for(int i = 0; i < AbortPollLimit; ++i) {
+                if((get<0>(apply(read(Regs::CHAN_ABORT::chan_abort))) & bit) == 0) {
+                    drained = true;
+                    break;
+                }
+            }
+            // Drop a completion that raced the abort: left pending it would
+            // fire into the callback the next start() installs.
+            apply(write(Regs::INTR::intr, bit));
+            if constexpr(DMAConfig::callbackFunctionSize > 0) {
+                callbackFunctions[static_cast<std::size_t>(Channel)].reset();
+            }
+            return drained;
+        }
+
         static void onIsr() {
             auto const channels = get<0>(apply(read(Regs::INTS0::ints0)));
             apply(write(Regs::INTS0::ints0, channels));

@@ -419,7 +419,12 @@ namespace Kvasir { namespace I2C {
             auto op = operationState_.load(std::memory_order_relaxed);
             if(op == OperationState::ongoing) {
                 if(currentTime > timeoutTime) {
-                    apply(base::abort);
+                    // softAbortRequest, not abort: the ABORT bit only issues a
+                    // STOP while ENABLE stays 1. base::abort clears ENABLE too
+                    // and is for the post-TX_ABRT case, where the NAK already
+                    // released the bus; on timeout the bus is mid-transaction
+                    // and needs the STOP.
+                    apply(base::softAbortRequest);
                     UC_LOG_W("timeout");
                     buffer_.clear();
                     operationState_.store(OperationState::failed, std::memory_order_relaxed);
@@ -428,6 +433,27 @@ namespace Kvasir { namespace I2C {
                 }
             }
             return op;
+        }
+
+        // Is the bus busy? Use this to sequence transfers, not
+        // operationState(), which answers whether the last one succeeded and
+        // latches `failed` until the next send/receive or reset() - gating on
+        // `succeeded` therefore waits for something only the caller can cause.
+        [[nodiscard]] static bool transferInProgress() {
+            return state_.load(std::memory_order_relaxed) != State::idle
+                || operationState_.load(std::memory_order_relaxed) == OperationState::ongoing;
+        }
+
+        // Acknowledge a failure so operationState() reports again from here on.
+        // Also releases the blocked state a timeout leaves behind, which would
+        // otherwise make acquire() fail for ever.
+        static void clearError() {
+            auto expected = OperationState::failed;
+            operationState_.compare_exchange_strong(expected,
+                                                    OperationState::succeeded,
+                                                    std::memory_order_relaxed);
+            auto blocked = State::blocked;
+            state_.compare_exchange_strong(blocked, State::idle, std::memory_order_relaxed);
         }
 
         static bool acquire() {

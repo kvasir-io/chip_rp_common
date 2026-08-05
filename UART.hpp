@@ -7,6 +7,7 @@
 #include "kvasir/Io/Types.hpp"
 
 #include <array>
+#include <atomic>
 #include <cassert>
 
 namespace Kvasir { namespace UART {
@@ -472,21 +473,41 @@ namespace Kvasir { namespace UART {
 
         enum class OperationState { succeeded, failed, ongoing };
 
-        inline static bool busy = false;
+        // Atomic because the DMA completion callback runs in interrupt context
+        // and every reader is in thread context.
+        inline static std::atomic<bool> busy{false};
 
         static OperationState operationState() {
-            if(!busy) { return OperationState::succeeded; }
-            // TODO timeout
-            return OperationState::ongoing;
+            return busy.load(std::memory_order_relaxed) ? OperationState::ongoing
+                                                        : OperationState::succeeded;
+        }
+
+        // Is the transmitter free? Use this to sequence transfers: `busy` is
+        // cleared only by the DMA completion callback, so a lost completion -
+        // a channel aborted elsewhere, a callback slot taken over by another
+        // user of the same channel - would otherwise latch operationState() at
+        // `ongoing` with no way out.
+        [[nodiscard]] static bool transferInProgress() {
+            return busy.load(std::memory_order_relaxed)
+                || static_cast<bool>(get<0>(apply(read(Regs::UARTFR::busy))));
+        }
+
+        // Abandon an in-flight transmit and leave the peripheral usable.
+        // Without it a caller that gives up cannot reclaim the channel: the
+        // sequence runs on and the next start() races a transfer that never
+        // stopped. See DMA::abort.
+        static void abortTransfer() {
+            Dma::template abort<DmaChannel>();
+            busy.store(false, std::memory_order_relaxed);
         }
 
         static void send_nocopy(std::span<std::byte const> span) {
-            assert(!busy);
-            busy = true;
+            // Never re-arm a live channel.
+            if(transferInProgress()) { abortTransfer(); }
+            busy.store(true, std::memory_order_relaxed);
 
             std::atomic_signal_fence(std::memory_order_release);
 
-            // TODO timeout
             Dma::template start<DmaChannel,
                                 DmaPriority,
                                 base::TxDmaTrigger,
@@ -495,7 +516,7 @@ namespace Kvasir { namespace UART {
                                 true>(Regs::UARTDR::Addr::value,
                                       reinterpret_cast<std::uint32_t>(span.data()),
                                       span.size(),
-                                      []() { busy = false; });
+                                      []() { busy.store(false, std::memory_order_relaxed); });
         }
     };
 

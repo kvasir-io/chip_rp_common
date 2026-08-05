@@ -298,14 +298,25 @@ namespace Kvasir { namespace ADC {
           = list(Nvic::makeSetPriority<ADCConfig::isrPriority>(InterruptIndexs{}),
                  Nvic::makeClearPending(InterruptIndexs{}));
 
+        // Bounds for the hardware-flag waits below. A conversion takes ~2 us and
+        // the FIFO is 4 deep, so hitting either limit means the ADC is disabled
+        // or wedged - give up rather than hang the caller.
+        static constexpr int ReadyPollLimit = 100000;
+        static constexpr int FifoDrainLimit = 64;
+
         static void drainFifo() {
-            while(!get<0>(apply(read(Regs::FCS::empty)))) { apply(read(Regs::FIFO::val)); }
+            for(int i = 0; i < FifoDrainLimit; ++i) {
+                if(get<0>(apply(read(Regs::FCS::empty)))) { break; }
+                apply(read(Regs::FIFO::val));
+            }
         }
 
         static std::uint16_t readOnce(std::uint8_t channel) {
             apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(channel)));
             apply(set(Regs::CS::start_once));
-            while(!get<0>(apply(read(Regs::CS::ready)))) {}
+            for(int i = 0; i < ReadyPollLimit; ++i) {
+                if(get<0>(apply(read(Regs::CS::ready)))) { break; }
+            }
             return static_cast<std::uint16_t>(get<0>(apply(read(Regs::RESULT::result))));
         }
     };
@@ -368,8 +379,14 @@ namespace Kvasir { namespace ADC {
 
         static void stop() {
             running_.store(false, std::memory_order_relaxed);
+            // Stop the DMA before the ADC: clearing running_ alone leaves the
+            // channel armed for the rest of its transfers, so the next start()
+            // would re-arm a live channel. See DMA::abort.
+            Dma::template abort<DmaChannel>();
             apply(clear(Regs::CS::start_many));
-            while(!get<0>(apply(read(Regs::CS::ready)))) {}
+            for(int i = 0; i < base::ReadyPollLimit; ++i) {   // bounded, see drainFifo
+                if(get<0>(apply(read(Regs::CS::ready)))) { break; }
+            }
 
             apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<0u>()),
                                               write(Regs::FCS::dreq_en, Register::value<1u>())));
@@ -436,7 +453,9 @@ namespace Kvasir { namespace ADC {
 
         static void stop() {
             apply(clear(Regs::CS::start_many));
-            while(!get<0>(apply(read(Regs::CS::ready)))) {}
+            for(int i = 0; i < base::ReadyPollLimit; ++i) {   // bounded: see drainFifo
+                if(get<0>(apply(read(Regs::CS::ready)))) { break; }
+            }
 
             apply(clear(Regs::INTE::fifo));
 
@@ -447,7 +466,29 @@ namespace Kvasir { namespace ADC {
         }
 
         static void onIsr() {
-            while(!get<0>(apply(read(Regs::FCS::empty)))) {
+            // On overrun the round-robin advanced past samples that were never
+            // stored, so channelIndex_ no longer matches the FIFO contents and
+            // every later sample would be attributed to the wrong channel. The
+            // offset is unknowable, so realign the way start() does: halt,
+            // discard the FIFO, reset AINSEL to the first channel, restart.
+            // Checked before the drain so misattributed samples are dropped.
+            if(get<0>(apply(read(Regs::FCS::over)))) {
+                apply(clear(Regs::CS::start_many));
+                for(int i = 0; i < base::ReadyPollLimit; ++i) {   // bounded, see drainFifo
+                    if(get<0>(apply(read(Regs::CS::ready)))) { break; }
+                }
+                base::drainFifo();
+                // Write-1-to-clear, safe here because the conversion is halted.
+                apply(set(Regs::FCS::over));
+                apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(base::firstChannel_)));
+                channelIndex_ = 0;
+                apply(set(Regs::CS::start_many));
+                return;
+            }
+            // Bounded: in ISR context with the ADC free-running, an unbounded
+            // drain can be refilled as fast as it is emptied.
+            for(int i = 0; i < base::FifoDrainLimit; ++i) {
+                if(get<0>(apply(read(Regs::FCS::empty)))) { break; }
                 auto val = static_cast<std::uint16_t>(get<0>(apply(read(Regs::FIFO::val))));
                 auto ch  = base::channelTable_.channels[channelIndex_];
                 if constexpr(base::numChannels_ > 1) {
