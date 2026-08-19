@@ -349,7 +349,24 @@ namespace Kvasir { namespace ADC {
         static void start(F&& callback) {
             assert(!running_.load(std::memory_order_relaxed));
             userCallback_ = std::forward<F>(callback);
-            activeIsA_    = true;
+            arm();
+        }
+
+        static void stop() {
+            halt();
+            userCallback_.reset();
+        }
+
+        // Realign on the first channel without reassigning userCallback_ - the
+        // overrun that needs this is detected from inside it.
+        static void restart() {
+            halt();
+            arm();
+        }
+
+    private:
+        static void arm() {
+            activeIsA_ = true;
             running_.store(true, std::memory_order_relaxed);
 
             // Configure FIFO for DMA
@@ -358,6 +375,10 @@ namespace Kvasir { namespace ADC {
                                               write(Regs::FCS::thresh, Register::value<1u>())));
 
             base::drainFifo();
+
+            // write-1-to-clear and survive halt(): left set, an overrun restart loops forever.
+            apply(set(Regs::FCS::over));
+            apply(set(Regs::FCS::under));
 
             // Reset AINSEL to first channel
             apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(base::firstChannel_)));
@@ -377,10 +398,10 @@ namespace Kvasir { namespace ADC {
             apply(set(Regs::CS::start_many));
         }
 
-        static void stop() {
+        static void halt() {
             running_.store(false, std::memory_order_relaxed);
             // Stop the DMA before the ADC: clearing running_ alone leaves the
-            // channel armed for the rest of its transfers, so the next start()
+            // channel armed for the rest of its transfers, so the next arm()
             // would re-arm a live channel. See DMA::abort.
             Dma::template abort<DmaChannel>();
             apply(clear(Regs::CS::start_many));
@@ -392,10 +413,8 @@ namespace Kvasir { namespace ADC {
                                               write(Regs::FCS::dreq_en, Register::value<1u>())));
 
             base::drainFifo();
-            userCallback_.reset();
         }
 
-    private:
         static void dmaComplete() {
             if(!running_.load(std::memory_order_relaxed)) { return; }
 
@@ -403,16 +422,15 @@ namespace Kvasir { namespace ADC {
             activeIsA_     = !activeIsA_;
             auto& next     = activeIsA_ ? bufferA_ : bufferB_;
 
-            // Start DMA to the other buffer
-            Dma::template start<DmaChannel,
-                                DmaPriority,
-                                base::DmaTrigger,
-                                Dma::TransferSize::_16,
-                                true,
-                                false>(reinterpret_cast<std::uint32_t>(next.data()),
-                                       Regs::FIFO::Addr::value,
-                                       BufferSize,
-                                       []() { dmaComplete(); });
+            // retrigger(), not start(): start() would assign the slot onIsr() is invoking.
+            Dma::template retrigger<DmaChannel,
+                                    DmaPriority,
+                                    base::DmaTrigger,
+                                    Dma::TransferSize::_16,
+                                    true,
+                                    false>(reinterpret_cast<std::uint32_t>(next.data()),
+                                           Regs::FIFO::Addr::value,
+                                           BufferSize);
 
             if(userCallback_) { userCallback_(completed); }
         }

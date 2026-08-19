@@ -109,30 +109,18 @@ namespace Kvasir { namespace DMA {
                           "DMA callback not configured");
         };
 
+    private:
+        // Register writes only, no callback state: shared tail of start() and retrigger().
         template<DMAChannel      Channel,
                  DMAPriority     Priority,
                  TriggerSource   Trigger,
                  DMATransferSize Size,
                  bool            IncDest,
-                 bool            IncSource,
-                 typename F>
-        static void start(std::uint32_t dest,
-                          std::uint32_t source,
-                          std::size_t   count,
-                          F&&           f) {
+                 bool            IncSource>
+        static void configureAndTrigger(std::uint32_t dest,
+                                        std::uint32_t source,
+                                        std::size_t   count) {
             using CHRegs = Regs::CH<static_cast<int>(Channel)>;
-
-            if constexpr(!std::is_same_v<std::remove_cvref_t<F>, std::nullopt_t>) {
-                if constexpr(DMAConfig::callbackFunctionSize > 0) {
-                    callbackFunctions[static_cast<std::size_t>(Channel)] = std::forward<F>(f);
-                } else {
-                    Fail<void>{};
-                }
-            } else {
-                if constexpr(DMAConfig::callbackFunctionSize > 0) {
-                    callbackFunctions[static_cast<std::size_t>(Channel)].reset();
-                }
-            }
 
             apply(write(CHRegs::READ_ADDR::read_addr, source));
             apply(write(CHRegs::WRITE_ADDR::write_addr, dest));
@@ -155,6 +143,35 @@ namespace Kvasir { namespace DMA {
               set(ctrl::en)));
         }
 
+    public:
+        template<DMAChannel      Channel,
+                 DMAPriority     Priority,
+                 TriggerSource   Trigger,
+                 DMATransferSize Size,
+                 bool            IncDest,
+                 bool            IncSource,
+                 typename F>
+        static void start(std::uint32_t dest,
+                          std::uint32_t source,
+                          std::size_t   count,
+                          F&&           f) {
+            if constexpr(!std::is_same_v<std::remove_cvref_t<F>, std::nullopt_t>) {
+                if constexpr(DMAConfig::callbackFunctionSize > 0) {
+                    callbackFunctions[static_cast<std::size_t>(Channel)] = std::forward<F>(f);
+                } else {
+                    Fail<void>{};
+                }
+            } else {
+                if constexpr(DMAConfig::callbackFunctionSize > 0) {
+                    callbackFunctions[static_cast<std::size_t>(Channel)].reset();
+                }
+            }
+
+            configureAndTrigger<Channel, Priority, Trigger, Size, IncDest, IncSource>(dest,
+                                                                                      source,
+                                                                                      count);
+        }
+
         template<DMAChannel      Channel,
                  DMAPriority     Priority,
                  TriggerSource   Trigger,
@@ -168,6 +185,22 @@ namespace Kvasir { namespace DMA {
                                                                         source,
                                                                         count,
                                                                         std::nullopt);
+        }
+
+        // Re-trigger without reinstalling the callback, for re-arming from inside
+        // it. Needs a prior start(); abort() clears the callback.
+        template<DMAChannel      Channel,
+                 DMAPriority     Priority,
+                 TriggerSource   Trigger,
+                 DMATransferSize Size,
+                 bool            IncDest,
+                 bool            IncSource>
+        static void retrigger(std::uint32_t dest,
+                              std::uint32_t source,
+                              std::size_t   count) {
+            configureAndTrigger<Channel, Priority, Trigger, Size, IncDest, IncSource>(dest,
+                                                                                      source,
+                                                                                      count);
         }
 
         template<DMAChannel Channel>
