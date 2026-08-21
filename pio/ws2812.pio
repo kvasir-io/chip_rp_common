@@ -1,9 +1,23 @@
 .program ws2812
 .side_set 1
 
-.define T1 1
-.define T2 1
-.define T3 1
+; Bit waveform, in state-machine cycles. The SM runs at LedClockSpeed * CylcesPerBit,
+; i.e. 9.6 MHz (104.17 ns/cycle) for the usual 800 kHz LED clock. A bit is
+;   0: high for T1,      low for T2 + T3
+;   1: high for T1 + T2, low for T3
+;
+; 12 cycles per bit rather than the minimum that works: the extra granularity is what
+; lets all four pulse widths sit in the interior of the acceptance window of every part
+; in this family (WS2812, WS2812B, SK6812, Wuerth WL-ICLED) instead of on a bound. At 10
+; cycles there is exactly one set that fits at all, and its T1H lands on SK6812's ceiling.
+;
+; The resulting widths are checked against those windows by static_assert in ws2812.hpp
+; -- it derives them from T1/T2/T3 and LedClockSpeed, so changing a define here (or
+; picking an LedClockSpeed these ratios do not suit, such as WS2811's 400 kHz mode) is a
+; compile error rather than an LED strip that misbehaves.
+.define public T1 3
+.define public T2 4
+.define public T3 5
 .define public CylcesPerBit T1 + T2 + T3
 
 .wrap_target
