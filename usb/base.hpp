@@ -119,6 +119,17 @@ namespace detail {
 
         static constexpr bool DoubleBufferd = Config::DoubleBufferd;
 
+        // EP0 plus one DPRAM group per mixin endpoint number. EndpointOps always
+        // addresses buffers through the DOUBLEBUFFER groups (2 x 2 x 64 bytes each), of
+        // which the buffer map has 8, whether or not double buffering is enabled.
+        static_assert(1
+                          + MixinTraits::countMixinEndpoints<Clock,
+                                                             ConfigT,
+                                                             USBBase,
+                                                             Mixins...>()
+                        <= 8,
+                      "too many endpoint numbers for the DPRAM buffer map");
+
         using EP0_IN
           = EndpointOps<USBBase, 0, EndpointDirection::In, EndpointTransferType::Control>;
         using EP0_OUT
