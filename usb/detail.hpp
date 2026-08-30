@@ -26,8 +26,10 @@ static inline void device_memory_memcpy(void*       dst,
 
     // If both pointers are now word-aligned, use word copies
     if((reinterpret_cast<std::uintptr_t>(src_byte) % kWordSize) == 0) {
-        std::uint32_t*       dst_word = reinterpret_cast<std::uint32_t*>(dst_byte);
-        std::uint32_t const* src_word = reinterpret_cast<std::uint32_t const*>(src_byte);
+        // via void* to silence -Wcast-align; alignment checked above
+        std::uint32_t*       dst_word = static_cast<std::uint32_t*>(static_cast<void*>(dst_byte));
+        std::uint32_t const* src_word
+          = static_cast<std::uint32_t const*>(static_cast<void const*>(src_byte));
 
         while(n >= kWordSize) {
             *dst_word++ = *src_word++;

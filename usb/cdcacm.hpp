@@ -46,7 +46,8 @@ namespace ACM {
     namespace Descriptors {
         struct [[gnu::packed]] Descriptor
           : detail::InterfaceDescriptorBase<Descriptor, DescriptorSubType::CDC_ACM_Descriptor> {
-            std::uint8_t bmCapabilities;
+            // defaulted so `{}` init avoids -Wmissing-field-initializers on the base
+            std::uint8_t bmCapabilities{0};
         };
 
         template<std::uint16_t DeviceVersion,
@@ -96,8 +97,7 @@ namespace ACM {
 
             constexpr USB::CDC::Descriptors::Header CDC_HeaderDescriptor{};
 
-            constexpr USB::CDC ::ACM::Descriptors::Descriptor CDC_ACM_Descriptor{
-              .bmCapabilities{0x00}};
+            constexpr USB::CDC::ACM::Descriptors::Descriptor CDC_ACM_Descriptor{};
 
             constexpr USB::CDC::Descriptors::Union CDC_UnionDescriptor{
               .bMasterInterface0{ManagementInterfaceId},

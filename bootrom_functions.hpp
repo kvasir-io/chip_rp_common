@@ -101,7 +101,7 @@ namespace detail {
                 return Kvasir::Startup::second_stage_bootloader;
 #endif
             } else {
-                return *reinterpret_cast<std::array<std::uint32_t, 64> const* const>(0x400E0000UL);
+                return *reinterpret_cast<std::array<std::uint32_t, 64> const*>(0x400E0000UL);
             }
         }
 

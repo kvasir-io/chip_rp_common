@@ -126,10 +126,15 @@ namespace detail {
 
     static constexpr std::uint16_t bcdUSB{0x0200};
 
+    // bLength is not defaulted to sizeof(Derived): gcc cannot constant-evaluate bit_cast of a
+    // class whose base default-initializes a member with sizeof(Derived) ("sorry, unimplemented").
+    // generateArray() stamps it via descriptorLength() instead.
     template<typename Derived, DescriptorType DT>
     struct DescriptorBase {
-        std::uint8_t   bLength{sizeof(Derived)};
+        std::uint8_t   bLength{0};
         DescriptorType bDescriptorType{DT};
+
+        static constexpr std::uint8_t descriptorLength() { return sizeof(Derived); }
     };
 
     template<typename Derived, DescriptorSubType DST>
@@ -223,7 +228,15 @@ namespace Descriptors {
             auto copyOne = [&]<typename T>(T const& arg) {
                 constexpr std::size_t actual_size = getActualSize<T>();
                 if constexpr(actual_size > 0) {
-                    auto byte_array = std::bit_cast<std::array<std::byte, sizeof(T)>>(arg);
+                    auto byte_array = [&] {
+                        if constexpr(requires { T::descriptorLength(); }) {
+                            T stamped       = arg;
+                            stamped.bLength = T::descriptorLength();
+                            return std::bit_cast<std::array<std::byte, sizeof(T)>>(stamped);
+                        } else {
+                            return std::bit_cast<std::array<std::byte, sizeof(T)>>(arg);
+                        }
+                    }();
                     for(std::size_t i = 0; i < actual_size; ++i) {
                         buffer[offset + i] = byte_array[i];
                     }
