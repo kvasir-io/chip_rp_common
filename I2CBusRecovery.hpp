@@ -37,8 +37,9 @@ namespace Kvasir { namespace I2C {
         // (a legitimate STOP settles SDA in ~0.5 bit-periods).
         //   100 kHz -> 5 ms,  400 kHz -> 1.25 ms
         // Floor at 1 ms to avoid spurious triggers from noise/polling jitter.
+        // explicit std::max<std::uint32_t>: uint32_t differs between gcc and clang, breaking deduction
         static constexpr auto kSdaStuckThreshold = std::chrono::microseconds{
-          std::max(std::uint32_t{1000}, 500'000'000u / I2CConfig::baudRate)};
+          std::max<std::uint32_t>(1000U, 500'000'000U / I2CConfig::baudRate)};
 
         static bool isActive() { return phase_ != Phase::Idle; }
 
