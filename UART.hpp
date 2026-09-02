@@ -5,6 +5,7 @@
 #include "core/Nvic.hpp"
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Io/Types.hpp"
+#include "kvasir/Util/RateLimiter.hpp"
 
 #include <array>
 #include <atomic>
@@ -546,10 +547,13 @@ namespace Kvasir { namespace UART {
         using base = UartBehaviorImpl<UartConfig, Dma, DmaChannel, DmaPriority, BufferSize>;
         using Regs = typename base::Regs;
 
+        // An overrun repeats per character on a noisy line; no clock here, so count based.
+        inline static Kvasir::CountLimiter<> overrunLog_{};
+
         static void onIsr() {
             auto const intflag = apply(read(Regs::UARTMIS::rxmis, Regs::UARTMIS::oemis));
             if(intflag.template get<1>()) {
-                UC_LOG_E("isr error");
+                KVASIR_LOG_LIMITED(overrunLog_.allow(), UC_LOG_E, "uart rx overrun");
                 apply(set(Regs::UARTICR::oeic));
                 base::rxbuffer_.push(std::nullopt);
             } else if(intflag.template get<0>()) {

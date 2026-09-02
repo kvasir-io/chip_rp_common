@@ -2,6 +2,7 @@
 
 #include "descriptors.hpp"
 #include "detail.hpp"
+#include "kvasir/Util/RateLimiter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -66,6 +67,17 @@ public:
     static inline EPState        state{};
     static constexpr std::size_t ep_num = EP;
     static constexpr bool        IsIn   = (Dir == EndpointDirection::In);
+
+    enum class Fault : std::uint8_t {
+        readEmptyBuffer = 1,
+        sizeMismatch,
+        allBuffersBusy,
+        bufferNotAvailable,
+        bufferMismatch,
+    };
+    // Fault logging goes through this: a stalled host or a pulled cable repeats
+    // these per packet.
+    static inline Kvasir::RateLimiter<typename Base::ClockType> faultLog_{};
 
 private:
     template<std::size_t Buffer>
@@ -168,12 +180,15 @@ private:
         bool const available = !static_cast<bool>(bufferState[BufferControlReg<Buffer>::available]);
 
         if(!full || !available) {
-            UC_LOG_C("Attempted read on empty buffer (EP{} {} buffer{}): full={} available={}",
-                     EP,
-                     IsIn ? "IN"sv : "OUT"sv,
-                     Buffer,
-                     full,
-                     available);
+            KVASIR_LOG_LIMITED(
+              faultLog_.allow(Kvasir::rateLimitKey(Fault::readEmptyBuffer, Buffer)),
+              UC_LOG_C,
+              "Attempted read on empty buffer (EP{} {} buffer{}): full={} available={}",
+              EP,
+              IsIn ? "IN"sv : "OUT"sv,
+              Buffer,
+              full,
+              available);
             return 0;
         }
 
@@ -182,12 +197,15 @@ private:
             if constexpr(EP != 0) { report = transferLength > dest.size(); }
 
             if(report) {
-                UC_LOG_E("Buffer size mismatch (EP{} {} buffer{}): received={} expected={}",
-                         EP,
-                         IsIn ? "IN"sv : "OUT"sv,
-                         Buffer,
-                         transferLength,
-                         dest.size());
+                KVASIR_LOG_LIMITED(
+                  faultLog_.allow(Kvasir::rateLimitKey(Fault::sizeMismatch, Buffer)),
+                  UC_LOG_E,
+                  "Buffer size mismatch (EP{} {} buffer{}): received={} expected={}",
+                  EP,
+                  IsIn ? "IN"sv : "OUT"sv,
+                  Buffer,
+                  transferLength,
+                  dest.size());
             }
 
             transferLength
@@ -235,11 +253,13 @@ public:
 
         // All buffers busy?
         if(std::ranges::none_of(buffersAvailable, [](bool av) { return av; })) {
-            UC_LOG_W("EP{} {}: All buffers busy, cannot transfer (buffers_av: {}) {}",
-                     EP,
-                     IsIn ? "IN"sv : "OUT"sv,
-                     buffersAvailable,
-                     BothBuffersControlReg{});
+            KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::allBuffersBusy)),
+                               UC_LOG_W,
+                               "EP{} {}: All buffers busy, cannot transfer (buffers_av: {}) {}",
+                               EP,
+                               IsIn ? "IN"sv : "OUT"sv,
+                               buffersAvailable,
+                               BothBuffersControlReg{});
             return false;
         }
 
@@ -262,11 +282,14 @@ public:
         }
 
         // Expected buffer busy
-        UC_LOG_W("EP{} {}: Buffer {} not available (buffers_av: {})",
-                 EP,
-                 IsIn ? "IN"sv : "OUT"sv,
-                 expectedBuffer,
-                 buffersAvailable);
+        KVASIR_LOG_LIMITED(
+          faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferNotAvailable, expectedBuffer)),
+          UC_LOG_W,
+          "EP{} {}: Buffer {} not available (buffers_av: {})",
+          EP,
+          IsIn ? "IN"sv : "OUT"sv,
+          expectedBuffer,
+          buffersAvailable);
 
         return false;
     }
@@ -283,7 +306,9 @@ public:
 
             if(buffer0) {
                 if(state.buffer() != 0) {
-                    UC_LOG_W(
+                    KVASIR_LOG_LIMITED(
+                      faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferMismatch, 0)),
+                      UC_LOG_W,
                       "EP{} OUT: Buffer mismatch - HW indicates buffer0 but state expects "
                       "buffer1",
                       EP);
@@ -292,7 +317,9 @@ public:
                 return readBuffer<0>(dest);
             } else {
                 if(state.buffer() != 1) {
-                    UC_LOG_W(
+                    KVASIR_LOG_LIMITED(
+                      faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferMismatch, 1)),
+                      UC_LOG_W,
                       "EP{} OUT: Buffer mismatch - HW indicates buffer1 but state expects "
                       "buffer0",
                       EP);
@@ -394,6 +421,8 @@ public:
 struct EP0ControlState {
 private:
     ControlStage current_stage{ControlStage::Idle};
+    // A protocol bug repeats per transfer; no clock here, so count based.
+    Kvasir::CountLimiter<> badTransitionLog_{};
 
     // Transition table: for each destination state, bitmask of valid source states
     // valid_from[to_state] = bitmask where bit N = 1 if transition from state N is valid
@@ -412,7 +441,11 @@ public:
         auto const current_bit = 1U << std::to_underlying(current_stage);
 
         if(!(valid_mask & current_bit)) {
-            UC_LOG_E("Invalid EP0 stage transition {} -> {}", current_stage, new_stage);
+            KVASIR_LOG_LIMITED(badTransitionLog_.allow(),
+                               UC_LOG_E,
+                               "Invalid EP0 stage transition {} -> {}",
+                               current_stage,
+                               new_stage);
         }
 
         current_stage = new_stage;

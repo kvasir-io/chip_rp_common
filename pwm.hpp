@@ -94,8 +94,8 @@ namespace Kvasir { namespace PWM {
                 UC_LOG_W("freq too large");
                 return std::nullopt;
             } else if(div16_top >= DivMax) {
-                return std::nullopt;
                 UC_LOG_W("freq too small");
+                return std::nullopt;
             } else if(topMin > top) {
                 UC_LOG_W("cant reach min top");
                 return std::nullopt;

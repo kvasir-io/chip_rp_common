@@ -3,6 +3,7 @@
 #include "I2CBusRecovery.hpp"
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Register/Apply.hpp"
+#include "kvasir/Util/RateLimiter.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 
 #include <span>
@@ -40,6 +41,8 @@ namespace Kvasir { namespace I2C {
         inline static std::uint8_t                               receivedCount_{0};
         inline static bool                                       stop{false};
         inline static tp                                         timeoutTime_{};
+        // Fault logging goes through this: a bad bus faults on every transaction.
+        inline static Kvasir::RateLimiter<Clock> faultLog_{};
 
         // -- Public API -----------------------------------------------------------
 
@@ -75,10 +78,21 @@ namespace Kvasir { namespace I2C {
             auto const rv = Recovery::tick(now);
             if(rv == Recovery::TickResult::needsReinit) {
                 reset();
-                UC_LOG_W("i2c{} recovery complete", base::Instance);
+                KVASIR_LOG_LIMITED(faultLog_.allow(faultKey(Fault::recovered), now),
+                                   UC_LOG_W,
+                                   "i2c{} recovery complete",
+                                   base::Instance);
                 return;
             }
             if(rv == Recovery::TickResult::busy) { return; }
+
+            // Report the faults the log rate limiter dropped, now that the bus is quiet.
+            apply(makeDisable(typename base::InterruptIndexs{}));
+            auto const droppedFaults = faultLog_.takeSummary(now);
+            apply(makeEnable(typename base::InterruptIndexs{}));
+            if(droppedFaults != 0) {
+                UC_LOG_W("i2c{} {} further faults not logged", base::Instance, droppedFaults);
+            }
 
             // Post-abort settle: bus was sick, wait before starting next transaction
             if(!Recovery::isPastSettle(now)) { return; }
@@ -100,10 +114,12 @@ namespace Kvasir { namespace I2C {
             // Active transaction: check for timeout
             if(now > timeoutTime_) {
                 apply(makeDisable(typename base::InterruptIndexs{}));
-                UC_LOG_W("i2c{} timeout addr={:#04x} {}",
-                         base::Instance,
-                         currentRequest_.address,
-                         typename Regs::IC_TX_ABRT_SOURCE{});
+                KVASIR_LOG_LIMITED(faultLog_.allow(faultKey(Fault::timeout), now),
+                                   UC_LOG_W,
+                                   "i2c{} timeout addr={:#04x} {}",
+                                   base::Instance,
+                                   currentRequest_.address,
+                                   typename Regs::IC_TX_ABRT_SOURCE{});
                 apply(base::softAbortRequest);
                 completeCurrentRequest(I2CRequestResult::failed);
                 apply(makeEnable(typename base::InterruptIndexs{}));
@@ -126,6 +142,30 @@ namespace Kvasir { namespace I2C {
         static bool isRecovering() { return Recovery::isActive(); }
 
     private:
+        enum class Fault : std::uint8_t {
+            abortSend = 1,
+            abortRecv,
+            timeout,
+            masterActive,
+            sdaStuck,
+            recovered,
+        };
+
+        // One kind of fault at one address with one cause, for the log rate limiter.
+        static std::uint32_t faultKey(Fault         kind,
+                                      std::uint32_t cause = 0) {
+            return Kvasir::rateLimitKey(kind, currentRequest_.address, cause);
+        }
+
+        // The abort cause bits.  One raw read instead of the ~20 volatile reads the
+        // generated field accessors would issue; the flush counter (31:23) is masked
+        // out since it is not part of the cause.
+        static std::uint32_t abortCause() {
+            return *reinterpret_cast<std::uint32_t const volatile*>(
+                     Regs::IC_TX_ABRT_SOURCE::Addr::value)
+                 & 0x007F'FFFFU;
+        }
+
         static void drainQueueWithFailure() {
             while(!requestQueue_.empty()) {
                 Request req{};
@@ -186,18 +226,25 @@ namespace Kvasir { namespace I2C {
                 // Guard against cascading timeouts: if the master FSM is still active after
                 // aborting, the bus may still be held. Defer startNext() for a brief settle.
                 if(fieldEquals(Regs::IC_STATUS::MST_ACTIVITYValC::active)) {
-                    UC_LOG_W("i2c{} master still active after abort -- deferring queue drain",
-                             base::Instance);
+                    auto const now = Clock::now();
+                    KVASIR_LOG_LIMITED(
+                      faultLog_.allow(faultKey(Fault::masterActive), now),
+                      UC_LOG_W,
+                      "i2c{} master still active after abort -- deferring queue drain",
+                      base::Instance);
                     active_ = false;
-                    Recovery::deferSettle(Clock::now() + std::chrono::milliseconds{1});
+                    Recovery::deferSettle(now + std::chrono::milliseconds{1});
                     return;
                 }
 
                 // Master FSM is idle: a STOP has propagated so SDA should be released.
                 // If it is still low a device is holding the bus — escalate to full recovery.
                 if(!Recovery::sdaIsHigh()) {
-                    UC_LOG_W("i2c{} SDA stuck low after abort -- escalating to bus recovery",
-                             base::Instance);
+                    KVASIR_LOG_LIMITED(
+                      faultLog_.allow(faultKey(Fault::sdaStuck)),
+                      UC_LOG_W,
+                      "i2c{} SDA stuck low after abort -- escalating to bus recovery",
+                      base::Instance);
                     drainQueueWithFailure();
                     active_ = false;
                     Recovery::begin();
@@ -215,10 +262,12 @@ namespace Kvasir { namespace I2C {
                 if(error) {
                     bool const isNak
                       = fieldEquals(Regs::IC_TX_ABRT_SOURCE::ABRT_7B_ADDR_NOACKValC::active);
-                    UC_LOG_W("i2c{} abort send addr={:#04x} {}",
-                             base::Instance,
-                             currentRequest_.address,
-                             typename Regs::IC_TX_ABRT_SOURCE{});
+                    KVASIR_LOG_LIMITED(faultLog_.allow(faultKey(Fault::abortSend, abortCause())),
+                                       UC_LOG_W,
+                                       "i2c{} abort send addr={:#04x} {}",
+                                       base::Instance,
+                                       currentRequest_.address,
+                                       typename Regs::IC_TX_ABRT_SOURCE{});
                     apply(base::abort);
                     completeCurrentRequest(isNak ? I2CRequestResult::notAcknowledged
                                                  : I2CRequestResult::failed);
@@ -257,10 +306,12 @@ namespace Kvasir { namespace I2C {
                 if(error) {
                     bool const isNak
                       = fieldEquals(Regs::IC_TX_ABRT_SOURCE::ABRT_7B_ADDR_NOACKValC::active);
-                    UC_LOG_W("i2c{} abort recv addr={:#04x} {}",
-                             base::Instance,
-                             currentRequest_.address,
-                             typename Regs::IC_TX_ABRT_SOURCE{});
+                    KVASIR_LOG_LIMITED(faultLog_.allow(faultKey(Fault::abortRecv, abortCause())),
+                                       UC_LOG_W,
+                                       "i2c{} abort recv addr={:#04x} {}",
+                                       base::Instance,
+                                       currentRequest_.address,
+                                       typename Regs::IC_TX_ABRT_SOURCE{});
                     apply(base::abort);
                     completeCurrentRequest(isNak ? I2CRequestResult::notAcknowledged
                                                  : I2CRequestResult::failed);

@@ -6,6 +6,7 @@
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Apply.hpp"
+#include "kvasir/Util/RateLimiter.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/I2C.hpp"
 
@@ -387,6 +388,10 @@ namespace Kvasir { namespace I2C {
         inline static bool                                         stop{false};
         inline static tp                                           timeoutTime{};
 
+        enum class Fault : std::uint8_t { timeout = 1, abortSend, abortRecv, unexpectedIsr };
+        // Fault logging goes through this: a bad bus faults on every transaction.
+        inline static Kvasir::RateLimiter<Clock> faultLog_{};
+
         static void reset() {
             apply(makeDisable(typename base::InterruptIndexs{}));
             state_.store(State::idle, std::memory_order_relaxed);
@@ -425,7 +430,11 @@ namespace Kvasir { namespace I2C {
                     // released the bus; on timeout the bus is mid-transaction
                     // and needs the STOP.
                     apply(base::softAbortRequest);
-                    UC_LOG_W("timeout");
+                    KVASIR_LOG_LIMITED(
+                      faultLog_.allow(Kvasir::rateLimitKey(Fault::timeout), currentTime),
+                      UC_LOG_W,
+                      "i2c{} timeout",
+                      base::Instance);
                     buffer_.clear();
                     operationState_.store(OperationState::failed, std::memory_order_relaxed);
                     state_.store(State::blocked, std::memory_order_relaxed);
@@ -560,7 +569,11 @@ namespace Kvasir { namespace I2C {
                 if(error) {
                     lstate  = State::blocked;
                     lostate = OperationState::failed;
-                    UC_LOG_C("abort send");
+                    KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::abortSend)),
+                                       UC_LOG_C,
+                                       "i2c{} abort send {}",
+                                       base::Instance,
+                                       typename Regs::IC_TX_ABRT_SOURCE{});
                     apply(base::abort);
                 } else {
                     if(!buffer_.empty()) {
@@ -600,7 +613,11 @@ namespace Kvasir { namespace I2C {
                 }
             } else if(lstate == State::receiving) {
                 if(error) {
-                    UC_LOG_C("abort recv");
+                    KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::abortRecv)),
+                                       UC_LOG_C,
+                                       "i2c{} abort recv {}",
+                                       base::Instance,
+                                       typename Regs::IC_TX_ABRT_SOURCE{});
                     lstate  = State::blocked;
                     lostate = OperationState::failed;
                     apply(base::abort);
@@ -625,7 +642,10 @@ namespace Kvasir { namespace I2C {
                     }
                 }
             } else {
-                UC_LOG_C("bad bad");
+                KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::unexpectedIsr)),
+                                   UC_LOG_C,
+                                   "i2c{} unexpected isr",
+                                   base::Instance);
             }
 
             operationState_.store(lostate, std::memory_order_relaxed);

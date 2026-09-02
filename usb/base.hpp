@@ -4,6 +4,7 @@
 #include "descriptors.hpp"
 #include "detail.hpp"
 #include "endpointOps.hpp"
+#include "kvasir/Util/RateLimiter.hpp"
 #include "mixins.hpp"
 #include "resetInterface.hpp"
 #include "simplebulk.hpp"
@@ -75,6 +76,7 @@ namespace detail {
         using Regs        = Kvasir::Peripheral::USB::Registers<0>;
         using BufferRegs  = Kvasir::Peripheral::USB_DPRAM::Registers<0>;
         using SetupPacket = Kvasir::USB::SetupPacket;
+        using ClockType   = Clock;
 
         struct Config : ConfigT {
             static constexpr bool UseSof = [] {
@@ -195,6 +197,21 @@ namespace detail {
         static inline std::array<std::byte, 256> stringDescriptorBuffer{};
         static inline detail::EP0ControlState    ep0_ctrl{};
 
+        enum class Fault : std::uint8_t {
+            epTxError = 1,
+            epRxError,
+            sieError,
+            watchdog,
+            unhandledBufferDone,
+            unhandledAbortDone,
+            unhandledSetup,
+            invalidOutData,
+            outReadNotInDataPhase,
+        };
+        // Fault logging goes through this: a bad cable or a misbehaving host repeats
+        // these per packet, from inside the ISR.
+        static inline Kvasir::RateLimiter<Clock, Kvasir::RateLimiterConfig{.burst = 8}> faultLog_{};
+
         static void onIsr() {
             static constexpr auto CommonIsrList
               = Kvasir::MPL::list(read(Regs::INTS::setup_req),
@@ -222,21 +239,30 @@ namespace detail {
                                               | (1U << 23);   // ENDPOINT_ERROR
 
 #if __has_include("chip/rp2350.hpp")
-            if(apply(read(Regs::EP_TX_ERROR::FULLREGISTER))) {
-                UC_LOG_E("USB: EP_TX_ERROR: {}", Regs::EP_TX_ERROR{});
+            if(std::uint32_t const txError = apply(read(Regs::EP_TX_ERROR::FULLREGISTER))) {
+                KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::epTxError, txError)),
+                                   UC_LOG_E,
+                                   "USB: EP_TX_ERROR: {}",
+                                   Regs::EP_TX_ERROR{});
                 apply(
                   write(Regs::EP_TX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
             }
-            if(apply(read(Regs::EP_RX_ERROR::FULLREGISTER))) {
-                UC_LOG_E("USB: EP_RX_ERROR: {}", Regs::EP_RX_ERROR{});
+            if(std::uint32_t const rxError = apply(read(Regs::EP_RX_ERROR::FULLREGISTER))) {
+                KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::epRxError, rxError)),
+                                   UC_LOG_E,
+                                   "USB: EP_RX_ERROR: {}",
+                                   Regs::EP_RX_ERROR{});
                 apply(
                   write(Regs::EP_RX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
             }
 #endif
             if(sieStatus & errorMask) {
-                UC_LOG_E("USB: SIE_STATUS error: {:#010x} {}",
-                         sieStatus & errorMask,
-                         Regs::SIE_STATUS{});
+                KVASIR_LOG_LIMITED(
+                  faultLog_.allow(Kvasir::rateLimitKey(Fault::sieError, sieStatus & errorMask)),
+                  UC_LOG_E,
+                  "USB: SIE_STATUS error: {:#010x} {}",
+                  sieStatus & errorMask,
+                  Regs::SIE_STATUS{});
                 // Clear error bits (WC - write 1 to clear)
                 apply(write(Regs::SIE_STATUS::FULLREGISTER, sieStatus & errorMask));
             }
@@ -256,7 +282,9 @@ namespace detail {
 
 #if __has_include("chip/rp2350.hpp")
             if(status[Regs::INTS::dev_sm_watchdog_fired]) {
-                UC_LOG_E("USB: watchdog");
+                KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::watchdog)),
+                                   UC_LOG_E,
+                                   "USB: watchdog");
                 apply(set(Regs::DEV_SM_WATCHDOG::fired));
             }
 #endif
@@ -353,9 +381,12 @@ namespace detail {
             using namespace std::string_view_literals;
             if(EndpointHandler(ep_num, in)) { return; }
             if(!MixinsBase::callEndpointHandler(ep_num, in)) {
-                UC_LOG_W("USB: Unhandled endpoint buffer done (EP{} {})",
-                         ep_num,
-                         in ? "IN"sv : "OUT"sv);
+                KVASIR_LOG_LIMITED(
+                  faultLog_.allow(Kvasir::rateLimitKey(Fault::unhandledBufferDone, ep_num, in)),
+                  UC_LOG_W,
+                  "USB: Unhandled endpoint buffer done (EP{} {})",
+                  ep_num,
+                  in ? "IN"sv : "OUT"sv);
             }
         }
 
@@ -376,9 +407,12 @@ namespace detail {
                                     bool        in) {
             using namespace std::string_view_literals;
             if(!MixinsBase::callAbortDone(ep_num, in)) {
-                UC_LOG_W("USB: Unhandled endpoint abort done (EP{} {})",
-                         ep_num,
-                         in ? "IN"sv : "OUT"sv);
+                KVASIR_LOG_LIMITED(
+                  faultLog_.allow(Kvasir::rateLimitKey(Fault::unhandledAbortDone, ep_num, in)),
+                  UC_LOG_W,
+                  "USB: Unhandled endpoint abort done (EP{} {})",
+                  ep_num,
+                  in ? "IN"sv : "OUT"sv);
             }
         }
 
@@ -545,7 +579,12 @@ namespace detail {
 
             // Centralized error handling - USB 2.0 spec requires STALL for unsupported requests
             if(!handled) {
-                UC_LOG_W("USB: STALL - Unhandled setup packet: {}", pkt);
+                KVASIR_LOG_LIMITED(
+                  faultLog_.allow(
+                    Kvasir::rateLimitKey(Fault::unhandledSetup, pkt.bmRequestType, pkt.bRequest)),
+                  UC_LOG_W,
+                  "USB: STALL - Unhandled setup packet: {}",
+                  pkt);
                 EP0_IN::stall();
                 EP0_OUT::stall();
                 ep0_ctrl.transition(ControlStage::Stall);
@@ -622,13 +661,20 @@ namespace detail {
             if(ep0_ctrl.stage() == ControlStage::Data) {
                 std::size_t const len = EP0_OUT::readCurrentBuffer(data);
                 if(len != data.size()) {
-                    UC_LOG_E("USB: Invalid out data (received={}, expected={})", len, data.size());
+                    KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::invalidOutData)),
+                                       UC_LOG_E,
+                                       "USB: Invalid out data (received={}, expected={})",
+                                       len,
+                                       data.size());
                     return false;
                 }
                 EP0_OUT::bufferFinished();
                 return true;
             } else {
-                UC_LOG_E("USB: out read attempted while not in data phase");
+                KVASIR_LOG_LIMITED(
+                  faultLog_.allow(Kvasir::rateLimitKey(Fault::outReadNotInDataPhase)),
+                  UC_LOG_E,
+                  "USB: out read attempted while not in data phase");
                 return false;
             }
         }

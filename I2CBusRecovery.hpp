@@ -1,6 +1,7 @@
 #pragma once
 
 #include "I2C.hpp"
+#include "kvasir/Util/RateLimiter.hpp"
 
 namespace Kvasir { namespace I2C {
 
@@ -29,8 +30,9 @@ namespace Kvasir { namespace I2C {
         inline static Phase phase_{Phase::Idle};
         inline static int   pulseCount_{0};
         inline static tp    phaseDeadline_{};
-        inline static tp    sickUntil_{};       // post-abort settle gate
-        inline static tp    sdaStuckSince_{};   // when SDA first observed stuck low
+        inline static tp    sickUntil_{};                  // post-abort settle gate
+        inline static tp    sdaStuckSince_{};              // when SDA first observed stuck low
+        inline static Kvasir::RateLimiter<Clock> log_{};   // a held-low SDA recovers in a loop
 
         // SDA must be continuously low for this long before recovery fires.
         // Scale with baud rate: ~500 bit-periods gives comfortable margin
@@ -55,7 +57,10 @@ namespace Kvasir { namespace I2C {
             }
             if(sdaStuckSince_ == tp{}) { sdaStuckSince_ = now; }
             if(now - sdaStuckSince_ >= kSdaStuckThreshold) {
-                UC_LOG_W("i2c{} SDA stuck low -- requesting recovery", base::Instance);
+                KVASIR_LOG_LIMITED(log_.allow(0, now),
+                                   UC_LOG_W,
+                                   "i2c{} SDA stuck low -- requesting recovery",
+                                   base::Instance);
                 sdaStuckSince_ = tp{};
                 begin();
                 return true;
