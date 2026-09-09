@@ -1,4 +1,7 @@
 #pragma once
+#include "peripherals/PSM.hpp"
+#include "peripherals/WATCHDOG.hpp"
+
 #include <cassert>
 #include <cstdint>
 #include <functional>
@@ -210,6 +213,43 @@ namespace detail {
         using rom_flash_op = int (*)(std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t*);
 
         return RomFunctions::call<'F', 'O', rom_flash_op>(flags, addr, size_bytes, buf);
+    }
+
+    // get_partition_table_info flags (RP2350 datasheet 5.4.8.16): what the words after the
+    // echoed flags word describe.
+    namespace PtInfoFlags {
+        constexpr std::uint32_t PT_INFO            = 0x0001;   // count, unpartitioned space
+        constexpr std::uint32_t SINGLE_PARTITION   = 0x8000;   // just partition (flags >> 24)
+        constexpr std::uint32_t LOCATION_AND_FLAGS = 0x0010;
+        constexpr std::uint32_t ID                 = 0x0020;
+        constexpr std::uint32_t FAMILY_IDS         = 0x0040;
+        constexpr std::uint32_t NAME               = 0x0080;
+    }   // namespace PtInfoFlags
+
+    static inline int get_partition_table_info(std::uint32_t* out_buffer,
+                                               std::uint32_t  out_buffer_word_size,
+                                               std::uint32_t  partition_and_flags) {
+        using rom_get_partition_table_info = int (*)(std::uint32_t*, std::uint32_t, std::uint32_t);
+
+        return RomFunctions::call<'G', 'P', rom_get_partition_table_info>(out_buffer,
+                                                                          out_buffer_word_size,
+                                                                          partition_and_flags);
+    }
+
+    // otp_access (5.4.8.19): rows are 24 bits wide; read or written as raw 32-bit words
+    // (four bytes per row, ECC off) or as ECC-protected 16-bit halves (two bytes per row).
+    namespace OtpCmd {
+        constexpr std::uint32_t ROW_MASK = 0x0000FFFF;
+        constexpr std::uint32_t WRITE    = 0x00010000;
+        constexpr std::uint32_t ECC      = 0x00020000;
+    }   // namespace OtpCmd
+
+    static inline int otp_access(std::uint8_t* buf,
+                                 std::uint32_t buf_len,
+                                 std::uint32_t cmd_flags) {
+        using rom_func_otp_access = int (*)(std::uint8_t*, std::uint32_t, std::uint32_t);
+
+        return RomFunctions::call<'O', 'A', rom_func_otp_access>(buf, buf_len, cmd_flags);
     }
 #endif
 
@@ -513,7 +553,77 @@ namespace detail {
 
 }   // namespace detail
 
-inline void resetToUsbBoot() {
+namespace detail {
+    // The watchdog's own reboot: what the pico-sdk's watchdog_reboot(0, 0, ..) and the RP2350
+    // bootrom's reboot() do underneath, without the timer. CTRL is written as a whole so the
+    // PAUSE_DBG0/1/JTAG bits go too: with them set a watchdog does nothing while a probe is
+    // attached, and "does not reboot under the debugger" is not a reboot. SCRATCH4 = 0 keeps
+    // the bootrom from taking a stale watchdog boot vector (5.2.4). PSM.WDSEL names the
+    // stages the reset runs through: the RP2350 bootrom resets everything but the processor
+    // cold domain (so the debug halt-on-reset bits survive), the pico-sdk on the RP2040
+    // everything but the oscillators; the RESETS stage being in both is what puts every
+    // peripheral back into reset, and the PROC stages what puts core 1 back into the
+    // bootrom's holding pen.
+    [[noreturn]] inline void watchdogReboot() {
+        using WD  = Kvasir::Peripheral::WATCHDOG::Registers<>;
+        using PSM = Kvasir::Peripheral::PSM::Registers<>;
+
+        apply(WD::CTRL::overrideDefaults(write(WD::CTRL::pause_dbg1, Register::value<0>()),
+                                         write(WD::CTRL::pause_dbg0, Register::value<0>()),
+                                         write(WD::CTRL::pause_jtag, Register::value<0>())));
+        apply(write(WD::SCRATCH4::FULLREGISTER, Register::value<0>()));
+
+#if __has_include("chip/rp2350.hpp")
+        apply(set(PSM::WDSEL::proc1),
+              set(PSM::WDSEL::proc0),
+              set(PSM::WDSEL::accessctrl),
+              set(PSM::WDSEL::sio),
+              set(PSM::WDSEL::xip),
+              set(PSM::WDSEL::sram9),
+              set(PSM::WDSEL::sram8),
+              set(PSM::WDSEL::sram7),
+              set(PSM::WDSEL::sram6),
+              set(PSM::WDSEL::sram5),
+              set(PSM::WDSEL::sram4),
+              set(PSM::WDSEL::sram3),
+              set(PSM::WDSEL::sram2),
+              set(PSM::WDSEL::sram1),
+              set(PSM::WDSEL::sram0),
+              set(PSM::WDSEL::bootram),
+              set(PSM::WDSEL::rom),
+              set(PSM::WDSEL::busfabric),
+              set(PSM::WDSEL::ready),
+              set(PSM::WDSEL::clocks),
+              set(PSM::WDSEL::resets),
+              set(PSM::WDSEL::xosc),
+              set(PSM::WDSEL::rosc),
+              set(PSM::WDSEL::otp),
+              clear(PSM::WDSEL::proc_cold));
+#else
+        apply(set(PSM::WDSEL::proc1),
+              set(PSM::WDSEL::proc0),
+              set(PSM::WDSEL::sio),
+              set(PSM::WDSEL::vreg_and_chip_reset),
+              set(PSM::WDSEL::xip),
+              set(PSM::WDSEL::sram5),
+              set(PSM::WDSEL::sram4),
+              set(PSM::WDSEL::sram3),
+              set(PSM::WDSEL::sram2),
+              set(PSM::WDSEL::sram1),
+              set(PSM::WDSEL::sram0),
+              set(PSM::WDSEL::rom),
+              set(PSM::WDSEL::busfabric),
+              set(PSM::WDSEL::resets),
+              set(PSM::WDSEL::clocks),
+              clear(PSM::WDSEL::xosc),
+              clear(PSM::WDSEL::rosc));
+#endif
+        apply(set(WD::CTRL::trigger));
+        while(true) { asm volatile("wfi"); }
+    }
+}   // namespace detail
+
+[[noreturn]] inline void resetToUsbBoot() {
     if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
         using romResetToUsbBoot
           = void (*)(std::uint32_t gpioActivityPinMask, std::uint32_t disableInterfaceMask);
@@ -529,7 +639,34 @@ inline void resetToUsbBoot() {
     }
 
     UC_LOG_C("This should not happen reboot returned");
-    apply(Kvasir::SystemControl::SystemReset{});
+    detail::watchdogReboot();   // a chip reset at least, see reboot() below
+}
+
+// Reboot the chip: both cores and every peripheral restart from the bootrom, as after a
+// power-on. PM::reset_cause() reports watchdog_timer on the RP2350 (the bootrom arms the
+// watchdog's timer, 1 ms) and watchdog_force on the raw-trigger path.
+//
+// Not SystemControl::SystemReset: SYSRESETREQ is a warm reset of the core that asserts it
+// and of nothing else (RP2040 datasheet 2.4.2.9, RP2350 datasheet 12.9, pico-feedback #329).
+// Issued from core 1 it parks core 1 in the bootrom and leaves core 0 running; from core 0
+// it leaves core 1 running and the peripherals configured, and only looks like a reboot
+// because FirstInitStep puts the peripherals back into reset.
+//
+// The RP2350 goes through the bootrom's reboot() (datasheet 5.4.8.24), the pico-sdk's and
+// picotool's path: it switches POWMAN off clk_ref before the clock generators reset (a
+// clk_pow glitch otherwise) and keeps the boot diagnostics. NO_RETURN_ON_SUCCESS parks this
+// core in the ROM until the watchdog fires, 1 ms later. The raw watchdog is the RP2040's
+// path and the fallback should the ROM call refuse.
+[[noreturn]] inline void reboot() {
+    if constexpr(PinConfig::CurrentChip != Kvasir::PinConfig::ChipVariant::RP2040) {
+        static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
+        static constexpr std::uint32_t REBOOT_TYPE_NORMAL   = 0x0000;
+
+        [[maybe_unused]] auto const ret
+          = detail::reboot(REBOOT_TYPE_NORMAL | NO_RETURN_ON_SUCCESS, 1, 0, 0);
+        UC_LOG_C("bootrom reboot returned {}", ret);
+    }
+    detail::watchdogReboot();
 }
 
 inline auto serialNumber() {

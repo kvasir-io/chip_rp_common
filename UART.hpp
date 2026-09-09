@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Clocks.hpp"
 #include "DMA.hpp"
 #include "PinConfig.hpp"
 #include "core/Nvic.hpp"
@@ -12,6 +13,9 @@
 #include <cassert>
 
 namespace Kvasir { namespace UART {
+
+    // Startup resource: the UART block itself (kvasir/StartUp/Resources.hpp).
+    struct InstanceTag {};
 
     enum class DataBits {
         _5,
@@ -29,6 +33,17 @@ namespace Kvasir { namespace UART {
     enum class StopBits {
         _1,
         _2,
+    };
+
+    // The interrupt trigger point of a FIFO (UARTIFLS), as a fraction of its 32 entries:
+    // the receive interrupt fires when the RX FIFO holds at least this much, the transmit
+    // one when the TX FIFO holds at most this much.
+    enum class FifoLevel : std::uint32_t {
+        _1_8 = 0,
+        _1_4 = 1,
+        _1_2 = 2,
+        _3_4 = 3,
+        _7_8 = 4,
     };
 
     namespace Detail {
@@ -380,6 +395,35 @@ namespace Kvasir { namespace UART {
                     return std::ratio<5, 1000>{};
                 }
             }();
+
+            // The PL011's 32-entry FIFOs (UARTLCR_H.FEN). Off, the holding registers are one
+            // deep and every received byte is an interrupt; on, the receive interrupt fires at
+            // rxFifoLevel and the receive-timeout interrupt (32 bit periods of silence) hands
+            // over what is left below it, so a burst costs a few interrupts instead of one per
+            // byte. The DMA transmit path pulls from the TX FIFO either way.
+            static constexpr bool fifo = [] {
+                if constexpr(requires { UartConfig_::fifo; }) {
+                    return static_cast<bool>(UartConfig_::fifo);
+                } else {
+                    return false;
+                }
+            }();
+
+            static constexpr FifoLevel rxFifoLevel = [] {
+                if constexpr(requires { UartConfig_::rxFifoLevel; }) {
+                    return UartConfig_::rxFifoLevel;
+                } else {
+                    return FifoLevel::_1_2;
+                }
+            }();
+
+            static constexpr FifoLevel txFifoLevel = [] {
+                if constexpr(requires { UartConfig_::txFifoLevel; }) {
+                    return UartConfig_::txFifoLevel;
+                } else {
+                    return FifoLevel::_1_2;
+                }
+            }();
         };
 
         // needed config
@@ -397,6 +441,11 @@ namespace Kvasir { namespace UART {
 
         using InterruptIndexs = decltype(Traits::UART::getIsrIndexs<Instance>());
 
+        // Startup: this block, and the clock the baud divisor is computed from (the PL011
+        // counts clk_peri).
+        using Provides = brigand::list<Startup::Resource<InstanceTag, Instance>>;
+        using Claims   = Clocks::Claim<Clocks::ClkPeri, UartConfig::clockSpeed>;
+
         using Config = Detail::Config<Instance>;
 
         static constexpr auto RxDmaTrigger = Traits::UART::DmaRX_Trigger<Instance>();
@@ -411,6 +460,33 @@ namespace Kvasir { namespace UART {
                       "invalid RXPin");
 
         static constexpr auto powerClockEnable = list(Traits::UART::getEnable<Instance>());
+
+        static constexpr bool hasRx
+          = !std::is_same_v<std::remove_cvref_t<decltype(UartConfig::rxPinLocation)>,
+                            std::remove_cvref_t<decltype(Io::NotUsed<>{})>>;
+
+        static constexpr auto fifoConfig() {
+            if constexpr(UartConfig::fifo) {
+                return list(
+                  set(Regs::UARTLCR_H::fen),
+                  write(Regs::UARTIFLS::rxiflsel,
+                        Register::value<static_cast<std::uint32_t>(UartConfig::rxFifoLevel)>()),
+                  write(Regs::UARTIFLS::txiflsel,
+                        Register::value<static_cast<std::uint32_t>(UartConfig::txFifoLevel)>()));
+            } else {
+                return list(clear(Regs::UARTLCR_H::fen));
+            }
+        }
+
+        // With a FIFO, a burst shorter than the trigger level would sit there until more
+        // arrives; the receive timeout interrupt delivers it after 32 bit periods of silence.
+        static constexpr auto rxTimeoutInterrupt() {
+            if constexpr(UartConfig::fifo && hasRx) {
+                return list(set(Regs::UARTIMSC::rtim));
+            } else {
+                return brigand::list<>{};
+            }
+        }
 
         static constexpr auto initStepPinConfig
           = list(typename Config::template GetTxPinConfig<
@@ -436,12 +512,12 @@ namespace Kvasir { namespace UART {
                  typename Config::template GetStopBitConfig<UartConfig::stopBits>::config{},
                  typename Config::template GetParityConfig<UartConfig::parity>::config{},
 
-                 // The following parameters are only supported via userConfigOverride
                  set(Regs::UARTDMACR::txdmae),
-                 //set(Regs::UARTLCR_H::fen),
+                 fifoConfig(),
 
                  typename Config::template GetRxPinConfig<
                    std::decay_t<decltype(UartConfig::rxPinLocation)>>::interrupt{},
+                 rxTimeoutInterrupt(),
                  UartConfig::userConfigOverride);
 
         static constexpr auto initStepInterruptConfig
@@ -466,7 +542,7 @@ namespace Kvasir { namespace UART {
         static constexpr std::size_t DmaChId = std::size_t(DmaChannel);
         static constexpr std::size_t DmaLvl  = std::size_t(DmaPriority);
 
-        static_assert(Dma::numberOfChannels > DmaChId);
+        using Claims = brigand::append<typename base::Claims, Kvasir::DMA::Claims<Dma, DmaChannel>>;
 
         inline static Kvasir::Atomic::
           Queue<std::optional<std::byte>, BufferSize, Kvasir::Atomic::OverFlowPolicyIgnore>
@@ -550,17 +626,24 @@ namespace Kvasir { namespace UART {
         // An overrun repeats per character on a noisy line; no clock here, so count based.
         inline static Kvasir::CountLimiter<> overrunLog_{};
 
+        // How often the receive interrupt ran: with the FIFO on, a fraction of the bytes.
+        inline static std::atomic<std::uint32_t> rxInterrupts{0};
+
         static void onIsr() {
-            auto const intflag = apply(read(Regs::UARTMIS::rxmis, Regs::UARTMIS::oemis));
+            rxInterrupts.fetch_add(1, std::memory_order_relaxed);
+            auto const intflag
+              = apply(read(Regs::UARTMIS::rxmis, Regs::UARTMIS::oemis, Regs::UARTMIS::rtmis));
             if(intflag.template get<1>()) {
                 KVASIR_LOG_LIMITED(overrunLog_.allow(), UC_LOG_E, "uart rx overrun");
                 apply(set(Regs::UARTICR::oeic));
                 base::rxbuffer_.push(std::nullopt);
-            } else if(intflag.template get<0>()) {
+            }
+            if(intflag.template get<2>()) { apply(set(Regs::UARTICR::rtic)); }
+            // Everything the FIFO (or the one-deep holding register) has: the receive and
+            // timeout interrupts both clear as it empties.
+            while(!apply(read(Regs::UARTFR::rxfe))) {
                 std::byte data = std::byte(apply(read(Regs::UARTDR::data)).template get<0>());
                 base::rxbuffer_.push(data);
-            } else {
-                assert(false);
             }
         }
 

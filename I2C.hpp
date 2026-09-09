@@ -1,11 +1,13 @@
 #pragma once
 
+#include "Clocks.hpp"
 #include "Io.hpp"
 #include "PinConfig.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Apply.hpp"
+#include "kvasir/Register/RegisterFmt.hpp"
 #include "kvasir/Util/RateLimiter.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/I2C.hpp"
@@ -15,6 +17,9 @@
 #include <span>
 
 namespace Kvasir { namespace I2C {
+
+    // Startup resource: the I2C block itself (kvasir/StartUp/Resources.hpp).
+    struct InstanceTag {};
 
     namespace Detail {
 
@@ -264,6 +269,11 @@ namespace Kvasir { namespace I2C {
 
             using InterruptIndexs = decltype(Traits::I2C::getIsrIndexs<Instance>());
 
+            // Startup: this block, and the clock the SCL counts are computed from (the DW
+            // I2C counts clk_sys).
+            using Provides = brigand::list<Startup::Resource<InstanceTag, Instance>>;
+            using Claims   = Clocks::Claim<Clocks::ClkSys, I2CConfig::clockSpeed>;
+
             static constexpr auto NoInterrupts
               = list(Regs::IC_INTR_MASK::overrideDefaults(clear(Regs::IC_INTR_MASK::m_gen_call),
                                                           clear(Regs::IC_INTR_MASK::m_rx_done),
@@ -326,9 +336,15 @@ namespace Kvasir { namespace I2C {
                        std::decay_t<decltype(I2CConfig::sclPinLocation)>,
                        I2CConfig::baudRate>::pinConfig{});
 
+            // TX_EMPTY_CTRL: TX_EMPTY only once the last popped command has actually been
+            // shifted out, not as soon as the FIFO drains. The queued driver completes a
+            // write on that interrupt and then disables the block and writes the next
+            // request's IC_TAR; with the default behaviour that happened while the last
+            // byte and its STOP were still on the wire, where a TAR write is ignored.
             static constexpr auto initStepPeripheryConfig
               = list(Regs::IC_CON::overrideDefaults(
                        write(Regs::IC_CON::MASTER_MODEValC::enabled),
+                       write(Regs::IC_CON::TX_EMPTY_CTRLValC::enabled),
                        Config::template getSpeedModeRegister<I2CConfig::baudRate>()),
                      typename Config::template GetBaudConfig<I2CConfig::clockSpeed,
                                                              I2CConfig::baudRate>::config{},
@@ -369,6 +385,30 @@ namespace Kvasir { namespace I2C {
               = list(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled),
                                                        set(Regs::IC_ENABLE::abort)),
                      NoInterrupts);
+
+            using AbrtSrc = typename Regs::IC_TX_ABRT_SOURCE;
+
+            // The abort causes worth reporting: everything except the slave-side bits, the
+            // flush counter, and abrt_user_abrt -- the last is raised by our own ENABLE.ABORT
+            // once the abort has gone through and would make one NACK look like two faults.
+            static constexpr auto MasterAbortCauses = static_cast<typename AbrtSrc::Addr::RegType>(
+              ~(AbrtSrc::abrt_user_abrt.Mask | AbrtSrc::abrt_slvrd_intx.Mask
+                | AbrtSrc::abrt_slv_arblost.Mask | AbrtSrc::abrt_slvflush_txfifo.Mask
+                | AbrtSrc::tx_flush_cnt.Mask));
+
+            // Log it as Kvasir::Register::Flags<AbrtSrc>{abortCause()}: the field names of the
+            // bits that are set, on one line.
+            static auto abortCause() {
+                return static_cast<typename AbrtSrc::Addr::RegType>(
+                  get<0>(apply(read(AbrtSrc::FULLREGISTER))) & MasterAbortCauses);
+            }
+
+            // Reading IC_CLR_TX_ABRT clears IC_TX_ABRT_SOURCE (and the TX_ABRT interrupt), so
+            // the next abort reports its own cause rather than a stale one.
+            static void clearAbortSource() {
+                [[maybe_unused]] auto const cleared
+                  = apply(read(Regs::IC_CLR_TX_ABRT::clr_tx_abrt));
+            }
         };
     }   // namespace Detail
 
@@ -567,13 +607,15 @@ namespace Kvasir { namespace I2C {
             auto lostate = operationState_.load(std::memory_order_relaxed);
             if(lstate == State::sending) {
                 if(error) {
-                    lstate  = State::blocked;
-                    lostate = OperationState::failed;
-                    KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::abortSend)),
-                                       UC_LOG_C,
-                                       "i2c{} abort send {}",
-                                       base::Instance,
-                                       typename Regs::IC_TX_ABRT_SOURCE{});
+                    lstate           = State::blocked;
+                    lostate          = OperationState::failed;
+                    auto const cause = base::abortCause();
+                    KVASIR_LOG_LIMITED(
+                      faultLog_.allow(Kvasir::rateLimitKey(Fault::abortSend, cause)),
+                      UC_LOG_C,
+                      "i2c{} abort send {}",
+                      base::Instance,
+                      Kvasir::Register::Flags<typename base::AbrtSrc>{cause});
                     apply(base::abort);
                 } else {
                     if(!buffer_.empty()) {
@@ -613,11 +655,13 @@ namespace Kvasir { namespace I2C {
                 }
             } else if(lstate == State::receiving) {
                 if(error) {
-                    KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::abortRecv)),
-                                       UC_LOG_C,
-                                       "i2c{} abort recv {}",
-                                       base::Instance,
-                                       typename Regs::IC_TX_ABRT_SOURCE{});
+                    auto const cause = base::abortCause();
+                    KVASIR_LOG_LIMITED(
+                      faultLog_.allow(Kvasir::rateLimitKey(Fault::abortRecv, cause)),
+                      UC_LOG_C,
+                      "i2c{} abort recv {}",
+                      base::Instance,
+                      Kvasir::Register::Flags<typename base::AbrtSrc>{cause});
                     lstate  = State::blocked;
                     lostate = OperationState::failed;
                     apply(base::abort);

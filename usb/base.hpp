@@ -1,9 +1,11 @@
 #pragma once
 
+#include "../Clocks.hpp"
 #include "cdcacm.hpp"
 #include "descriptors.hpp"
 #include "detail.hpp"
 #include "endpointOps.hpp"
+#include "kvasir/Register/RegisterFmt.hpp"
 #include "kvasir/Util/RateLimiter.hpp"
 #include "mixins.hpp"
 #include "resetInterface.hpp"
@@ -29,6 +31,9 @@
 #include <variant>
 
 namespace Kvasir::USB {
+// Startup resource: the one USB controller (kvasir/StartUp/Resources.hpp).
+struct InstanceTag {};
+
 namespace detail {
 
     template<typename Clock,
@@ -229,21 +234,24 @@ namespace detail {
                 }
             }();
 
-            auto const              status    = apply(IsrList);
-            std::uint32_t const     sieStatus = apply(read(Regs::SIE_STATUS::FULLREGISTER));
-            constexpr std::uint32_t errorMask = (1U << 31)    // DATA_SEQ_ERROR
-                                              | (1U << 27)    // RX_TIMEOUT
-                                              | (1U << 26)    // RX_OVERFLOW
-                                              | (1U << 25)    // BIT_STUFF_ERROR
-                                              | (1U << 24)    // CRC_ERROR
-                                              | (1U << 23);   // ENDPOINT_ERROR
+            auto const          status    = apply(IsrList);
+            std::uint32_t const sieStatus = apply(read(Regs::SIE_STATUS::FULLREGISTER));
+
+            constexpr std::uint32_t errorMask
+              = Regs::SIE_STATUS::data_seq_error.Mask | Regs::SIE_STATUS::rx_timeout.Mask
+              | Regs::SIE_STATUS::rx_overflow.Mask | Regs::SIE_STATUS::bit_stuff_error.Mask
+              | Regs::SIE_STATUS::crc_error.Mask
+#if __has_include("chip/rp2350.hpp")
+              | Regs::SIE_STATUS::endpoint_error.Mask
+#endif
+              ;
 
 #if __has_include("chip/rp2350.hpp")
             if(std::uint32_t const txError = apply(read(Regs::EP_TX_ERROR::FULLREGISTER))) {
                 KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::epTxError, txError)),
                                    UC_LOG_E,
                                    "USB: EP_TX_ERROR: {}",
-                                   Regs::EP_TX_ERROR{});
+                                   Kvasir::Register::Flags<typename Regs::EP_TX_ERROR>{txError});
                 apply(
                   write(Regs::EP_TX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
             }
@@ -251,7 +259,7 @@ namespace detail {
                 KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::epRxError, rxError)),
                                    UC_LOG_E,
                                    "USB: EP_RX_ERROR: {}",
-                                   Regs::EP_RX_ERROR{});
+                                   Kvasir::Register::Flags<typename Regs::EP_RX_ERROR>{rxError});
                 apply(
                   write(Regs::EP_RX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
             }
@@ -260,9 +268,8 @@ namespace detail {
                 KVASIR_LOG_LIMITED(
                   faultLog_.allow(Kvasir::rateLimitKey(Fault::sieError, sieStatus & errorMask)),
                   UC_LOG_E,
-                  "USB: SIE_STATUS error: {:#010x} {}",
-                  sieStatus & errorMask,
-                  Regs::SIE_STATUS{});
+                  "USB: SIE_STATUS error: {}",
+                  Kvasir::Register::Flags<typename Regs::SIE_STATUS>{sieStatus & errorMask});
                 // Clear error bits (WC - write 1 to clear)
                 apply(write(Regs::SIE_STATUS::FULLREGISTER, sieStatus & errorMask));
             }
@@ -693,6 +700,11 @@ namespace detail {
         }
 
         using Isr = decltype(makeIsr(InterruptIndexes));
+
+        using Provides = brigand::list<Kvasir::Startup::Resource<InstanceTag, 0>>;
+        // The PHY runs from clk_usb at 48 MHz; a ClockSettings that programs it otherwise is
+        // caught here (optional tag: unchecked until the settings declare their clocks).
+        using Claims = Clocks::Claim<Clocks::ClkUsb, 48'000'000>;
 
         static constexpr auto powerClockEnable
           = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::usbctrl));

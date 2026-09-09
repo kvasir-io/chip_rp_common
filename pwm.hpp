@@ -1,11 +1,29 @@
 #pragma once
+#include "Clocks.hpp"
 #include "PinConfig.hpp"
+#include "kvasir/StartUp/Resources.hpp"
 
 #include <cstdint>
 #include <optional>
 #include <utility>
 
 namespace Kvasir { namespace PWM {
+    // Startup resources (kvasir/StartUp/Resources.hpp). A slice has one counter (DIV, TOP)
+    // and two outputs; two peripherals on one slice are fine if they agree on the counter
+    // (pins 0 and 1 at one frequency) and a build error if they do not, and each output
+    // belongs to one peripheral.
+    struct OutputTag {};
+
+    struct SliceTag {
+        static constexpr bool mergeIdentical = true;
+    };
+
+    template<unsigned Slice, bool A>
+    using OutputResource = Startup::Resource<OutputTag, Slice * 2 + (A ? 0 : 1)>;
+
+    template<unsigned Slice, unsigned Div16, unsigned Top>
+    using SliceResource = Startup::Resource<SliceTag, Slice, Div16, Top>;
+
     namespace detail {
 
         template<std::uint32_t ClockSpeed>
@@ -18,6 +36,13 @@ namespace Kvasir { namespace PWM {
         static constexpr std::uint32_t calcTop(std::uint16_t div16,
                                                std::uint32_t frequency) {
             return ((ClockSpeed * 16) / (div16)) / frequency - 1;
+        }
+
+        // Whether a given TOP and frequency need a divider of at least 1.0 (16 in 8.4).
+        template<std::uint32_t ClockSpeed>
+        static constexpr bool div16Reachable(std::uint16_t top,
+                                             std::uint32_t frequency) {
+            return (ClockSpeed * 16) / ((top + 1) * frequency) >= 16;
         }
 
         template<std::uint32_t ClockSpeed>
@@ -235,12 +260,25 @@ namespace Kvasir { namespace PWM {
             }
         }();
 
+        // The frequency has to be reachable from clk_sys with a 16-bit TOP and an 8.4-bit
+        // divider, or with the given TOP a divider of at least 1.0. A static_assert, not an
+        // assert inside the constexpr lambda: that is a no-op under NDEBUG, and the `->` on
+        // an empty optional then fails constant evaluation with a useless message.
+        static_assert(
+          [] {
+              if constexpr(hasTop) {
+                  return detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop)
+                    .has_value();
+              } else {
+                  return detail::div16Reachable<Config::clockSpeed>(Config::top, Config::frequency);
+              }
+          }(),
+          "PWM frequency unreachable from clk_sys: with a 16-bit TOP and an 8.4-bit divider "
+          "(frequency given), or the divider would be below 1.0 (top given)");
+
         static constexpr std::uint16_t InitialTop = []() {
             if constexpr(hasTop) {
-                auto const divTopO
-                  = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop);
-                assert(divTopO.has_value());
-                return divTopO->second;
+                return detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop)->second;
             } else {
                 return Config::top;
             }
@@ -248,16 +286,20 @@ namespace Kvasir { namespace PWM {
 
         static constexpr std::uint16_t InitialDiv16 = []() {
             if constexpr(hasTop) {
-                auto const divTopO
-                  = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop);
-                assert(divTopO.has_value());
-                return divTopO->first;
+                return detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop)->first;
             } else {
                 return detail::calcDiv16<Config::clockSpeed>(Config::top, Config::frequency);
             }
         }();
 
         static constexpr std::uint16_t InitialDuty = Config::initDuty;
+
+        // Startup: this slice's counter as configured, this output, and the clock the
+        // divider is computed from (clk_sys).
+        using Provides
+          = brigand::list<OutputResource<detail::getChannel(Pin{}), detail::isChannelA(Pin{})>,
+                          SliceResource<detail::getChannel(Pin{}), InitialDiv16, InitialTop>>;
+        using Claims = Clocks::Claim<Clocks::ClkSys, Config::clockSpeed>;
 
         static constexpr auto powerClockEnable
           = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::pwm));
@@ -309,6 +351,120 @@ namespace Kvasir { namespace PWM {
         }
     };
 
+    // What a slice counts in counter mode (CSR.DIVMODE): the divider's ticks while the B
+    // input is high, or one per rising or falling edge on it. `free` is the ordinary PWM.
+    enum class CountMode { level, rising, falling };
+
+    // A slice as a counter: its B pin is an input and the 16-bit counter advances by
+    // Config::mode on it (pico-examples' measure_duty_cycle as a Startup-list peripheral).
+    //
+    //   struct DutyCounterConfig {
+    //       static constexpr auto clockSpeed = HW::ClockSpeed;              // clk_sys
+    //       static constexpr auto mode       = Kvasir::PWM::CountMode::level;
+    //       static constexpr auto clockDiv   = 100.0;   // one count per 100 cycles high
+    //   };
+    //   using DutyCounter = Kvasir::PWM::Counter<HW::Pin::pwm_in, DutyCounterConfig>;
+    //
+    // Config (required): clockSpeed, mode. Optional: clockDiv (1.0; 8.4 fixed point), top
+    // (65535), enabled (true). The pin must be a B channel (an odd GPIO): only the B input
+    // reaches the divider. The slice's counter is provided, so an ordinary PWM on the
+    // slice's A pin is a build error.
+    template<typename Pin, typename Config_>
+    struct Counter {
+        struct Config : Config_ {
+            static constexpr double clockDiv = [] {
+                if constexpr(requires { Config_::clockDiv; }) {
+                    return static_cast<double>(Config_::clockDiv);
+                } else {
+                    return 1.0;
+                }
+            }();
+            static constexpr std::uint16_t top = [] {
+                if constexpr(requires { Config_::top; }) {
+                    return static_cast<std::uint16_t>(Config_::top);
+                } else {
+                    return std::uint16_t{65535};
+                }
+            }();
+            static constexpr bool enabled = [] {
+                if constexpr(requires { Config_::enabled; }) {
+                    return static_cast<bool>(Config_::enabled);
+                } else {
+                    return true;
+                }
+            }();
+        };
+
+        static_assert(!detail::isChannelA(Pin{}),
+                      "a PWM counter's input is the slice's B pin (an odd GPIO)");
+        static_assert(Config::clockDiv >= 1.0 && Config::clockDiv < 256.0,
+                      "the PWM divider is 8.4 fixed point: 1.0 to 255.9375");
+
+        static constexpr unsigned Slice = detail::getChannel(Pin{});
+        using Regs                      = Kvasir::Peripheral::PWM::Registers<>::CH<Slice>;
+
+        static constexpr std::uint16_t Div16 = static_cast<std::uint16_t>(Config::clockDiv * 16.0);
+        static constexpr std::uint16_t Top   = Config::top;
+
+        using Provides
+          = brigand::list<OutputResource<Slice, false>, SliceResource<Slice, Div16, Top>>;
+        using Claims = Clocks::Claim<Clocks::ClkSys, Config::clockSpeed>;
+
+        static constexpr auto powerClockEnable
+          = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::pwm));
+
+        // F4 is the PWM function; the pad's input buffer is on by default, and in a gated
+        // mode the slice reads the pin rather than driving it.
+        static constexpr auto initStepPinConfig
+          = list(action(Kvasir::Io::Action::PinFunction<4>{}, Pin{}));
+
+        static constexpr auto modeConfig = [] {
+            if constexpr(Config::mode == CountMode::level) {
+                return write(Regs::CSR::DIVMODEValC::level);
+            } else if constexpr(Config::mode == CountMode::rising) {
+                return write(Regs::CSR::DIVMODEValC::rise);
+            } else {
+                return write(Regs::CSR::DIVMODEValC::fall);
+            }
+        }();
+
+        static constexpr auto initStepPeripheryConfig
+          = list(write(Regs::DIV::div_16, Kvasir::Register::value<Div16>()),
+                 write(Regs::TOP::top, Kvasir::Register::value<Top>()),
+                 write(Regs::CTR::ctr, Kvasir::Register::value<0>()),
+                 modeConfig);
+
+        static constexpr auto initStepPeripheryEnable = [] {
+            if constexpr(Config::enabled) {
+                return list(set(Regs::CSR::en));
+            } else {
+                return list(clear(Regs::CSR::en));
+            }
+        }();
+
+        /// The counter, 0..top.
+        [[nodiscard]] static std::uint16_t count() {
+            return static_cast<std::uint16_t>(get<0>(apply(read(Regs::CTR::ctr))));
+        }
+
+        /// Back to zero. The counter keeps running if it is enabled.
+        static void resetCount() { apply(write(Regs::CTR::ctr, Kvasir::Register::value<0>())); }
+
+        /// Start or stop counting; the count is kept either way.
+        static void setEnabled(bool on) {
+            if(on) {
+                apply(set(Regs::CSR::en));
+            } else {
+                apply(clear(Regs::CSR::en));
+            }
+        }
+
+        /// The rate the counter advances at while its input is high (level mode): clk_sys
+        /// over the divider. For edge modes the count is the number of edges.
+        static constexpr std::uint32_t countRate
+          = static_cast<std::uint32_t>(Config::clockSpeed / Config::clockDiv);
+    };
+
     template<std::size_t Channel, typename Config, typename Callback>
     struct PWM_Timer {
         using Regs = Kvasir::Peripheral::PWM::Registers<>::CH<Channel>;
@@ -351,21 +507,26 @@ namespace Kvasir { namespace PWM {
 
         static constexpr std::uint16_t MinTop = 1;
 
-        static constexpr std::uint16_t InitialTop = []() {
-            auto const divTopO
-              = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop);
-            assert(divTopO.has_value());
-            return divTopO->second;
-        }();
+        static_assert(
+          detail::calcDivAndTop<Config::clockSpeed>(Config::frequency,
+                                                    MinTop)
+            .has_value(),
+          "PWM_Timer frequency unreachable from clk_sys with a 16-bit TOP and an 8.4-bit "
+          "divider");
 
-        static constexpr std::uint16_t InitialDiv16 = []() {
-            auto const divTopO
-              = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop);
-            assert(divTopO.has_value());
-            return divTopO->first;
-        }();
+        static constexpr std::uint16_t InitialTop
+          = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop)->second;
+
+        static constexpr std::uint16_t InitialDiv16
+          = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, MinTop)->first;
 
         static constexpr std::uint16_t InitialDuty = InitialTop;
+
+        // Startup: this slice's counter as configured, output A (whose compare it sets),
+        // and the clock the divider is computed from.
+        using Provides = brigand::list<OutputResource<Channel, true>,
+                                       SliceResource<Channel, InitialDiv16, InitialTop>>;
+        using Claims   = Clocks::Claim<Clocks::ClkSys, Config::clockSpeed>;
 
         static constexpr auto powerClockEnable
           = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::pwm));

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Clocks.hpp"
 #include "DMA.hpp"
 #include "Io.hpp"
 #include "PinConfig.hpp"
@@ -15,6 +16,9 @@
 #include <span>
 
 namespace Kvasir { namespace ADC {
+
+    // Startup resource: the one ADC (kvasir/StartUp/Resources.hpp).
+    struct InstanceTag {};
 
     namespace Detail {
         template<int Pin>
@@ -255,6 +259,11 @@ namespace Kvasir { namespace ADC {
         using Regs            = Kvasir::Peripheral::ADC::Registers<0>;
         using InterruptIndexs = decltype(Traits::ADC::getIsrIndexs());
 
+        // Startup: the ADC, and the clock the sample divider is computed from (clk_adc,
+        // 48 MHz from the USB PLL).
+        using Provides = brigand::list<Startup::Resource<InstanceTag, 0>>;
+        using Claims   = Clocks::Claim<Clocks::ClkAdc, ADCConfig::clockSpeed>;
+
         static constexpr auto DmaTrigger = Traits::ADC::DmaTrigger();
 
         static_assert(Detail::allValidAdcPins(ADCConfig::pins),
@@ -334,7 +343,7 @@ namespace Kvasir { namespace ADC {
         using base = ADCBase<ADCConfig_>;
         using Regs = typename base::Regs;
 
-        static_assert(Dma::numberOfChannels > std::size_t(DmaChannel));
+        using Claims = brigand::append<typename base::Claims, Kvasir::DMA::Claims<Dma, DmaChannel>>;
 
         using DmaCallback_t = Kvasir::StaticFunction<void(std::span<std::uint16_t>),
                                                      base::ADCConfig::callbackFunctionSize>;

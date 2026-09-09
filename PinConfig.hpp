@@ -8,6 +8,32 @@
 namespace Kvasir { namespace PinConfig {
     enum class ChipVariant { RP2040, RP2350A, RP2350B };
 
+    // What differs between the two chip families beyond pins and pin functions, for the
+    // shared drivers to ask instead of assuming the RP2350.
+    constexpr bool isRp2040(ChipVariant c) { return c == ChipVariant::RP2040; }
+
+    constexpr unsigned pioCount(ChipVariant c) { return isRp2040(c) ? 2U : 3U; }
+
+    constexpr unsigned timerCount(ChipVariant c) { return isRp2040(c) ? 1U : 2U; }
+
+    // The GPIO function select of the clock outputs (CLOCKS_GPOUTn).
+    constexpr int gpoutFunction(ChipVariant c) { return isRp2040(c) ? 8 : 9; }
+
+    // Which CLK_GPOUT generator a pin carries, -1 for none. The RP2040 has 21 / 23 / 24 / 25;
+    // the RP2350 adds 13 / 15 (and, on the B variant, 33..37 which are not listed here).
+    constexpr int gpoutOf(ChipVariant c,
+                          int         pin) {
+        switch(pin) {
+        case 21: return 0;
+        case 23: return 1;
+        case 24: return 2;
+        case 25: return 3;
+        case 13: return isRp2040(c) ? -1 : 0;
+        case 15: return isRp2040(c) ? -1 : 1;
+        default: return -1;
+        }
+    }
+
     template<ChipVariant Chip>
     struct ChipTraits;
 

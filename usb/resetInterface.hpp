@@ -52,7 +52,9 @@ private:
         } else if(pkt.bRequest == REQUEST_FLASH) {
             UC_LOG_I("USB: Rebooting to flash");
             if constexpr(!std::is_same_v<BeforeFlashCallback, void>) { BeforeFlashCallback{}(); }
-            apply(Kvasir::SystemControl::SystemReset{});
+            // A chip reboot (pico-sdk's reset interface does the same through
+            // watchdog_reboot): SYSRESETREQ would only warm-reset this core, see reboot().
+            Kvasir::reboot();
             return true;
         }
         return false;

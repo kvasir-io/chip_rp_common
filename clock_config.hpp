@@ -1,4 +1,5 @@
 #pragma once
+#include "Clocks.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/CLOCKS.hpp"
 
@@ -13,11 +14,20 @@
 #if __has_include("peripherals/POWMAN.hpp")
     #include "peripherals/POWMAN.hpp"
 #endif
+#if __has_include("peripherals/VREG_AND_CHIP_RESET.hpp")
+    #include "peripherals/VREG_AND_CHIP_RESET.hpp"
+#endif
 
 #include <cmath>
 #include <cstdint>
 
 namespace Kvasir { namespace DefaultClockSettings {
+    // The clocks coreClockInit below programs, as Startup resources (Clocks.hpp). An
+    // application's ClockSettings opts into the clock check with
+    //     using Provides = Kvasir::DefaultClockSettings::Provides<ClockSpeed, CrystalSpeed>;
+    template<auto ClockSpeed, auto CrystalSpeed>
+    using Provides = Clocks::DefaultProvides<ClockSpeed, CrystalSpeed>;
+
     namespace detail {
         struct PllSettings {
             std::uint32_t fbdiv;
@@ -156,6 +166,31 @@ namespace Kvasir { namespace DefaultClockSettings {
             for(int i = 0; i < 100000; ++i) {
                 if(!apply(read(VREG::update_in_progress))) { break; }
             }
+        }
+#elif __has_include("peripherals/VREG_AND_CHIP_RESET.hpp")
+        // RP2040. Reset value is 1.10 V (vsel 0b01011), the datasheet setting for 133 MHz.
+        // 200 MHz at 1.15 V (0b01100) is the one overclock pico-sdk validates
+        // (SYS_CLK_VREG_VOLTAGE_AUTO_ADJUST); nothing above it is.
+        if constexpr(ClockSpeed > 133'000'000) {
+            static_assert(ClockSpeed <= 200'000'000,
+                          "no validated core voltage for this clock on the RP2040 - extend "
+                          "vregInit together with hardware validation");
+            using VREG = Kvasir::Peripheral::VREG_AND_CHIP_RESET::Registers<>::VREG;
+            using Kvasir::Register::value;
+            constexpr std::uint32_t vsel_1v15 = 0b01100;
+            apply(write(VREG::vsel, value<std::uint32_t, vsel_1v15>()));
+            // The RP2040 regulator has no "update in progress" flag; pico-sdk waits 1 ms.
+            // This runs before the crystal is up, on the ring oscillator at up to ~12 MHz,
+            // so the wait is a counted loop: 12 000 turns of a 1-cycle-ish loop is at
+            // least 1 ms at any ROSC speed, and only a few ms at the slowest.
+            std::uint32_t turns = 12'000;
+            asm volatile(
+              "1:\n"
+              "subs %0, %0, #1\n"
+              "bne 1b\n"
+              : "+l"(turns)
+              :
+              : "cc");
         }
 #else
         static_assert(ClockSpeed <= 150'000'000,

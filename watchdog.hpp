@@ -4,6 +4,7 @@
     #include "peripherals/TICKS.hpp"
 #endif
 
+#include "Clocks.hpp"
 #include "peripherals/WATCHDOG.hpp"
 
 #include <chrono>
@@ -50,10 +51,19 @@ namespace Detail {
     }
 }   // namespace Detail
 
+// Startup resource: the one watchdog (kvasir/StartUp/Resources.hpp).
+struct WatchdogTag {};
+
 template<typename Config>
 struct Watchdog {
     using Regs      = Kvasir::Peripheral::WATCHDOG::Registers<>;
     using TicksRegs = decltype(Detail::getTicksReg());
+
+    // Startup: the watchdog, and the clock its tick generator counts. That is clk_ref (the
+    // crystal), not the core clock: a Config::clockSpeed of the core's speed gives a period
+    // sixteen times too short, and with the clocks declared that is a build error.
+    using Provides = brigand::list<Startup::Resource<WatchdogTag, 0>>;
+    using Claims   = Clocks::Claim<Clocks::ClkRef, Config::clockSpeed>;
 
     static constexpr std::uint64_t TotalCycles{
       static_cast<std::uint64_t>(
@@ -86,12 +96,14 @@ struct Watchdog {
              Kvasir::Register::sequencePoint,
              Detail::getEnableTick<TicksRegs>());
 
-    static constexpr auto initStepPeripheryEnable = list(Regs::CTRL::overrideDefaults(
-      set(Regs::CTRL::enable),
-      set(Regs::CTRL::pause_dbg0),
-      set(Regs::CTRL::pause_dbg1),
-      set(Regs::CTRL::pause_jtag),
-      write(Regs::CTRL::time, Kvasir::Register::value<ReadloadValue>())));
+    // CTRL.TIME is read-only (the live countdown, on the RP2040 as on the RP2350); the counter
+    // is set through LOAD above and by feed(). The pause bits keep the watchdog from firing
+    // while a debugger holds a core.
+    static constexpr auto initStepPeripheryEnable
+      = list(Regs::CTRL::overrideDefaults(set(Regs::CTRL::enable),
+                                          set(Regs::CTRL::pause_dbg0),
+                                          set(Regs::CTRL::pause_dbg1),
+                                          set(Regs::CTRL::pause_jtag)));
 
     static void feed() { apply(write(Regs::LOAD::load, Kvasir::Register::value<ReadloadValue>())); }
 

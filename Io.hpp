@@ -4,6 +4,7 @@
 #include "kvasir/Io/Io.hpp"
 #include "kvasir/Mpl/Utility.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/StartUp/Resources.hpp"
 #include "peripherals/IO_BANK0.hpp"
 #include "peripherals/PADS_BANK0.hpp"
 #include "peripherals/SIO.hpp"
@@ -305,4 +306,47 @@ namespace Kvasir { namespace Io {
                       "only push pull supported");
     };
 
+    // The pins a peripheral configures, derived from what it writes: every pin path above
+    // (and the ADC's) writes IO_BANK0's GPIOn_CTRL, so an action on that register is the
+    // peripheral taking GPIO n. Startup collects these as the peripheral's provided
+    // resources; two peripherals on one pin, or a driver claiming a pin nobody configures,
+    // are then build errors (kvasir/StartUp/Resources.hpp).
+    namespace Detail {
+        using IoBank = Kvasir::Peripheral::IO_BANK0::Registers<>;
+
+        constexpr int gpioOfCtrlAddress(unsigned address) {
+            constexpr unsigned base   = IoBank::baseAddr;
+            constexpr unsigned stride = 8;
+            constexpr unsigned ctrl   = 4;
+            constexpr unsigned pins   = PinConfig::ChipTraits<PinConfig::CurrentChip>::pinCount;
+            if(address < base + ctrl) { return -1; }
+            unsigned const offset = address - base - ctrl;
+            if(offset % stride != 0) { return -1; }
+            if(offset / stride >= pins) { return -1; }
+            return static_cast<int>(offset / stride);
+        }
+
+        static_assert(gpioOfCtrlAddress(IoBank::GPIO<0>::CTRL::Addr::value) == 0);
+        static_assert(gpioOfCtrlAddress(IoBank::GPIO<22>::CTRL::Addr::value) == 22);
+        static_assert(gpioOfCtrlAddress(IoBank::GPIO<22>::STATUS::Addr::value) == -1);
+    }   // namespace Detail
 }}   // namespace Kvasir::Io
+
+namespace Kvasir { namespace Startup {
+    template<unsigned Addr,
+             unsigned Z,
+             unsigned O,
+             typename RegType,
+             typename Mode,
+             unsigned Mask,
+             typename Access,
+             typename FieldType,
+             typename TAction>
+        requires(Io::Detail::gpioOfCtrlAddress(Addr) >= 0)
+    struct ResourceOfAction<Register::Action<
+      Register::
+        FieldLocation<Register::Address<Addr, Z, O, RegType, Mode>, Mask, Access, FieldType>,
+      TAction>> {
+        using type = brigand::list<Io::PinResource<0, Io::Detail::gpioOfCtrlAddress(Addr)>>;
+    };
+}}   // namespace Kvasir::Startup

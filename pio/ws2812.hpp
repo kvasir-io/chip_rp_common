@@ -1,4 +1,5 @@
 #pragma once
+#include "chip/rp_common/Clocks.hpp"
 #include "chip/rp_common/PIO.hpp"
 #include "ws2812Pio/ws2812.hpp"
 
@@ -14,7 +15,7 @@ namespace Kvasir { namespace Pio {
     ///   PioInstance    (required) 0 or 1
     ///   SmInstance     (required) 0..3
     ///   LedClockSpeed  (default 800000) bit rate on the wire
-    ///   ProgrammOffset (default 0)      where the program is loaded in instruction memory
+    ///   ProgramOffset  (default 0)      where the program is loaded in instruction memory
     ///   ResetTime      (default 60us)   line-low time that latches a frame.
     ///                                   WS2812/WS2812B want >=50us, but several parts in
     ///                                   this family specify more -- the Wuerth WL-ICLED
@@ -41,8 +42,10 @@ namespace Kvasir { namespace Pio {
                     return 800000;
                 }
             }();
-            static constexpr auto ProgrammOffset = [] {
-                if constexpr(requires { Config_::ProgrammOffset; }) {
+            static constexpr auto ProgramOffset = [] {
+                if constexpr(requires { Config_::ProgramOffset; }) {
+                    return Config_::ProgramOffset;
+                } else if constexpr(requires { Config_::ProgrammOffset; }) {   // the old spelling
                     return Config_::ProgrammOffset;
                 } else {
                     return 0;
@@ -58,6 +61,13 @@ namespace Kvasir { namespace Pio {
         };
 
         using Programm = Pio::ws2812Programm;
+
+        // Startup: the state machine and instruction slots the program occupies, the DMA
+        // channel, and the clock the divider below is computed from.
+        using Provides = Kvasir::Pio::
+          Provides<Config::PioInstance, Config::SmInstance, Config::ProgramOffset, Programm>;
+        using Claims = brigand::append<Kvasir::DMA::Claims<Dma, DmaChannel>,
+                                       Clocks::Claim<Clocks::ClkSys, Config::ClockSpeed>>;
 
         static constexpr double DivFactor{
           double{Config::ClockSpeed}
@@ -122,9 +132,9 @@ namespace Kvasir { namespace Pio {
 
                  SmRegs::EXECCTRL::overrideDefaults(
                    write(SmRegs::EXECCTRL::wrap_bottom,
-                         Kvasir::Register::value<Programm::WrapTarget + Config::ProgrammOffset>()),
+                         Kvasir::Register::value<Programm::WrapTarget + Config::ProgramOffset>()),
                    write(SmRegs::EXECCTRL::wrap_top,
-                         Kvasir::Register::value<Programm::Wrap + Config::ProgrammOffset>())),
+                         Kvasir::Register::value<Programm::Wrap + Config::ProgramOffset>())),
 
                  clear(SmRegs::SHIFTCTRL::fjoin_rx),
                  write(SmRegs::SHIFTCTRL::fjoin_tx, Kvasir::Register::value<1>()),
@@ -136,10 +146,8 @@ namespace Kvasir { namespace Pio {
                  write(SmRegs::SHIFTCTRL::autopush, Kvasir::Register::value<0>()));
 
         static void preEnableRuntimeInit() {
-            static_assert(32 >= Config::ProgrammOffset + Programm::Instructions.size(),
-                          "to many Instructions");
             for(std::uint16_t volatile* addr = reinterpret_cast<std::uint16_t volatile*>(
-                  PioRegs::template INSTR_MEM<Config::ProgrammOffset>::Addr::value);
+                  PioRegs::template INSTR_MEM<Config::ProgramOffset>::Addr::value);
                 auto v : Programm::Instructions)
             {
                 *addr = v;
@@ -173,7 +181,7 @@ namespace Kvasir { namespace Pio {
           = list(write(PioRegs::CTRL::sm_restart, Kvasir::Register::value<SmMask>()),
                  write(PioRegs::CTRL::clkdiv_restart, Kvasir::Register::value<SmMask>()),
                  //JUMP to programm
-                 write(SmRegs::INSTR::instr, Kvasir::Register::value<Config::ProgrammOffset>()));
+                 write(SmRegs::INSTR::instr, Kvasir::Register::value<Config::ProgramOffset>()));
 
         static void runtimeInit() {
             auto const enabled = get<0>(apply(read(PioRegs::CTRL::sm_enable)));

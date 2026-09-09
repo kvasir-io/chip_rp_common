@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Clocks.hpp"
 #include "DMA.hpp"
 #include "Io.hpp"
 #include "PinConfig.hpp"
@@ -12,6 +13,10 @@
 #include <span>
 
 namespace Kvasir { namespace SPI {
+
+    // Startup resource: the SPI block itself. Two drivers on one instance would each
+    // configure it (kvasir/StartUp/Resources.hpp).
+    struct InstanceTag {};
 
     enum class Mode {
         _0,   //CPOL0_CPHA0
@@ -339,6 +344,11 @@ namespace Kvasir { namespace SPI {
 
         using InterruptIndexs = decltype(Traits::SPI::getIsrIndexs<Instance>());
 
+        // Startup: this block, and the clock the baud divisor is computed from (the PL022
+        // counts clk_peri).
+        using Provides = brigand::list<Startup::Resource<InstanceTag, Instance>>;
+        using Claims   = Clocks::Claim<Clocks::ClkPeri, SPIConfig::clockSpeed>;
+
         using Config = Detail::Config<Instance>;
 
         static constexpr auto RxDmaTrigger = Traits::SPI::DmaRX_Trigger<Instance>();
@@ -449,6 +459,9 @@ namespace Kvasir { namespace SPI {
         static constexpr auto DmaChannelA = DMAConfig::ChannelA;
         static constexpr auto DmaChannelB = DMAConfig::ChannelB;
         static constexpr auto DmaPriority = DMAConfig::Priority;
+
+        using Claims = brigand::append<typename base::Claims,
+                                       Kvasir::DMA::Claims<Dma, DmaChannelA, DmaChannelB>>;
 
         enum class OperationState { succeeded, failed, ongoing };
 
