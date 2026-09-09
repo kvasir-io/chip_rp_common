@@ -2,6 +2,7 @@
 #include "PinConfig.hpp"
 #include "kvasir/StartUp/Resources.hpp"
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,98 @@ namespace Kvasir { namespace Pio {
     template<unsigned Instance, unsigned Slot, unsigned long long ProgramId>
     using InstructionResource = Startup::Resource<InstructionTag, Instance * 32 + Slot, ProgramId>;
 
+    // ---- the instance's GPIO window (GPIOBASE) -------------------------------------------
+    // A state machine names a pin in five bits - PINCTRL's four bases and EXECCTRL's jmp_pin
+    // - so it reaches 32 GPIOs, and GPIOBASE says which 32: it relocates the instance's GPIO
+    // 0 in the system numbering. Only 0 and 16 are supported, so the RP2350B's GPIO 32..47
+    // are reachable only from window 16, and a pin below 16 is not reachable from it at all.
+    //
+    // Without this the pin number was written into the field as it stood and a GPIO above 31
+    // silently lost its top bits, pointing the machine at a pad 32 lower. Register::write now
+    // refuses the literal, and a driver maps every pin through `pinIndex` instead.
+    //
+    // GPIOBASE belongs to the whole instance - all four machines, every mapping - so a driver
+    // *provides* the window it needs (GpioBaseResource, appended by `Provides` below). Two
+    // drivers that share an instance and disagree are then a build error rather than one of
+    // them driving the wrong pad. A driver whose pins all sit in 16..31 fits either window
+    // and derives 0; sharing an instance with a driver that needs 16 is what
+    // `static constexpr unsigned GpioBase = 16;` in its config is for.
+    struct GpioBaseTag {
+        static constexpr bool coreLocal      = false;
+        static constexpr bool mergeIdentical = true;
+    };
+
+    template<unsigned Instance, unsigned Base>
+    using GpioBaseResource = Startup::Resource<GpioBaseTag, Instance, Base>;
+
+    /// The window a set of GPIOs needs: 16 as soon as one of them is above 31, else 0.
+    template<std::size_t N>
+    constexpr unsigned gpioBaseFor(std::array<unsigned,
+                                              N> const& pins) {
+        for(auto const p : pins) {
+            if(p >= 32) { return 16U; }
+        }
+        return 0U;
+    }
+
+    /// Whether every one of `pins` is reachable from `base`.
+    template<std::size_t N>
+    constexpr bool pinsInWindow(std::array<unsigned,
+                                           N> const& pins,
+                                unsigned             base) {
+        for(auto const p : pins) {
+            if(p < base || p - base >= 32) { return false; }
+        }
+        return true;
+    }
+
+    /// A GPIO as the state machine names it.
+    constexpr unsigned pinIndex(unsigned pin,
+                                unsigned base) {
+        return pin - base;
+    }
+
+    /// Program the instance's window. Called from a driver's `preEnableRuntimeInit`, which is
+    /// after `initStepPeripheryConfig` and before `initStepPeripheryEnable` (StartUp.hpp), so
+    /// no machine on the instance is running yet - that, not the write order, is what makes
+    /// this safe. EXECCTRL's jmp_pin is in fact written one phase *earlier*, and PINCTRL's
+    /// bases in this one after this call: a base is a latched number the machine reads only
+    /// while it executes, so when it is written relative to this does not matter, only that
+    /// nothing has executed in between. Every driver on the instance writes the same value
+    /// here, which the resource above is what guarantees.
+    // Not `static`: internal linkage would let clang prove the definition dead in every
+    // translation unit that includes this header without a PIO driver in it, which is
+    // -Wunused-template on almost every one of them (`gpioBaseFor` and `pinsInWindow` above
+    // are non-static for the same reason).
+    template<unsigned Instance,
+             unsigned Base>
+    void applyGpioBase() {
+        static_assert(Base == 0 || Base == 16,
+                      "GPIOBASE is 0 or 16: only bit 4 of the register is writable");
+        using Regs = Kvasir::Peripheral::PIO::Registers<Instance>;
+        if constexpr(requires { Regs::GPIOBASE::gpiobase; }) {
+            apply(write(Regs::GPIOBASE::gpiobase, Kvasir::Register::value<Base / 16U>()));
+        } else {
+            static_assert(Base == 0,
+                          "this chip's PIO has no GPIOBASE: a state machine reaches GPIO "
+                          "0..31 only");
+        }
+    }
+
+    template<unsigned Instance>
+    static constexpr auto getEnable() {
+        static_assert(Instance < PinConfig::pioCount(PinConfig::CurrentChip),
+                      "the RP2350 has PIO0..PIO2, the RP2040 PIO0 and PIO1");
+        using Reset = typename Peripheral::RESETS::Registers<Instance * 0>::RESET;
+        if constexpr(Instance == 0) {
+            return clear(Reset::pio0);
+        } else if constexpr(Instance == 1) {
+            return clear(Reset::pio1);
+        } else {
+            return clear(Reset::pio2);
+        }
+    }
+
     // A program's identity for the resource check: FNV-1a over its instructions and wrap
     // points. Two programs with the same words at the same offset are the same program.
     template<typename Program>
@@ -57,7 +150,11 @@ namespace Kvasir { namespace Pio {
         };
     }   // namespace Detail
 
-    template<unsigned Instance, unsigned Sm, unsigned Offset, typename Program>
+    template<unsigned Instance,
+             unsigned Sm,
+             unsigned Offset,
+             typename Program,
+             unsigned GpioBase = 0>
     struct ProvidesFor {
         static constexpr std::size_t Length = Program::Instructions.size();
         static_assert(Instance < PinConfig::pioCount(PinConfig::CurrentChip),
@@ -67,17 +164,21 @@ namespace Kvasir { namespace Pio {
         static_assert(Offset + Length <= 32,
                       "a PIO program must fit the instance's 32 instruction slots from its "
                       "offset");
-        using type
-          = brigand::append<brigand::list<SmResource<Instance, Sm>>,
-                            typename Detail::Instructions<Instance,
-                                                          Offset,
-                                                          programId<Program>(),
-                                                          std::make_index_sequence<Length>>::type>;
+        using type = brigand::append<
+          brigand::list<SmResource<Instance, Sm>, GpioBaseResource<Instance, GpioBase>>,
+          typename Detail::Instructions<Instance,
+                                        Offset,
+                                        programId<Program>(),
+                                        std::make_index_sequence<Length>>::type>;
     };
 
-    // `using Provides = Kvasir::Pio::Provides<Instance, Sm, Offset, Program>;`
-    template<unsigned Instance, unsigned Sm, unsigned Offset, typename Program>
-    using Provides = typename ProvidesFor<Instance, Sm, Offset, Program>::type;
+    // `using Provides = Kvasir::Pio::Provides<Instance, Sm, Offset, Program, GpioBase>;`
+    template<unsigned Instance,
+             unsigned Sm,
+             unsigned Offset,
+             typename Program,
+             unsigned GpioBase = 0>
+    using Provides = typename ProvidesFor<Instance, Sm, Offset, Program, GpioBase>::type;
 
     // One of an instance's two interrupt lines (PIO0_IRQ_0 / _1 ...), for Pio::Irq.
     struct LineTag {};
@@ -90,20 +191,6 @@ namespace Kvasir { namespace Pio {
     constexpr int pinFunction = Instance == 0 ? 6
                               : Instance == 1 ? 7
                                               : 8;
-
-    template<unsigned Instance>
-    static constexpr auto getEnable() {
-        static_assert(Instance < PinConfig::pioCount(PinConfig::CurrentChip),
-                      "the RP2350 has PIO0..PIO2, the RP2040 PIO0 and PIO1");
-        using Reset = typename Peripheral::RESETS::Registers<Instance * 0>::RESET;
-        if constexpr(Instance == 0) {
-            return clear(Reset::pio0);
-        } else if constexpr(Instance == 1) {
-            return clear(Reset::pio1);
-        } else {
-            return clear(Reset::pio2);
-        }
-    }
 
     template<unsigned Instance,
              typename Pin>

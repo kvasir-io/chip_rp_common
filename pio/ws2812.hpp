@@ -3,6 +3,7 @@
 #include "chip/rp_common/PIO.hpp"
 #include "ws2812Pio/ws2812.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <span>
@@ -16,6 +17,9 @@ namespace Kvasir { namespace Pio {
     ///   SmInstance     (required) 0..3
     ///   LedClockSpeed  (default 800000) bit rate on the wire
     ///   ProgramOffset  (default 0)      where the program is loaded in instruction memory
+    ///   GpioBase       (derived)        the instance's GPIO window, 0 or 16 (PIO.hpp).
+    ///                                   Derived from Pin; name it only to agree with
+    ///                                   another driver on the same PIO instance.
     ///   ResetTime      (default 60us)   line-low time that latches a frame.
     ///                                   WS2812/WS2812B want >=50us, but several parts in
     ///                                   this family specify more -- the Wuerth WL-ICLED
@@ -34,6 +38,11 @@ namespace Kvasir { namespace Pio {
              typename Dma::Priority DmaPriority,
              typename Config_>
     struct WS2812 {
+        static constexpr unsigned PinNumber
+          = []<int Port, int PinN>(Kvasir::Register::PinLocation<Port, PinN>) {
+                return static_cast<unsigned>(PinN);
+            }(Pin{});
+
         struct Config : Config_ {
             static constexpr auto LedClockSpeed = [] {
                 if constexpr(requires { Config_::LedClockSpeed; }) {
@@ -58,16 +67,35 @@ namespace Kvasir { namespace Pio {
                     return std::chrono::microseconds{60};
                 }
             }();
+            static constexpr unsigned GpioBase = [] {
+                if constexpr(requires { Config_::GpioBase; }) {
+                    return static_cast<unsigned>(Config_::GpioBase);
+                } else {
+                    return Kvasir::Pio::gpioBaseFor(std::array{PinNumber});
+                }
+            }();
         };
 
         using Programm = Pio::ws2812Programm;
 
-        // Startup: the state machine and instruction slots the program occupies, the DMA
-        // channel, and the clock the divider below is computed from.
-        using Provides = Kvasir::Pio::
-          Provides<Config::PioInstance, Config::SmInstance, Config::ProgramOffset, Programm>;
-        using Claims = brigand::append<Kvasir::DMA::Claims<Dma, DmaChannel>,
-                                       Clocks::Claim<Clocks::ClkSys, Config::ClockSpeed>>;
+        // The pin as the state machine names it: PINCTRL's bases are five bits wide and
+        // count from the instance's GPIOBASE, not from GPIO 0 (PIO.hpp).
+        static_assert(Kvasir::Pio::pinsInWindow(std::array{PinNumber},
+                                                Config::GpioBase),
+                      "the LED's GPIO is not reachable from this PIO instance's GPIO window: "
+                      "a state machine sees 32 pins from GpioBase (0 or 16)");
+        static constexpr unsigned PinIndex = Kvasir::Pio::pinIndex(PinNumber, Config::GpioBase);
+
+        // Startup: the state machine and instruction slots the program occupies, the GPIO
+        // window it needs of its instance, the DMA channel, and the clock the divider below
+        // is computed from.
+        using Provides = Kvasir::Pio::Provides<Config::PioInstance,
+                                               Config::SmInstance,
+                                               Config::ProgramOffset,
+                                               Programm,
+                                               Config::GpioBase>;
+        using Claims   = brigand::append<Kvasir::DMA::Claims<Dma, DmaChannel>,
+                                         Clocks::Claim<Clocks::ClkSys, Config::ClockSpeed>>;
 
         static constexpr double DivFactor{
           double{Config::ClockSpeed}
@@ -154,13 +182,10 @@ namespace Kvasir { namespace Pio {
                 ++addr;
                 ++addr;
             }
-            static constexpr auto PinNumber
-              = []<int Port, int PinN>(Kvasir::Register::PinLocation<Port, PinN>) {
-                    return PinN;
-                }(Pin{});
+            Kvasir::Pio::applyGpioBase<Config::PioInstance, Config::GpioBase>();
 
             apply(SmRegs::PINCTRL::overrideDefaults(
-              write(SmRegs::PINCTRL::set_base, Kvasir::Register::value<PinNumber>()),
+              write(SmRegs::PINCTRL::set_base, Kvasir::Register::value<PinIndex>()),
               write(SmRegs::PINCTRL::set_count, Kvasir::Register::value<1>())));
 
             apply(write(SmRegs::INSTR::instr, Kvasir::Register::value<0xe000 | (4 << 5) | 0x1f>()));
@@ -168,7 +193,7 @@ namespace Kvasir { namespace Pio {
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::sideset_count, Kvasir::Register::value<1>()),
               write(SmRegs::PINCTRL::set_count, Kvasir::Register::value<0>()),
-              write(SmRegs::PINCTRL::sideset_base, Kvasir::Register::value<PinNumber>())));
+              write(SmRegs::PINCTRL::sideset_base, Kvasir::Register::value<PinIndex>())));
         }
 
         // sm_restart and clkdiv_restart are self-clearing one-shot fields, so writing a

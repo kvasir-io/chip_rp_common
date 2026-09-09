@@ -4,6 +4,7 @@
 #include "PIO.hpp"
 #include "kvasir/Register/Register.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -26,6 +27,10 @@
 //
 // Optional config, with defaults:
 //   ProgramOffset (0), clockDiv (1.0; 16.8, the machine runs at ClockSpeed / clockDiv)
+//   GpioBase      (derived)    the instance's GPIO window, 0 or 16 (PIO.hpp): a machine
+//                              names 32 pins counted from it, so the RP2350B's GPIO 32..47
+//                              need 16. Derived from this machine's pins; name it only to
+//                              agree with another driver on the same PIO instance
 //   setPins, outPins, sidesetPins, inPins (empty brigand::lists): consecutive GPIOs, the
 //                              first is the mapping's base; set/out/side-set pins become
 //                              outputs, in pins inputs, all get this PIO's function
@@ -79,6 +84,24 @@ namespace Kvasir { namespace Pio {
 
             static constexpr bool ok = consecutive();
         };
+
+        // Every pin of a mapping list, as GPIO numbers, for the window checks.
+        template<typename List>
+        struct PinNumbers;
+
+        template<typename... Ps>
+        struct PinNumbers<brigand::list<Ps...>> {
+            static constexpr std::array<unsigned, sizeof...(Ps)> value{
+              static_cast<unsigned>(pinNumber(Ps{}))...};
+        };
+
+        // A mapping's base as the state machine names it. An empty mapping keeps 0: its
+        // count is 0, so the base is never used, and subtracting the window from a base
+        // that is not a pin would underflow.
+        template<typename Range>
+        constexpr unsigned mappedBase(unsigned gpioBase) {
+            return Range::count == 0 ? 0U : static_cast<unsigned>(Range::base) - gpioBase;
+        }
 
         // The elements of List that are not in Other.
         template<typename List, typename Other>
@@ -321,6 +344,23 @@ namespace Kvasir { namespace Pio {
                           std::remove_cvref_t<decltype(Config::jmpPin)>>>::type;
         using AllPins = typename detail::Unique<brigand::append<OutputPins, InputPins>>::type;
 
+        // The instance's GPIO window: a machine names 32 pins counted from it, so a pin above
+        // 31 needs 16 (PIO.hpp). Derived from this machine's own pins unless the config pins
+        // it, which is how two drivers on one instance are made to agree.
+        static constexpr unsigned GpioBase = [] {
+            if constexpr(requires { Config::GpioBase; }) {
+                return static_cast<unsigned>(Config::GpioBase);
+            } else {
+                return Kvasir::Pio::gpioBaseFor(detail::PinNumbers<AllPins>::value);
+            }
+        }();
+
+        static_assert(Kvasir::Pio::pinsInWindow(detail::PinNumbers<AllPins>::value,
+                                                GpioBase),
+                      "a pin of this state machine is not reachable from the PIO instance's "
+                      "GPIO window: a machine sees 32 pins from GpioBase (0 or 16), so one "
+                      "below 16 and one above 31 cannot be driven by the same instance");
+
         using PioRegs = Kvasir::Peripheral::PIO::Registers<Instance>;
         using SmRegs  = typename PioRegs::template SM<Sm>;
 
@@ -341,8 +381,9 @@ namespace Kvasir { namespace Pio {
         static constexpr std::uint32_t SmMask = 1U << Sm;
 
         // Startup: the state machine, the instruction slots (tagged with the program, so two
-        // machines on one program share them), the pins, the clock.
-        using Provides = Kvasir::Pio::Provides<Instance, Sm, Offset, Program>;
+        // machines on one program share them), the instance's GPIO window, the pins, the
+        // clock.
+        using Provides = Kvasir::Pio::Provides<Instance, Sm, Offset, Program, GpioBase>;
         using Claims   = Clocks::Claim<Clocks::ClkSys, Config::ClockSpeed>;
 
         static constexpr auto powerClockEnable = list(Kvasir::Pio::getEnable<Instance>());
@@ -382,7 +423,7 @@ namespace Kvasir { namespace Pio {
             write(SmRegs::EXECCTRL::side_en, Register::value<Config::sidesetOptional ? 1 : 0>()),
             write(SmRegs::EXECCTRL::side_pindir, Register::value<Config::sidesetPindirs ? 1 : 0>()),
             write(SmRegs::EXECCTRL::jmp_pin,
-                  Register::value<static_cast<unsigned>(JmpPin::base)>()),
+                  Register::value<detail::mappedBase<JmpPin>(GpioBase)>()),
             write(SmRegs::EXECCTRL::out_sticky, Register::value<Config::outSticky ? 1 : 0>()),
             write(SmRegs::EXECCTRL::status_sel,
                   Register::value<typename SmRegs::EXECCTRL::STATUS_SELVal,
@@ -409,7 +450,8 @@ namespace Kvasir { namespace Pio {
         template<typename Pin>
         static void setPinDir(Pin,
                               bool out) {
-            constexpr auto n = static_cast<unsigned>(detail::pinNumber(Pin{}));
+            constexpr auto n
+              = Kvasir::Pio::pinIndex(static_cast<unsigned>(detail::pinNumber(Pin{})), GpioBase);
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::set_base, Register::value<n>()),
               write(SmRegs::PINCTRL::set_count, Register::value<1>())));
@@ -419,7 +461,8 @@ namespace Kvasir { namespace Pio {
         template<typename Pin>
         static void setPinLevel(Pin,
                                 bool high) {
-            constexpr auto n = static_cast<unsigned>(detail::pinNumber(Pin{}));
+            constexpr auto n
+              = Kvasir::Pio::pinIndex(static_cast<unsigned>(detail::pinNumber(Pin{})), GpioBase);
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::set_base, Register::value<n>()),
               write(SmRegs::PINCTRL::set_count, Register::value<1>())));
@@ -443,6 +486,10 @@ namespace Kvasir { namespace Pio {
         // Load the program and fix the pin levels and directions, before the machine is
         // enabled. The level first, so a pin that idles high never shows a low.
         static void preEnableRuntimeInit() {
+            // Before any mapping is written and while no machine on the instance runs: every
+            // base below counts from this window.
+            Kvasir::Pio::applyGpioBase<Instance, GpioBase>();
+
             auto* addr = reinterpret_cast<std::uint16_t volatile*>(
               PioRegs::template INSTR_MEM<Offset>::Addr::value);
             for(auto const v : Program::Instructions) {
@@ -456,20 +503,20 @@ namespace Kvasir { namespace Pio {
 
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::set_base,
-                    Register::value<static_cast<unsigned>(SetPins::base)>()),
+                    Register::value<detail::mappedBase<SetPins>(GpioBase)>()),
               write(SmRegs::PINCTRL::set_count,
                     Register::value<static_cast<unsigned>(SetPins::count)>()),
               write(SmRegs::PINCTRL::out_base,
-                    Register::value<static_cast<unsigned>(OutPins::base)>()),
+                    Register::value<detail::mappedBase<OutPins>(GpioBase)>()),
               write(SmRegs::PINCTRL::out_count,
                     Register::value<static_cast<unsigned>(OutPins::count)>()),
               write(SmRegs::PINCTRL::sideset_base,
-                    Register::value<static_cast<unsigned>(SidePins::base)>()),
+                    Register::value<detail::mappedBase<SidePins>(GpioBase)>()),
               write(SmRegs::PINCTRL::sideset_count,
                     Register::value<static_cast<unsigned>(SidePins::count)
                                     + (Config::sidesetOptional ? 1U : 0U)>()),
               write(SmRegs::PINCTRL::in_base,
-                    Register::value<static_cast<unsigned>(InPins::base)>())));
+                    Register::value<detail::mappedBase<InPins>(GpioBase)>())));
         }
 
         // Jump to the program's first instruction. The restart bits and sm_enable live in
