@@ -485,6 +485,25 @@ namespace Kvasir { namespace Pio {
     public:
         // Load the program and fix the pin levels and directions, before the machine is
         // enabled. The level first, so a pin that idles high never shows a low.
+        // JMP targets are absolute instruction addresses, so a program loaded at a non-zero
+        // offset needs them relocated. JMP is opcode 000 in bits 15:13, target in bits 4:0;
+        // no other instruction carries an address.
+        static constexpr auto RelocatedInstructions = [] {
+            auto instructions = Program::Instructions;
+            for(auto& i : instructions) {
+                if((i >> 13U) == 0U) {
+                    auto const target = static_cast<std::uint16_t>(((i & 0x1FU) + Offset) & 0x1FU);
+                    i = static_cast<std::uint16_t>((i & static_cast<std::uint16_t>(~0x1FU))
+                                                   | target);
+                }
+            }
+            return instructions;
+        }();
+
+        static_assert(Offset + Program::Instructions.size() <= 32,
+                      "the program does not fit in instruction memory at this ProgramOffset: a "
+                      "PIO instance has 32 slots and a JMP target is five bits");
+
         static void preEnableRuntimeInit() {
             // Before any mapping is written and while no machine on the instance runs: every
             // base below counts from this window.
@@ -492,7 +511,7 @@ namespace Kvasir { namespace Pio {
 
             auto* addr = reinterpret_cast<std::uint16_t volatile*>(
               PioRegs::template INSTR_MEM<Offset>::Addr::value);
-            for(auto const v : Program::Instructions) {
+            for(auto const v : RelocatedInstructions) {
                 *addr = v;
                 addr += 2;   // one 32-bit register per instruction slot
             }

@@ -231,6 +231,22 @@ namespace Kvasir { namespace I2C {
                 return set(Peripheral::RESETS::Registers<>::RESET::i2c1);
             }
         }
+
+        template<unsigned Instance>
+        static constexpr auto getResetDoneBit() {
+            static_assert(Instance < 2, "I2C Instance must be 0 or 1");
+            if constexpr(Instance == 0) {
+                return Peripheral::RESETS::Registers<>::RESET_DONE::i2c0;
+            } else {
+                return Peripheral::RESETS::Registers<>::RESET_DONE::i2c1;
+            }
+        }
+
+        /// Registers written before RESET_DONE is set are silently dropped, so wait for it.
+        template<unsigned Instance>
+        inline void waitResetDone() {
+            while(get<0>(apply(read(getResetDoneBit<Instance>()))) == 0) {}
+        }
     }}   // namespace Traits::I2C
 
     namespace Detail {
@@ -438,6 +454,7 @@ namespace Kvasir { namespace I2C {
             operationState_.store(OperationState::succeeded, std::memory_order_relaxed);
             apply(Traits::I2C::getDisable<base::Instance>());
             apply(base::powerClockEnable);
+            Traits::I2C::waitResetDone<base::Instance>();
             apply(base::initStepPeripheryConfig);
             apply(base::initStepInterruptConfig);
             apply(base::initStepPeripheryEnable);

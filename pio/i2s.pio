@@ -1,0 +1,62 @@
+; I2S transmit, master and slave.
+;
+; Philips I2S, 16 bits a slot, two slots a frame: one 32-bit FIFO word is a frame, left slot
+; in the high half. Shift left with a 32-bit threshold so the MSB leaves first.
+;
+; The format's one-BCLK delay is in the encoding: the master moves LRCK one bit period early,
+; the slave waits one rising edge after the LRCK edge.
+
+; ---------------------------------------------------------------------------------------
+; Master: side-set bit 0 is BCLK, bit 1 is LRCK, so the clock pins are consecutive with BCLK
+; the base. Data changes while BCLK is low, the receiver samples on the rising edge.
+;
+; Two cycles a bit, 32 bits a frame, so the state machine runs at 64 * the sample rate.
+; Side-set is applied even when an instruction stalls, so an underrun holds the last sample
+; instead of breaking the frame.
+.program i2s_out_master
+.side_set 2
+
+; Seed the bit counter once, outside the wrap, with both clocks idle low.
+    set x, 14          side 0b00
+.wrap_target
+leftbit:
+    out pins, 1        side 0b00      ; BCLK low, LRCK low: drive a left bit
+    jmp x-- leftbit     side 0b01      ; BCLK high: the receiver takes it
+    out pins, 1        side 0b10      ; the 16th left bit, and LRCK goes high one bit early
+    set x, 14          side 0b11
+rightbit:
+    out pins, 1        side 0b10      ; BCLK low, LRCK high
+    jmp x-- rightbit     side 0b11
+    out pins, 1        side 0b00      ; the 16th right bit, and LRCK goes low again
+    set x, 14          side 0b01
+.wrap
+
+; ---------------------------------------------------------------------------------------
+; Slave: the codec drives BCLK and LRCK and this follows them.
+;
+; `wait ... pin N` is relative to the IN base, so the base is BCLK and pin 1 is LRCK -- the
+; same two consecutive pins the master program side-sets. Every edge comes from outside, so
+; the divider only has to be fast enough to keep up.
+.program i2s_out_slave
+
+; Find a frame boundary once; LRCK keeps us in step from there on.
+    wait 1 pin 1
+.wrap_target
+    pull                              ; a frame is one 32-bit word
+    wait 0 pin 1                      ; LRCK falls: the left slot begins
+    wait 1 pin 0                      ; let one BCLK pass -- the I2S one-bit delay
+    set x, 15
+left_loop:
+    wait 0 pin 0                      ; BCLK falls: safe to change the data
+    out pins, 1
+    wait 1 pin 0                      ; BCLK rises: the codec samples it
+    jmp x-- left_loop
+    wait 1 pin 1                      ; LRCK rises: the right slot
+    wait 1 pin 0
+    set x, 15
+right_loop:
+    wait 0 pin 0
+    out pins, 1
+    wait 1 pin 0
+    jmp x-- right_loop
+.wrap

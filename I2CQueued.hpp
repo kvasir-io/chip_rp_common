@@ -6,7 +6,9 @@
 #include "kvasir/Util/RateLimiter.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 
+#include <limits>
 #include <span>
+#include <string_view>
 
 namespace Kvasir { namespace I2C {
 
@@ -24,12 +26,17 @@ namespace Kvasir { namespace I2C {
     struct I2CBehaviorQueued : Detail::I2CBase<I2CConfig> {
         static constexpr std::size_t QueueDepth   = QueueDepth_;
         static constexpr std::size_t CallbackSize = CallbackSize_;
-        using base                                = Detail::I2CBase<I2CConfig>;
-        using Regs                                = typename base::Regs;
-        using tp                                  = typename Clock::time_point;
-        using Request                             = I2CRequest<CallbackSize>;
-        using Result                              = I2CRequestResult;
-        using Recovery                            = I2CBusRecovery<I2CConfig, Clock>;
+        /// Re-exported from the config so a bus can size its traffic against the bandwidth.
+        static constexpr auto BaudRate = I2CConfig::baudRate;
+        using base                     = Detail::I2CBase<I2CConfig>;
+        using Regs                     = typename base::Regs;
+        using tp                       = typename Clock::time_point;
+        using Request                  = I2CRequest<CallbackSize>;
+        using Result                   = I2CRequestResult;
+        using Recovery                 = I2CBusRecovery<I2CConfig, Clock>;
+
+        /// Failures in an unbroken row that mean the bus is dead; any success resets it.
+        static constexpr std::uint32_t kDeadBusFailures = 40;
 
         enum class State { idle, sending, receiving };
 
@@ -37,10 +44,14 @@ namespace Kvasir { namespace I2C {
         inline static Request                                    currentRequest_{};
         inline static bool                                       active_{false};
         inline static State                                      state_{State::idle};
-        inline static std::uint8_t                               sendIndex_{0};
-        inline static std::uint8_t                               receivedCount_{0};
-        inline static bool                                       stop{false};
-        inline static tp                                         timeoutTime_{};
+        // std::size_t: a request's spans are not capped at 255 bytes.
+        inline static std::size_t sendIndex_{0};
+        inline static std::size_t receivedCount_{0};
+        inline static bool        stop{false};
+        inline static tp          timeoutTime_{};
+        // Dead-bus watchdog state.
+        inline static std::uint32_t consecutiveFailures_{};
+        inline static std::uint32_t resuscitations_{};
         // Fault logging goes through this: a bad bus faults on every transaction.
         inline static Kvasir::RateLimiter<Clock> faultLog_{};
 
@@ -54,6 +65,8 @@ namespace Kvasir { namespace I2C {
             drainQueueWithFailure();
             apply(Traits::I2C::getDisable<base::Instance>());
             apply(base::powerClockEnable);
+            // RESET_DONE before any register of the block is written: see waitResetDone().
+            Traits::I2C::waitResetDone<base::Instance>();
             apply(base::initStepPeripheryConfig);
             apply(base::initStepInterruptConfig);
             apply(base::initStepPeripheryEnable);
@@ -78,10 +91,18 @@ namespace Kvasir { namespace I2C {
             auto const rv = Recovery::tick(now);
             if(rv == Recovery::TickResult::needsReinit) {
                 reset();
+                // The line states right after the sequence are the diagnosis: both high
+                // and the bus is back, SDA low means a slave still holds data, SCL low
+                // means no master can help.
                 KVASIR_LOG_LIMITED(faultLog_.allow(faultKey(Fault::recovered), now),
                                    UC_LOG_W,
-                                   "i2c{} recovery complete",
-                                   base::Instance);
+                                   "i2c{} recovery #{} complete -- SDA {}, SCL {}, {} of 9 "
+                                   "clocks unused",
+                                   base::Instance,
+                                   Recovery::recoveries(),
+                                   std::string_view{Recovery::sdaIsHigh() ? "high" : "LOW"},
+                                   std::string_view{Recovery::sclIsHigh() ? "high" : "LOW"},
+                                   Recovery::clocksLeft());
                 return;
             }
             if(rv == Recovery::TickResult::busy) { return; }
@@ -94,6 +115,31 @@ namespace Kvasir { namespace I2C {
                 UC_LOG_W("i2c{} +{} faults not logged", base::Instance, droppedFaults);
             }
 
+            // Dead-bus watchdog: line-state checks miss failures on a healthy wire (an
+            // unconfigured peripheral, a dropped address write), so this asks instead
+            // whether anything works at all. A NAK counts as a completed transfer, so
+            // absent devices cannot trip it.
+            if(consecutiveFailures_ >= kDeadBusFailures) {
+                consecutiveFailures_ = 0;
+                ++resuscitations_;
+                // Alternate the cheap fix and the expensive one.
+                if((resuscitations_ % 2U) == 1U) {
+                    UC_LOG_W(
+                      "i2c{} {} transfers failed in a row with no success -- "
+                      "re-initialising the peripheral (SDA {}, SCL {})",
+                      base::Instance,
+                      kDeadBusFailures,
+                      std::string_view{Recovery::sdaIsHigh() ? "high" : "LOW"},
+                      std::string_view{Recovery::sclIsHigh() ? "high" : "LOW"});
+                    reset();
+                } else {
+                    UC_LOG_W("i2c{} still dead after a re-initialise -- full bus recovery",
+                             base::Instance);
+                    requestRecovery();
+                }
+                return;
+            }
+
             // Post-abort settle: bus was sick, wait before starting next transaction
             if(!Recovery::isPastSettle(now)) { return; }
 
@@ -101,8 +147,10 @@ namespace Kvasir { namespace I2C {
             // If SDA is held low the I2C peripheral cannot issue a START condition and the
             // transaction will time out immediately.  Detect this early and recover.
             if(!active_) {
+                // Checked on every idle turn, not only when a request waits: a stuck bus
+                // parks every device as absent, which leaves the queue empty for seconds.
+                if(Recovery::checkBusStuck(now)) { return; }
                 if(!requestQueue_.empty()) {
-                    if(Recovery::checkSdaStuck(now)) { return; }
                     if(!Recovery::sdaIsHigh()) { return; }
                     apply(makeDisable(typename base::InterruptIndexs{}));
                     startNext();
@@ -142,6 +190,11 @@ namespace Kvasir { namespace I2C {
 
         static bool isRecovering() { return Recovery::isActive(); }
 
+        /// Failures with no success between them, and how often the watchdog stepped in.
+        static std::uint32_t consecutiveFailures() { return consecutiveFailures_; }
+
+        static std::uint32_t resuscitations() { return resuscitations_; }
+
     private:
         enum class Fault : std::uint8_t {
             abortSend = 1,
@@ -155,6 +208,14 @@ namespace Kvasir { namespace I2C {
         static std::uint32_t faultKey(Fault                                 kind,
                                       typename base::AbrtSrc::Addr::RegType cause = 0) {
             return Kvasir::rateLimitKey(kind, currentRequest_.address, cause);
+        }
+
+        /// Spin until IC_ENABLE_STATUS says the block is inactive. Bounded: this runs in
+        /// the ISR, and a wedged block is left to the dead-bus watchdog.
+        static void waitDisabled_() {
+            for(std::uint32_t spins = 0; spins < 100'000U; ++spins) {
+                if(!fieldEquals(Regs::IC_ENABLE_STATUS::IC_ENValC::enabled)) { return; }
+            }
         }
 
         static void drainQueueWithFailure() {
@@ -187,6 +248,11 @@ namespace Kvasir { namespace I2C {
             // source. Left in place it fires the moment this request unmasks TX_ABRT and
             // fails it with the previous request's cause.
             base::clearAbortSource();
+
+            // IC_TAR is writable only while the block is disabled, and IC_ENABLE=0 takes
+            // effect only once the master is done: without this wait the address write
+            // below is dropped and the transfer goes out to the previous address.
+            waitDisabled_();
 
             apply(write(Regs::IC_TAR::ic_tar, currentRequest_.address));
             apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
@@ -224,6 +290,12 @@ namespace Kvasir { namespace I2C {
             // the empty RX FIFO as the byte asked for and completed the NAKed request again.
             state_ = State::idle;
 
+            if(result == I2CRequestResult::succeeded) {
+                consecutiveFailures_ = 0;
+            } else if(consecutiveFailures_ != std::numeric_limits<std::uint32_t>::max()) {
+                ++consecutiveFailures_;
+            }
+
             if(currentRequest_.callback) { currentRequest_.callback(result); }
 
             if(result != I2CRequestResult::succeeded) {
@@ -238,7 +310,11 @@ namespace Kvasir { namespace I2C {
                 }
 
                 // Master FSM is idle: a STOP has propagated so SDA should be released.
-                // If it is still low a device is holding the bus — escalate to full recovery.
+                // If it is still low a device is holding the bus — escalate to full
+                // recovery.
+                //
+                // SDA only: a momentarily low SCL here is ordinary while the abort
+                // settles. A genuinely held clock is left to the idle watchdog.
                 if(!Recovery::sdaIsHigh()) {
                     KVASIR_LOG_LIMITED(
                       faultLog_.allow(faultKey(Fault::sdaStuck)),
@@ -247,7 +323,8 @@ namespace Kvasir { namespace I2C {
                       base::Instance);
                     drainQueueWithFailure();
                     active_ = false;
-                    Recovery::begin();
+                    // Throttled: a line nothing can free fails every transaction.
+                    static_cast<void>(Recovery::beginThrottled(Clock::now()));
                     return;
                 }
             }
