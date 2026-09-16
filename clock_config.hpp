@@ -307,15 +307,16 @@ namespace Kvasir { namespace DefaultClockSettings {
                              / (usb_pllSettings.pd1 * usb_pllSettings.pd2),
                       "bad clock config");
 
-        using PERI_CLOCK = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_PERI_CTRL;
-        using SYS_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_CTRL;
-        using REF_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_CTRL;
-        using USB_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_USB_CTRL;
-        using ADC_CLOCK  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_ADC_CTRL;
-        using XOSC       = Kvasir::Peripheral::XOSC::Registers<>;
-        using RST        = Kvasir::Peripheral::RESETS::Registers<0>;
-        using PLL        = Kvasir::Peripheral::PLL::Registers<0>;
-        using USBPLL     = Kvasir::Peripheral::PLL::Registers<1>;
+        using PERI_CLOCK    = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_PERI_CTRL;
+        using SYS_CLOCK     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_CTRL;
+        using REF_CLOCK     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_CTRL;
+        using REF_CLOCK_DIV = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_DIV;
+        using USB_CLOCK     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_USB_CTRL;
+        using ADC_CLOCK     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_ADC_CTRL;
+        using XOSC          = Kvasir::Peripheral::XOSC::Registers<>;
+        using RST           = Kvasir::Peripheral::RESETS::Registers<0>;
+        using PLL           = Kvasir::Peripheral::PLL::Registers<0>;
+        using USBPLL        = Kvasir::Peripheral::PLL::Registers<1>;
 
         // Voltage first, then flash timing, then the PLL switch - all three
         // still running from ROSC, so the core never executes a cycle at the
@@ -380,7 +381,8 @@ namespace Kvasir { namespace DefaultClockSettings {
             apply(SYS_CLOCK::overrideDefaults(write(SYS_CLOCK::SRCValC::clksrc_clk_sys_aux),
                                               write(SYS_CLOCK::AUXSRCValC::clksrc_pll_sys)));
 
-            // set ref clock to xosc
+            // set ref clock to xosc, undivided (boot may leave CLK_REF_DIV != 1)
+            apply(write(REF_CLOCK_DIV::_int, value<std::uint32_t{1}>()));
             apply(REF_CLOCK::overrideDefaults(write(REF_CLOCK::SRCValC::xosc_clksrc)));
 
             // enable periphery clock
