@@ -52,12 +52,7 @@ namespace Kvasir { namespace Pio {
     enum class MovStatus { none, txFifoLessThan, rxFifoLessThan, irqSet };
 
     namespace detail {
-        template<int Port,
-                 int Pin>
-        constexpr int pinNumber(Register::PinLocation<Port,
-                                                      Pin>) {
-            return Pin;
-        }
+        using Kvasir::Io::pinNumber;
 
         template<typename List>
         struct PinRange;

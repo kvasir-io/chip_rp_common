@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <functional>
 #include <kvasir/Util/StaticString.hpp>
+#include <kvasir/Util/attributes.hpp>
+#include <string_view>
 #if __has_include("peripherals/QMI.hpp")
     #include "peripherals/QMI.hpp"
 #endif
@@ -39,6 +41,23 @@ namespace RomFunctions {
         assert(fp != nullptr);
 
         return fp;
+    }
+
+    /// getRomFunctionPointer() for code running from RAM while the flash may not be readable:
+    /// the lookup routine is in ROM and nothing here is fetched from flash. No assert (its
+    /// failure path is flash code): a null result is the caller's to handle.
+    template<char C1,
+             char C2,
+             typename F>
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] F getRomFunctionPointerFromRam() {
+        static constexpr std::uint32_t FunctionLookupCode = lookupCode(C1, C2);
+
+        using RomTableLookupFunction = F (*)(std::uint32_t code, std::uint32_t mask);
+
+        auto const romTableLookupFunction = reinterpret_cast<RomTableLookupFunction>(
+          static_cast<std::uintptr_t>(*reinterpret_cast<std::uint16_t const*>(0x16U)));
+
+        return romTableLookupFunction(FunctionLookupCode, 0x0004);
     }
 
     template<char C1,
@@ -81,6 +100,93 @@ struct OtpPageLocks {
 #endif
 
 namespace detail {
+#if __has_include("peripherals/QMI.hpp")
+    // The XIP read mode every RP2350 project runs in.
+    //
+    // The bootrom brings the flash up in EBh quad I/O (command on one line, address, mode
+    // bits, dummy and data on four) and leaves the mode bits at 0x00, so every fetch that
+    // misses the cache spends 8 SCK cycles on the command byte. With mode bits 0xA0 the
+    // flash stays in "continuous read": it keeps answering EBh-shaped transfers without
+    // the command byte, 28 -> 20 SCK cycles per random word, as pico-sdk's boot2 does.
+    // apply() makes the switch when the QMI is in the bootrom's EBh mode and leaves any
+    // other mode alone (a flash the bootrom would not run in quad mode is not forced into
+    // it). It also writes the timing, because the bootrom's flash_exit_xip resets M0_TIMING
+    // to clkdiv 12.
+    //
+    // Runs from RAM with interrupts off and the QMI idle: while the format changes,
+    // nothing may fetch from flash. peripheryClockInit() calls it once at boot,
+    // FlashXipDisabler::enable() after every direct-mode access (the BOOTRAM setup
+    // function that re-enables XIP restores the bootrom's mode, mode bits 0x00).
+    struct XipReadMode {
+        using QMI = Kvasir::Peripheral::QMI::Registers<0>;
+
+        static constexpr std::uint32_t XipNoCacheBase = 0x1400'0000U;
+        static constexpr std::uint32_t PrefixLenBit   = 1U << 12;
+        // prefix 1-bit 8 bits, address/suffix/dummy/data 4-bit, suffix 8 bits, dummy 16
+        // bits (4 quad clocks): what the bootrom programs for EBh
+        static constexpr std::uint32_t RfmtQuadEBh        = 0x0004'92A8U;
+        static constexpr std::uint32_t CommandEBh         = 0xEBU;
+        static constexpr std::uint32_t ContinuousModeBits = 0xA0U;
+
+        // M0_TIMING that reads at clk_ref speed and at the full clock: clkdiv 4, rxdelay 2,
+        // min_deselect 2, cooldown 1 - the divider flashInit() uses before the PLL switch
+        // with the bootrom's sample delay, i.e. what every boot runs on through the switch
+        // until peripheryClockInit(). What a clk_sys resus handler writes before it touches
+        // flash: at 12 MHz the full-clock timing's rxdelay samples after the bit is gone.
+        static constexpr std::uint32_t TimingAtClkRef = (1U << 30) | (2U << 12) | (2U << 8) | 4U;
+
+        // The resus handler reads it before the flash is readable: never an out-of-line call.
+        [[nodiscard,
+          gnu::always_inline]] static inline std::uint32_t
+        currentTiming() {
+            return *reinterpret_cast<std::uint32_t const volatile*>(QMI::M0_TIMING::Addr::value);
+        }
+
+        [[nodiscard]] static bool isQuadEBh(std::uint32_t rfmt,
+                                            std::uint32_t rcmd) {
+            return (rfmt | PrefixLenBit) == RfmtQuadEBh && (rcmd & 0xFFU) == CommandEBh;
+        }
+
+        [[nodiscard]] static bool isContinuous(std::uint32_t rfmt,
+                                               std::uint32_t rcmd) {
+            return isQuadEBh(rfmt, rcmd) && (rfmt & PrefixLenBit) == 0
+                && ((rcmd >> 8) & 0xFFU) == ContinuousModeBits;
+        }
+
+        [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void apply(std::uint32_t timing) {
+            auto* const timingReg
+              = reinterpret_cast<std::uint32_t volatile*>(QMI::M0_TIMING::Addr::value);
+            auto* const rfmtReg
+              = reinterpret_cast<std::uint32_t volatile*>(QMI::M0_RFMT::Addr::value);
+            auto* const rcmdReg
+              = reinterpret_cast<std::uint32_t volatile*>(QMI::M0_RCMD::Addr::value);
+
+            // The fetch that brought us here may still hold the chip select (cooldown,
+            // 64 x COOLDOWN clk_sys cycles): let it expire, then the QMI is idle.
+            for(std::uint32_t i = 0; i < 256; ++i) { asm volatile("" ::: "memory"); }
+            *timingReg = timing;
+            asm volatile("dsb" ::: "memory");
+
+            auto const rfmt = *rfmtReg;
+            auto const rcmd = *rcmdReg;
+            if(!isQuadEBh(rfmt, rcmd) || isContinuous(rfmt, rcmd)) { return; }
+
+            // The one transfer with the command byte and the continuous mode bits: the
+            // flash is in continuous mode after it.
+            *rcmdReg = CommandEBh | (ContinuousModeBits << 8);
+            *rfmtReg = RfmtQuadEBh;
+            asm volatile("dsb" ::: "memory");
+            (void)*reinterpret_cast<std::uint32_t const volatile*>(XipNoCacheBase);
+            asm volatile("dsb" ::: "memory");
+            // Let the chip select cooldown (64 x COOLDOWN clk_sys cycles) run out so the
+            // format is changed with the QMI idle.
+            for(std::uint32_t i = 0; i < 256; ++i) { asm volatile("" ::: "memory"); }
+            *rfmtReg = RfmtQuadEBh & ~PrefixLenBit;   // no command byte from now on
+            asm volatile("dsb\n isb" ::: "memory");
+        }
+    };
+#endif
+
     struct FlashXipDisabler {
         using RomConnectInternalFlash = void (*)(void);
         using RomFlashExitXip         = void (*)(void);
@@ -138,9 +244,8 @@ namespace detail {
             flushCache();
             xipEnable();
 #if __has_include("peripherals/QMI.hpp")
-            using namespace Kvasir::Peripheral::QMI;
-            using QMI = Registers<0>;
-            apply(write(QMI::M0_TIMING::FULLREGISTER, flashTiming));
+            // xipEnable() ran the BOOTRAM setup function: bootrom mode, bootrom timing.
+            XipReadMode::apply(flashTiming);
 #endif
         }
     };
@@ -225,6 +330,13 @@ namespace detail {
         constexpr std::uint32_t FAMILY_IDS         = 0x0040;
         constexpr std::uint32_t NAME               = 0x0080;
     }   // namespace PtInfoFlags
+
+    // The word a PT_INFO query returns after the echoed flags: the partition count in the
+    // low byte, and whether a partition table exists at all.
+    namespace PtInfo {
+        constexpr std::uint32_t PartitionCountMask = 0x00FF;
+        constexpr std::uint32_t HasPartitionTable  = 0x0100;
+    }   // namespace PtInfo
 
     static inline int get_partition_table_info(std::uint32_t* out_buffer,
                                                std::uint32_t  out_buffer_word_size,
@@ -718,11 +830,76 @@ inline Kvasir::StaticString<30> bootromUSBSerialNumber() {
     return serialNumberString();
 }
 
+/// serialNumberString() as a view of one function-local copy: what a string_view member
+/// or a USB descriptor can hold on to (the by-value one is a temporary).
+inline std::string_view serialNumberView() {
+    static Kvasir::StaticString<16> const hexSerialString = serialNumberString();
+    return std::string_view{hexSerialString};
+}
+
 inline bool isFlashBinary() {
     // Read SCB->VTOR (0xE000ED08): the vector table base address tells us where
     // the binary lives. On RP2350: flash = 0x10000000, RAM = 0x20000000.
     auto const vtor = *reinterpret_cast<std::uint32_t const volatile*>(0xE000ED08U);
     return vtor < 0x20000000U;
 }
+
+// The bootrom's flash, partition table and OTP entry points under their public names; the
+// detail:: originals they wrap are what the drivers use.
+namespace Bootrom {
+    /// Erase `blocks` 4096-byte sectors at flash `offset` (from the start of flash, not the
+    /// XIP window). Runs with XIP disabled; mask interrupts around it.
+    inline void flashErase(std::uint32_t offset,
+                           std::size_t   blocks) {
+        detail::flash_erase(offset, blocks);
+    }
+
+    /// Program `size` bytes (a multiple of 256, page aligned `offset`) from `data`. Runs
+    /// with XIP disabled; mask interrupts around it.
+    inline void flashWrite(std::uint32_t       offset,
+                           std::uint8_t const* data,
+                           std::size_t         size) {
+        detail::flash_write(offset, data, size);
+    }
+
+#if __has_include("chip/rp2350.hpp")
+    namespace PtInfoFlags = Kvasir::detail::PtInfoFlags;
+    namespace PtInfo      = Kvasir::detail::PtInfo;
+    namespace OtpCmd      = Kvasir::detail::OtpCmd;
+
+    /// get_partition_table_info (RP2350 datasheet 5.4.8.16): fills `out_buffer` with the
+    /// echoed flags word and what PtInfoFlags asks for; returns the word count or a
+    /// negative bootrom error.
+    [[nodiscard]] inline int getPartitionTableInfo(std::uint32_t* out_buffer,
+                                                   std::uint32_t  out_buffer_word_size,
+                                                   std::uint32_t  partition_and_flags) {
+        return detail::get_partition_table_info(out_buffer,
+                                                out_buffer_word_size,
+                                                partition_and_flags);
+    }
+
+    /// flash_runtime_to_storage_addr (5.4.8.15): the QMI's address translation of a runtime
+    /// (XIP window) address; negative when the address is not mapped.
+    [[nodiscard]] inline int flashRuntimeToStorageAddr(std::uint32_t addr) {
+        return detail::flash_runtime_to_storage_addr(addr);
+    }
+
+    /// otp_access (5.4.8.19): read or write `buf_len` bytes of OTP from the row in
+    /// `cmd_flags` (OtpCmd::ROW_MASK, WRITE, ECC); 0 on success.
+    [[nodiscard]] inline int otpAccess(std::uint8_t* buf,
+                                       std::uint32_t buf_len,
+                                       std::uint32_t cmd_flags) {
+        return detail::otp_access(buf, buf_len, cmd_flags);
+    }
+
+    // OTP row numbers (RP2350 datasheet 13.6, the OTP row table): CHIPID0..3 are rows
+    // 0x000..0x003 (ECC, read together they are the 64-bit chip id); the rows from 0x400
+    // (page 16) on are not assigned by the datasheet and are the user area.
+    namespace Otp::Rows {
+        constexpr std::uint32_t ChipId   = 0x000;
+        constexpr std::uint32_t UserBase = 0x400;
+    }   // namespace Otp::Rows
+#endif
+}   // namespace Bootrom
 
 }   // namespace Kvasir

@@ -2,24 +2,32 @@
 #include "bootrom_functions.hpp"
 
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cstdint>
 
 namespace Kvasir { namespace Flash {
 
+    /// The XIP window: flash byte 0 is read at this address.
+    inline constexpr std::uint32_t XipBase = 0x1000'0000U;
+    /// The smallest erasable unit (a sector) and the largest programmable unit (a page)
+    /// of the parts the boot ROM's flash functions drive.
+    inline constexpr std::size_t SectorSize = 4096;
+    inline constexpr std::size_t PageSize   = 256;
+
     static inline void eraseAndWrite(std::uint32_t              addr,
                                      std::span<std::byte const> data) {
-        constexpr std::size_t flashBlockSize{4096};
+        constexpr std::size_t flashBlockSize{SectorSize};
         assert(addr % flashBlockSize == 0);
-        //Löschen von n 4096 byte Speicherbereichen
-        std::uint32_t offset = addr - 0x10000000;
+        // Erase n 4096-byte sectors, then program page by page.
+        std::uint32_t offset = addr - XipBase;
         {
             std::size_t eraseBlocks
               = data.size() / flashBlockSize + (data.size() % flashBlockSize == 0 ? 0 : 1);
             Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
             Kvasir::detail::flash_erase(offset, eraseBlocks);
         }
-        constexpr std::size_t writeBlockSize{256};
+        constexpr std::size_t writeBlockSize{PageSize};
         while(!data.empty()) {
             std::array<std::byte, writeBlockSize> buffer{};
             std::copy_n(data.begin(), std::min(data.size(), writeBlockSize), buffer.begin());
@@ -49,8 +57,20 @@ namespace Kvasir { namespace Flash {
         [[gnu::section(".eeprom"), gnu::aligned(4096)]] static inline ValueStruct flashValue{};
 #endif
 
-        static_assert(StorageAddress % 4096 == 0,
-                      "StorageAddress needs to be aligned to 4096");
+        static_assert(StorageAddress % SectorSize == 0,
+                      "StorageAddress needs to be aligned to a flash sector");
+
+        /// Where the value lives, as an XIP window address: StorageAddress on the RP2350,
+        /// the .eeprom section's `flashValue` on the RP2040 (the linker places it, hence
+        /// not constexpr there).
+#if __has_include("chip/rp2040.hpp")
+        [[nodiscard]] static std::uint32_t address() {
+            return static_cast<std::uint32_t>(
+              std::bit_cast<std::uintptr_t>(std::addressof(flashValue)));
+        }
+#else
+        [[nodiscard]] static constexpr std::uint32_t address() { return StorageAddress; }
+#endif
 
         static inline T    ramCopy{};
         static inline bool valueRead{false};
@@ -100,9 +120,13 @@ namespace Kvasir { namespace Flash {
             eraseAndWrite(StorageAddress, std::as_bytes(std::span{std::addressof(newV), 1}));
         }
 
-        static void writeValue() {
+        /// Write value() to flash if it differs from what flash holds. True when a write
+        /// happened.
+        static bool writeValue() {
             auto const currentFlashValue = readFlashValue();
-            if(ramCopy != currentFlashValue) { internalWrite(); }
+            if(ramCopy == currentFlashValue) { return false; }
+            internalWrite();
+            return true;
         }
     };
 }}   // namespace Kvasir::Flash

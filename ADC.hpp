@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <optional>
 #include <ratio>
 #include <span>
 
@@ -196,6 +197,22 @@ namespace Kvasir { namespace ADC {
 
     }   // namespace Detail
 
+    /// The AINSEL channel of an ADC-capable pin (`channelOf(HW::Pin::a0{})`); a pin that
+    /// has no channel on this chip variant is a build error.
+    template<int Port,
+             int Pin>
+    constexpr std::uint8_t channelOf(Register::PinLocation<Port,
+                                                           Pin>) {
+        static_assert(Port == 0 && Detail::pinToAdcChannel<Pin>() >= 0,
+                      "not an ADC pin on this chip variant");
+        return static_cast<std::uint8_t>(Detail::pinToAdcChannel<Pin>());
+    }
+
+    /// The on-die temperature sensor's channel: 4 on the RP2040 and the RP2350A, 8 on the
+    /// RP2350B (whose GPIO40..47 take channels 0..7).
+    inline constexpr std::uint8_t TempSensorChannel
+      = static_cast<std::uint8_t>(Detail::tempSensorChannel());
+
     namespace Traits { namespace ADC {
         static constexpr auto getIsrIndexs() {
             return brigand::list<decltype(Kvasir::Interrupt::adc_fifo)>{};
@@ -320,13 +337,48 @@ namespace Kvasir { namespace ADC {
             }
         }
 
-        static std::uint16_t readOnce(std::uint8_t channel) {
+        /// Start a single conversion of `channel` and poll CS.READY for it, at most
+        /// ReadyPollLimit times. False means the poll was exhausted: RESULT is stale.
+        [[nodiscard]] static bool startOnceAndWait(std::uint8_t channel) {
             apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(channel)));
             apply(set(Regs::CS::start_once));
             for(int i = 0; i < ReadyPollLimit; ++i) {
-                if(get<0>(apply(read(Regs::CS::ready)))) { break; }
+                if(get<0>(apply(read(Regs::CS::ready)))) { return true; }
             }
+            return false;
+        }
+
+        /// One conversion of `channel`. Returns whatever RESULT holds after the bounded
+        /// READY poll, stale if the poll was exhausted; tryReadOnce() tells the two apart.
+        static std::uint16_t readOnce(std::uint8_t channel) {
+            static_cast<void>(startOnceAndWait(channel));
             return static_cast<std::uint16_t>(get<0>(apply(read(Regs::RESULT::result))));
+        }
+
+        /// readOnce() that reports an exhausted READY poll (ADC disabled or wedged) as
+        /// nullopt instead of handing back the stale RESULT.
+        [[nodiscard]] static std::optional<std::uint16_t> tryReadOnce(std::uint8_t channel) {
+            if(!startOnceAndWait(channel)) { return std::nullopt; }
+            return static_cast<std::uint16_t>(get<0>(apply(read(Regs::RESULT::result))));
+        }
+
+        /// readOnce() of a channel the config enables (a pin in `pins`, or the sensor with
+        /// `enableTempSensor`): any other channel is a build error.
+        ///     Adc::readOnce<Kvasir::ADC::channelOf(HW::Pin::a0{})>()
+        ///     Adc::readOnce<Kvasir::ADC::TempSensorChannel>()
+        template<std::uint8_t Channel>
+        static std::uint16_t readOnce() {
+            static_assert((channelMask_ & (1U << Channel)) != 0,
+                          "channel is not in this ADC's config (pins / enableTempSensor)");
+            return readOnce(Channel);
+        }
+
+        /// tryReadOnce() of a channel the config enables; see readOnce<Channel>().
+        template<std::uint8_t Channel>
+        [[nodiscard]] static std::optional<std::uint16_t> tryReadOnce() {
+            static_assert((channelMask_ & (1U << Channel)) != 0,
+                          "channel is not in this ADC's config (pins / enableTempSensor)");
+            return tryReadOnce(Channel);
         }
     };
 
@@ -334,6 +386,11 @@ namespace Kvasir { namespace ADC {
     // Continuously samples ADC into two ping-pong buffers.
     // When one buffer fills, the callback is called with a span to the completed buffer
     // while DMA fills the other.
+    //
+    // A FIFO overrun (the callback held the DMA off for longer than the FIFO's four
+    // entries) leaves the round-robin misaligned with the buffers, so the callback should
+    // check fifoOverran() and, when set, discard the buffer and call restart(): it clears
+    // the flag and realigns on the first channel.
     template<typename ADCConfig_,
              typename Dma,
              typename Dma::Channel  DmaChannel,
@@ -366,8 +423,15 @@ namespace Kvasir { namespace ADC {
             userCallback_.reset();
         }
 
-        // Realign on the first channel without reassigning userCallback_ - the
-        // overrun that needs this is detected from inside it.
+        /// FCS.OVER: the FIFO was full when a sample arrived, so samples were lost and the
+        /// channel alignment of the buffers is unknown. Sticky until restart() (or stop()
+        /// and start()) clears it.
+        [[nodiscard]] static bool fifoOverran() {
+            return get<0>(apply(read(Regs::FCS::over))) != 0;
+        }
+
+        /// Realign on the first channel without reassigning userCallback_: halts, clears
+        /// the overrun flag and re-arms. What the callback calls after fifoOverran().
         static void restart() {
             halt();
             arm();

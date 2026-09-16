@@ -16,14 +16,18 @@ namespace Kvasir { namespace I2C {
         using base = Detail::I2CBase<I2CConfig>;
         using tp   = typename Clock::time_point;
 
+        // The lines are driven the way I2C drives them: low is the pad pulling down, high is
+        // the pad let go and the bus pull-ups doing the rest (driveLow_ / release_ below).
+        // A push-pull high would fight a slave that is still holding the line, and it is
+        // the slave that is being freed here.
         enum class Phase : std::uint8_t {
             Idle,
             Aborting,      // softAbortRequest issued; waiting 100 µs for STOP to propagate
-            PinTakeover,   // switch SCL/SDA to GPIO output-high (instantaneous)
+            PinTakeover,   // SCL/SDA over to GPIO, both released (instantaneous)
             PulseLow,      // SCL low; waiting 20 µs
-            PulseHigh,     // SCL high; waiting 20 µs; pulseCount_ decrements back to PulseLow
+            PulseHigh,     // SCL released; waiting 20 µs; pulseCount_ decrements back to PulseLow
             StopSdaLow,    // SDA low; waiting 20 µs
-            StopSdaHigh,   // SDA high; waiting 20 µs; then -> Reinit
+            StopSdaHigh,   // SDA released; waiting 20 µs; then -> Reinit
             Reinit,        // restore pin functions; caller must reset the peripheral
         };
 
@@ -36,6 +40,7 @@ namespace Kvasir { namespace I2C {
         inline static tp    stuckSince_{};   // when a line was first seen low while idle
         inline static Kvasir::RateLimiter<Clock> log_{};   // a held-low SDA recovers in a loop
         inline static std::uint32_t              recoveries_{};
+        inline static std::uint32_t              idleStuck_{};
 
         // A line must be continuously low for this long before recovery fires.
         // Scale with baud rate: ~500 bit-periods gives comfortable margin
@@ -55,6 +60,18 @@ namespace Kvasir { namespace I2C {
 
         static bool isActive() { return phase_ != Phase::Idle; }
 
+        /// Open-drain by hand: an output that is low, or an input that leaves the line to
+        /// the pull-ups. The pad is never pushed high.
+        template<typename Pin>
+        static void driveLow_(Pin pin) {
+            apply(makeOutput(pin));
+        }
+
+        template<typename Pin>
+        static void release_(Pin pin) {
+            apply(makeInput(pin));
+        }
+
         static bool sdaIsHigh() {
             return get<0>(apply(read(base::I2CConfig::sdaPinLocation))) != 0;
         }
@@ -66,6 +83,10 @@ namespace Kvasir { namespace I2C {
 
         /// Recovery sequences begun since reset.
         static std::uint32_t recoveries() { return recoveries_; }
+
+        /// Times SDA was found held low on an idle bus for kStuckThreshold. Each one asks for
+        /// a recovery, which the backoff may hold off, so this and recoveries() can differ.
+        static std::uint32_t idleStuck() { return idleStuck_; }
 
         /// Clocks left over from the nine when SDA came back; 0 means it never did.
         static int clocksLeft() { return pulseCount_; }
@@ -88,6 +109,7 @@ namespace Kvasir { namespace I2C {
                                    "i2c{} SDA stuck low while idle -- requesting recovery",
                                    base::Instance);
                 stuckSince_ = tp{};
+                ++idleStuck_;
                 return beginThrottled(now);
             }
             return false;
@@ -131,33 +153,36 @@ namespace Kvasir { namespace I2C {
             switch(phase_) {
             case Phase::Aborting: phase_ = Phase::PinTakeover; [[fallthrough]];
             case Phase::PinTakeover:
-                // SCL is driven, SDA released: the slave must be able to drive SDA while
-                // it shifts out, and sdaIsHigh() must read the bus, not our own output.
-                apply(makeInput(base::I2CConfig::sdaPinLocation));
-                apply(makeOutputInitHigh(base::I2CConfig::sclPinLocation));
+                // Both released: the slave must be able to drive SDA while it shifts out,
+                // and sdaIsHigh() must read the bus, not our own output. The OUT latches are
+                // cleared first: makeOutput() sets OE before it clears OUT, so a latch left
+                // high would push the line high for an instant in driveLow_().
+                apply(clear(base::I2CConfig::sdaPinLocation));
+                apply(clear(base::I2CConfig::sclPinLocation));
+                release_(base::I2CConfig::sdaPinLocation);
+                release_(base::I2CConfig::sclPinLocation);
                 pulseCount_ = 9;
                 phase_      = Phase::PulseLow;
                 break;
             case Phase::PulseLow:
-                apply(clear(base::I2CConfig::sclPinLocation));
+                driveLow_(base::I2CConfig::sclPinLocation);
                 phaseDeadline_ = now + std::chrono::microseconds{20};
                 phase_         = Phase::PulseHigh;
                 break;
             case Phase::PulseHigh:
-                apply(set(base::I2CConfig::sclPinLocation));
+                release_(base::I2CConfig::sclPinLocation);
                 phaseDeadline_ = now + std::chrono::microseconds{20};
                 // Stop as soon as the slave has let SDA go; pulseCount_ keeps the rest.
                 phase_ = (--pulseCount_ > 0 && !sdaIsHigh()) ? Phase::PulseLow : Phase::StopSdaLow;
                 break;
             case Phase::StopSdaLow:
                 // SDA is taken back for the STOP: low while SCL is high, then released.
-                apply(makeOutputInitHigh(base::I2CConfig::sdaPinLocation));
-                apply(clear(base::I2CConfig::sdaPinLocation));
+                driveLow_(base::I2CConfig::sdaPinLocation);
                 phaseDeadline_ = now + std::chrono::microseconds{20};
                 phase_         = Phase::StopSdaHigh;
                 break;
             case Phase::StopSdaHigh:
-                apply(set(base::I2CConfig::sdaPinLocation));
+                release_(base::I2CConfig::sdaPinLocation);
                 phaseDeadline_ = now + std::chrono::microseconds{20};
                 phase_         = Phase::Reinit;
                 break;

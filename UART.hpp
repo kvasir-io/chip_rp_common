@@ -450,6 +450,9 @@ namespace Kvasir { namespace UART {
 
         static constexpr auto RxDmaTrigger = Traits::UART::DmaRX_Trigger<Instance>();
         static constexpr auto TxDmaTrigger = Traits::UART::DmaTX_Trigger<Instance>();
+        /// The data register, as a DMA channel's write address (TX) or read address (RX).
+        static constexpr std::uint32_t TxDmaTarget = Regs::UARTDR::Addr::value;
+        static constexpr std::uint32_t RxDmaSource = Regs::UARTDR::Addr::value;
 
         static_assert(Detail::isValidBaudConfig<UartConfig::clockSpeed,
                                                 UartConfig::baudRate>(UartConfig::maxBaudRateError),
@@ -548,6 +551,10 @@ namespace Kvasir { namespace UART {
           Queue<std::optional<std::byte>, BufferSize, Kvasir::Atomic::OverFlowPolicyIgnore>
             rxbuffer_{};
 
+        /// The next received byte, if one is waiting. An empty optional inside `out` is a
+        /// framing / overrun error the interrupt recorded in the stream's order.
+        static bool receive(std::optional<std::byte>& out) { return rxbuffer_.pop_into(out); }
+
         enum class OperationState { succeeded, failed, ongoing };
 
         // Atomic because the DMA completion callback runs in interrupt context
@@ -590,7 +597,7 @@ namespace Kvasir { namespace UART {
                                 base::TxDmaTrigger,
                                 Dma::TransferSize::_8,
                                 false,
-                                true>(Regs::UARTDR::Addr::value,
+                                true>(base::TxDmaTarget,
                                       reinterpret_cast<std::uint32_t>(span.data()),
                                       span.size(),
                                       []() { busy.store(false, std::memory_order_relaxed); });

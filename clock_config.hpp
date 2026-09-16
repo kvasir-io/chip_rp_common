@@ -4,6 +4,7 @@
 #include "peripherals/CLOCKS.hpp"
 
 #if __has_include("peripherals/QMI.hpp")
+    #include "bootrom_functions.hpp"
     #include "peripherals/QMI.hpp"
 #endif
 
@@ -20,6 +21,12 @@
 
 #include <cmath>
 #include <cstdint>
+
+namespace Kvasir { namespace Clocks {
+    // The two PLLs by name: the system PLL feeds clk_sys, the USB PLL clk_usb and clk_adc.
+    using PllSys = Peripheral::PLL::Registers<0>;
+    using PllUsb = Peripheral::PLL::Registers<1>;
+}}   // namespace Kvasir::Clocks
 
 namespace Kvasir { namespace DefaultClockSettings {
     // The clocks coreClockInit below programs, as Startup resources (Clocks.hpp). An
@@ -199,48 +206,78 @@ namespace Kvasir { namespace DefaultClockSettings {
 #endif
     }
 
-    // Flash configuration function for W25Q32RV optimal settings
-    template<auto ClockSpeed>
+    namespace detail {
+        // The QMI's M0_TIMING for the flash at the final clock: divider, sample delay,
+        // deselect time. Applied by XipReadMode::apply() in peripheryClockInit(), from RAM,
+        // after the PLL switch - see flashInit() for why not earlier.
+        //
+        // MaxFlashFreq: what the flash is rated for, 100 MHz by default.
+        template<auto ClockSpeed,
+                 auto MaxFlashFreq>
+        constexpr std::uint32_t flashClkdiv() {
+            constexpr std::uint32_t min_clkdiv = 2;
+            constexpr std::uint32_t max_clkdiv = 255;
+
+            constexpr std::uint32_t calculated_clkdiv
+              = (ClockSpeed + MaxFlashFreq - 1) / MaxFlashFreq;
+
+            if(calculated_clkdiv < min_clkdiv) { return min_clkdiv; }
+            if(calculated_clkdiv > max_clkdiv) { return max_clkdiv; }
+            return calculated_clkdiv;
+        }
+
+        template<auto ClockSpeed,
+                 auto MaxFlashFreq>
+        constexpr std::uint32_t flashTiming() {
+            constexpr std::uint32_t clkdiv = flashClkdiv<ClockSpeed, MaxFlashFreq>();
+
+            constexpr std::uint32_t flash_freq = ClockSpeed / clkdiv;
+            static_assert(flash_freq <= MaxFlashFreq, "Flash frequency exceeds MaxFlashFreq");
+
+            // rxdelay: when the QMI samples the data lines, in half clk_sys cycles after
+            // the SCK edge. The flash launches a bit ~9 ns (clock-to-output plus the pad
+            // round trip) after the opposite edge, half an SCK period earlier, so the bit
+            // is there from (9 ns - clkdiv/2 cycles) to (9 ns + clkdiv/2 cycles) after
+            // the sample edge. Sampling 7.5 ns after the edge sits mid-window at every
+            // clk_sys the divider rule allows: 2 at 150 MHz (window 1..3), 3 at 200 MHz
+            // (window 2..4). Below about 33 MHz that rounds to 0, which is clamped to 1.
+            constexpr std::uint32_t rxdelay_rounded = static_cast<std::uint32_t>(
+              (static_cast<unsigned long long>(ClockSpeed) * 15ULL + 500'000'000ULL)
+              / 1'000'000'000ULL);   // round(7.5 ns * 2 * clk_sys)
+            constexpr std::uint32_t rxdelay = rxdelay_rounded < 1 ? 1 : rxdelay_rounded;
+            static_assert(rxdelay <= 7, "rxdelay out of the QMI's range");
+
+            // min_deselect: chip select high for half an SCK period plus this many clk_sys
+            // cycles between transfers. The W25Q64JV wants 10 ns (tSHSL, read); 2 cycles
+            // give 3 x 5 ns at 200 MHz clk_sys, 3 x 6.7 ns at 150 MHz. (The bootrom uses 7.)
+            constexpr std::uint32_t min_deselect = 2;
+
+            constexpr std::uint32_t cooldown = 1;   // hold CS, append sequential accesses
+            // pagebreak none, select_setup 0, select_hold 0, max_select 0
+            return (cooldown << 30) | (min_deselect << 12) | (rxdelay << 8) | clkdiv;
+        }
+    }   // namespace detail
+
+    // Before the PLL switch, from flash, on the ring oscillator: only the divider.
+    //
+    // CLKDIV is the one M0_TIMING field the QMI lets software change while it is fetching;
+    // everything else needs the QMI idle, which code running from flash cannot promise.
+    // And the sample delay that is right at the final clock is wrong here: with the
+    // divider at 2 the next bit lands half an SCK period after the sample edge, which at
+    // ROSC speed is long before a 7.5 ns rxdelay samples. Divider 4 with the bootrom's rxdelay 2
+    // reads clean at ROSC and at any final clk_sys the divider rule allows, so this is
+    // what the code between here and peripheryClockInit() runs on - or the final divider,
+    // when a slow flash needs a larger one.
+    template<auto ClockSpeed,
+             auto MaxFlashFreq = 100'000'000>
     void flashInit() {
 #if __has_include("peripherals/QMI.hpp")
         using namespace Kvasir::Peripheral::QMI;
         using QMI = Registers<0>;
-
-        // Kept below the flash's 104 MHz datasheet ceiling: XIP near that limit
-        // has too little margin to boot reliably. 84 MHz leaves the common
-        // clocks unchanged (150 -> 75, 250 -> 83.3) and pushes the rest to the
-        // next divider rather than onto the margin.
-        constexpr std::uint32_t max_flash_freq = 84'000'000;
-        constexpr std::uint32_t min_clkdiv     = 2;
-        constexpr std::uint32_t max_clkdiv     = 255;
-
-        constexpr std::uint32_t calculated_clkdiv
-          = (ClockSpeed + max_flash_freq - 1) / max_flash_freq;
-
-        constexpr std::uint32_t clkdiv = [&]() {
-            if(calculated_clkdiv < min_clkdiv) { return min_clkdiv; }
-            if(calculated_clkdiv > max_clkdiv) { return max_clkdiv; }
-            return calculated_clkdiv;
-        }();
-
-        constexpr std::uint32_t flash_freq = ClockSpeed / clkdiv;
-        static_assert(flash_freq <= max_flash_freq, "Flash frequency exceeds the 84 MHz ceiling");
-
-        // rxdelay compensates the flash's clock-to-output plus the pad round
-        // trip, in flash-clock cycles. 2 is enough up to ~80 MHz; above that
-        // the cycle is short enough to need the extra one.
-        constexpr std::uint32_t rxdelay = flash_freq > 80'000'000 ? 3 : 2;
-
-        apply(QMI::M0_TIMING::overrideDefaults(
-          write(QMI::M0_TIMING::clkdiv, value<std::uint32_t, clkdiv>()),
-          write(QMI::M0_TIMING::cooldown, value<std::uint32_t, 1>()),
-          write(QMI::M0_TIMING::rxdelay, value<std::uint32_t, rxdelay>()),
-          write(QMI::M0_TIMING::PAGEBREAKValC::none),
-          write(QMI::M0_TIMING::select_setup, value<std::uint32_t, 0>()),
-          write(QMI::M0_TIMING::select_hold, value<std::uint32_t, 0>()),
-          write(QMI::M0_TIMING::max_select, value<std::uint32_t, 0>()),
-          write(QMI::M0_TIMING::min_deselect, value<std::uint32_t, 0>())));
-
+        (void)detail::flashTiming<ClockSpeed, MaxFlashFreq>();   // the static_asserts
+        constexpr std::uint32_t finalClkdiv = detail::flashClkdiv<ClockSpeed, MaxFlashFreq>();
+        constexpr std::uint32_t bootClkdiv  = finalClkdiv > 4 ? finalClkdiv : 4;
+        apply(write(QMI::M0_TIMING::clkdiv, value<std::uint32_t, bootClkdiv>()));
 #endif
 
 #if __has_include("peripherals/XIP_CTRL.hpp")
@@ -252,7 +289,8 @@ namespace Kvasir { namespace DefaultClockSettings {
     }
 
     template<auto ClockSpeed,
-             auto CrystalSpeed>
+             auto CrystalSpeed,
+             auto MaxFlashFreq = 100'000'000>
     void coreClockInit() {
         using Kvasir::Register::value;
 
@@ -283,7 +321,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         // still running from ROSC, so the core never executes a cycle at the
         // new frequency on the old voltage.
         vregInit<ClockSpeed>();
-        flashInit<ClockSpeed>();
+        flashInit<ClockSpeed, MaxFlashFreq>();
 
         // disable periphery clocks
         apply(PERI_CLOCK::overrideDefaults(clear(PERI_CLOCK::enable)));
@@ -293,6 +331,21 @@ namespace Kvasir { namespace DefaultClockSettings {
 
         // set sysclock to default
         apply(SYS_CLOCK::overrideDefaults(write(SYS_CLOCK::SRCValC::clk_ref)));
+
+        // A clk_sys resus (Clocks::Resus) survives a core reset: the clocks block is not
+        // reset by SYSRESETREQ, so after an unhandled event every debugger reset boots with
+        // clk_sys forced to clk_ref, the PLL switch below has no effect, and the flash
+        // timing peripheryClockInit() applies for ClockSpeed reads garbage at 12 MHz - a
+        // HardFault before main, on every reset, until the resus is released.
+        // clk_sys is explicitly on clk_ref now, so releasing it changes nothing here.
+        {
+            using RESUS_CTRL   = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_RESUS_CTRL;
+            using RESUS_STATUS = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_RESUS_STATUS;
+            if(apply(read(RESUS_STATUS::resussed))) {
+                apply(set(RESUS_CTRL::clear));
+                apply(clear(RESUS_CTRL::clear));
+            }
+        }
 
         apply(write(XOSC::CTRL::ENABLEValC::en), write(detail::getXoscFreqRange<CrystalSpeed>()));
         // wait for XOSC stable
@@ -369,7 +422,35 @@ namespace Kvasir { namespace DefaultClockSettings {
         }
     }
 
+    // After initMemory(): the RAM functions exist now, and interrupts are not enabled yet.
+    // The flash's final timing and read mode (see flashInit() and XipReadMode). A project
+    // that passes its own MaxFlashFreq must pass it here and to coreClockInit().
     template<auto ClockSpeed,
-             auto CrystalSpeed>
-    void peripheryClockInit() {}
+             auto CrystalSpeed,
+             auto MaxFlashFreq = 100'000'000>
+    void peripheryClockInit() {
+#if __has_include("peripherals/QMI.hpp")
+        std::uint32_t primask{};
+        asm volatile("mrs %0, primask\n cpsid i" : "=r"(primask)::"memory");
+        Kvasir::detail::XipReadMode::apply(detail::flashTiming<ClockSpeed, MaxFlashFreq>());
+        asm volatile("msr primask, %0" ::"r"(primask) : "memory");
+#endif
+    }
+
+    // An application's whole ClockSettings in one line:
+    //     using ClockSettings = Kvasir::DefaultClockSettings::Settings<ClockSpeed, CrystalSpeed>;
+    // Provides (the clock check), coreClockInit() and peripheryClockInit() with the same
+    // three arguments, so the numbers are spelled once.
+    template<auto ClockSpeed, auto CrystalSpeed, auto MaxFlashFreq = 100'000'000>
+    struct Settings {
+        using Provides = DefaultClockSettings::Provides<ClockSpeed, CrystalSpeed>;
+
+        static void coreClockInit() {
+            DefaultClockSettings::coreClockInit<ClockSpeed, CrystalSpeed, MaxFlashFreq>();
+        }
+
+        static void peripheryClockInit() {
+            DefaultClockSettings::peripheryClockInit<ClockSpeed, CrystalSpeed, MaxFlashFreq>();
+        }
+    };
 }}   // namespace Kvasir::DefaultClockSettings

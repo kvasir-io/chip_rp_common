@@ -174,6 +174,22 @@ public:
         while(now() < end) {}
     }
 
+    /// Blocking delay of a runtime duration. Negative or zero returns at once.
+    template<typename Rep,
+             typename Period>
+    static void delay(std::chrono::duration<Rep,
+                                            Period> d) {
+        auto const wait = std::chrono::duration_cast<duration>(d);
+        if(wait <= duration::zero()) { return; }
+        auto const end = now() + wait;
+        while(now() < end) {}
+    }
+
+    /// Block until this clock reads `t`; returns at once if `t` is already past.
+    static void delayUntil(time_point t) {
+        while(now() < t) {}
+    }
+
     // kvasir init: once, on the core whose Startup list carries this type. TICKS is not
     // behind a reset; the timer itself is, hence the reset-done poll before anyone can
     // call now().

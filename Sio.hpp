@@ -170,8 +170,9 @@ struct Doorbell {
 // RP2040 each core has its own line (sio_proc0 / sio_proc1), so the ISR has to know which
 // core's list it is in: FifoIsrOn<Core, F> names it, and Startup refuses the other core's
 // list (startupCore). FifoIsr<F> is core 0's. Priority is the NVIC priority (0 highest),
-// like every other driver's isrPriority; `I` is the chip interrupt table.
-template<unsigned Core, void (*F)(), int Priority = 0, typename I = Kvasir::Interrupt>
+// like every other driver's isrPriority, and 3 by default like theirs; `I` is the chip
+// interrupt table.
+template<unsigned Core, void (*F)(), int Priority = 3, typename I = Kvasir::Interrupt>
 struct FifoIsrOn {
     static_assert(Core < 2,
                   "two cores");
@@ -193,7 +194,7 @@ struct FifoIsrOn {
     static constexpr Nvic::Isr<std::addressof(onIsr), Irq> isr{};
 };
 
-template<void (*F)(), int Priority = 0, typename I = Kvasir::Interrupt>
+template<void (*F)(), int Priority = 3, typename I = Kvasir::Interrupt>
 using FifoIsr = FifoIsrOn<0, F, Priority, I>;
 
 // F receives the mask of bells (bit N for Doorbell<N>) that were pending, restricted to

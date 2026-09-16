@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <optional>
+#include <span>
 #include <utility>
 
 namespace Kvasir { namespace DMA {
@@ -171,7 +172,8 @@ namespace Kvasir { namespace DMA {
                 if constexpr(requires { DMAConfig_::isrPriority; }) {
                     return DMAConfig_::isrPriority;
                 } else {
-                    return 0;
+                    // 3, like every other driver's default; 0 would be level with SysTick.
+                    return 3;
                 }
             }();
 
@@ -408,6 +410,33 @@ namespace Kvasir { namespace DMA {
                                                                         source,
                                                                         count,
                                                                         std::nullopt);
+        }
+
+        // Memory to memory with the buffers as spans: the count is the source's size, the
+        // element width is checked against Size, and the destination must hold the source.
+        // Returns false, with nothing started, when it does not.
+        template<DMAChannel      Channel,
+                 DMAPriority     Priority,
+                 TriggerSource   Trigger,
+                 DMATransferSize Size,
+                 bool            IncDest,
+                 bool            IncSource,
+                 typename T,
+                 typename U,
+                 typename F = std::nullopt_t>
+        [[nodiscard]] static bool start(std::span<T> dest,
+                                        std::span<U> source,
+                                        F&&          f = std::nullopt) {
+            static_assert(sizeof(T) == sizeof(U), "source and destination element widths differ");
+            static_assert(sizeof(T) == (1U << static_cast<unsigned>(Size)),
+                          "element width does not match the transfer size");
+            if(dest.size() < source.size()) { return false; }
+            start<Channel, Priority, Trigger, Size, IncDest, IncSource>(
+              std::bit_cast<std::uint32_t>(dest.data()),
+              std::bit_cast<std::uint32_t>(source.data()),
+              source.size(),
+              std::forward<F>(f));
+            return true;
         }
 
         // Re-trigger without reinstalling the callback, for re-arming from inside

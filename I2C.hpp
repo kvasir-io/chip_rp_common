@@ -4,17 +4,11 @@
 #include "Io.hpp"
 #include "PinConfig.hpp"
 #include "core/Nvic.hpp"
-#include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Apply.hpp"
 #include "kvasir/Register/RegisterFmt.hpp"
-#include "kvasir/Util/RateLimiter.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/I2C.hpp"
-
-#include <array>
-#include <cassert>
-#include <span>
 
 namespace Kvasir { namespace I2C {
 
@@ -171,17 +165,15 @@ namespace Kvasir { namespace I2C {
                 return err <= maxErr;
             }
 
+            /// Fast mode for every rate: standard mode (<= 100 kHz) is buggy on this block,
+            /// and high-speed mode (> 1 MHz) is not something it does -- the IC_HS_* count
+            /// registers are never programmed here and the SCL counts in GetBaudConfig are
+            /// the fast-mode ones, so selecting SPEED = high would clock the bus with
+            /// numbers meant for another register set. I2CBase static_asserts the ceiling.
             template<std::uint32_t f_baud>
             static constexpr auto getSpeedModeRegister() {
-                if constexpr(f_baud <= 100'000) {
-                    //return write(Regs::IC_CON::SPEEDValC::standard);
-                    // standard mode is buggy always use fast
-                    return write(Regs::IC_CON::SPEEDValC::fast);
-                } else if constexpr(f_baud <= 1'000'000) {
-                    return write(Regs::IC_CON::SPEEDValC::fast);
-                } else {
-                    return write(Regs::IC_CON::SPEEDValC::high);
-                }
+                static_assert(f_baud <= 1'000'000, "fast mode plus (1 MHz) is the ceiling");
+                return write(Regs::IC_CON::SPEEDValC::fast);
             }
 
             template<std::uint32_t f_clockSpeed, std::uint32_t f_baud>
@@ -323,6 +315,10 @@ namespace Kvasir { namespace I2C {
                                                           clear(Regs::IC_INTR_MASK::m_rx_over),
                                                           clear(Regs::IC_INTR_MASK::m_rx_under)));
 
+            static_assert(I2CConfig::baudRate <= 1'000'000,
+                          "the RP2040/RP2350 I2C block does fast mode plus (1 MHz) at most: "
+                          "high-speed mode's own SCL count registers are not programmed by "
+                          "this driver");
             static_assert(Config::template isValidSpkLen<I2CConfig::clockSpeed,
                                                          I2CConfig::baudRate>(),
                           "I2C SPKLEN overflows 8-bit register (max 255) — baud rate too low or "
@@ -427,298 +423,4 @@ namespace Kvasir { namespace I2C {
             }
         };
     }   // namespace Detail
-
-    template<typename I2CConfig, typename Clock, std::size_t BufferSize_>
-    struct I2CBehavior : Detail::I2CBase<I2CConfig> {
-        static constexpr std::size_t BufferSize = BufferSize_;
-        using base                              = Detail::I2CBase<I2CConfig>;
-        using Regs                              = typename base::Regs;
-        using tp                                = typename Clock::time_point;
-
-        enum class State { idle, blocked, sending, receiving };
-        enum class OperationState { succeeded, failed, ongoing };
-        inline static std::atomic<State>          state_{State::idle};
-        inline static std::atomic<std::uint8_t>   receiveSize_{0};
-        inline static std::atomic<OperationState> operationState_{OperationState::succeeded};
-        inline static Kvasir::Atomic::Queue<std::byte, BufferSize> buffer_{};
-        inline static bool                                         stop{false};
-        inline static tp                                           timeoutTime{};
-
-        enum class Fault : std::uint8_t { timeout = 1, abortSend, abortRecv, unexpectedIsr };
-        // Fault logging goes through this: a bad bus faults on every transaction.
-        inline static Kvasir::RateLimiter<Clock> faultLog_{};
-
-        static void reset() {
-            apply(makeDisable(typename base::InterruptIndexs{}));
-            state_.store(State::idle, std::memory_order_relaxed);
-            operationState_.store(OperationState::succeeded, std::memory_order_relaxed);
-            apply(Traits::I2C::getDisable<base::Instance>());
-            apply(base::powerClockEnable);
-            Traits::I2C::waitResetDone<base::Instance>();
-            apply(base::initStepPeripheryConfig);
-            apply(base::initStepInterruptConfig);
-            apply(base::initStepPeripheryEnable);
-        }
-
-        template<typename C>
-        static void getReceivedBytes(C& c) {
-            assert(c.size() <= buffer_.size());
-            buffer_.pop_into(c);
-        }
-
-        template<typename OIT>
-        static void getReceivedBytes(OIT first,
-                                     OIT last) {
-            while(first != last) {
-                assert(!buffer_.empty());
-                *first = buffer_.front();
-                buffer_.pop();
-                ++first;
-            }
-        }
-
-        static OperationState operationState(tp const& currentTime) {
-            auto op = operationState_.load(std::memory_order_relaxed);
-            if(op == OperationState::ongoing) {
-                if(currentTime > timeoutTime) {
-                    // softAbortRequest, not abort: the ABORT bit only issues a
-                    // STOP while ENABLE stays 1. base::abort clears ENABLE too
-                    // and is for the post-TX_ABRT case, where the NAK already
-                    // released the bus; on timeout the bus is mid-transaction
-                    // and needs the STOP.
-                    apply(base::softAbortRequest);
-                    KVASIR_LOG_LIMITED(
-                      faultLog_.allow(Kvasir::rateLimitKey(Fault::timeout), currentTime),
-                      UC_LOG_W,
-                      "i2c{} timeout",
-                      base::Instance);
-                    buffer_.clear();
-                    operationState_.store(OperationState::failed, std::memory_order_relaxed);
-                    state_.store(State::blocked, std::memory_order_relaxed);
-                    return OperationState::failed;
-                }
-            }
-            return op;
-        }
-
-        // Is the bus busy? Use this to sequence transfers, not
-        // operationState(), which answers whether the last one succeeded and
-        // latches `failed` until the next send/receive or reset() - gating on
-        // `succeeded` therefore waits for something only the caller can cause.
-        [[nodiscard]] static bool transferInProgress() {
-            return state_.load(std::memory_order_relaxed) != State::idle
-                || operationState_.load(std::memory_order_relaxed) == OperationState::ongoing;
-        }
-
-        // Acknowledge a failure so operationState() reports again from here on.
-        // Also releases the blocked state a timeout leaves behind, which would
-        // otherwise make acquire() fail for ever.
-        static void clearError() {
-            auto expected = OperationState::failed;
-            operationState_.compare_exchange_strong(expected,
-                                                    OperationState::succeeded,
-                                                    std::memory_order_relaxed);
-            auto blocked = State::blocked;
-            state_.compare_exchange_strong(blocked, State::idle, std::memory_order_relaxed);
-        }
-
-        static bool acquire() {
-            if(state_.load(std::memory_order_relaxed) == State::idle) {
-                state_.store(State::blocked, std::memory_order_relaxed);
-                return true;
-            }
-            return false;
-        }
-
-        static void release() {
-            assert(state_.load(std::memory_order_relaxed) != State::idle);
-            state_.store(State::idle, std::memory_order_relaxed);
-        }
-
-        template<typename C>
-        static void send(tp const&    currentTime,
-                         std::uint8_t address,
-                         C const&     c) {
-            assert(state_.load(std::memory_order_relaxed) != State::sending);
-            assert(state_.load(std::memory_order_relaxed) != State::receiving);
-            assert(!c.empty());
-            assert(c.size() <= buffer_.max_size());
-
-            buffer_.clear();
-            buffer_.push(c);
-            state_.store(State::sending, std::memory_order_relaxed);
-            operationState_.store(OperationState::ongoing, std::memory_order_relaxed);
-            stop        = true;
-            timeoutTime = currentTime + base::calcTransferTimeout(c.size());
-            apply(write(Regs::IC_TAR::ic_tar, address));
-            apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
-            apply(base::TxInterrupts);
-        }
-
-        static void receive(tp const&    currentTime,
-                            std::uint8_t address,
-                            std::uint8_t size) {
-            assert(state_.load(std::memory_order_relaxed) != State::sending);
-            assert(state_.load(std::memory_order_relaxed) != State::receiving);
-            assert(size <= buffer_.max_size());
-            assert(size != 0);
-
-            buffer_.clear();
-            receiveSize_.store(size, std::memory_order_relaxed);
-            state_.store(State::receiving, std::memory_order_relaxed);
-            operationState_.store(OperationState::ongoing, std::memory_order_relaxed);
-            stop        = true;
-            timeoutTime = currentTime + base::calcTransferTimeout(size);
-
-            apply(write(Regs::IC_TAR::ic_tar, address));
-            apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
-
-            if(size == 1) {
-                apply(
-                  Regs::IC_DATA_CMD::overrideDefaults(write(Regs::IC_DATA_CMD::STOPValC::enable),
-                                                      write(Regs::IC_DATA_CMD::CMDValC::read)));
-            } else {
-                apply(Regs::IC_DATA_CMD::overrideDefaults(write(Regs::IC_DATA_CMD::CMDValC::read)));
-            }
-
-            apply(base::RxInterrupts);
-        }
-
-        template<typename C>
-        static void send_receive(tp const&    currentTime,
-                                 std::uint8_t address,
-                                 C const&     c,
-                                 std::uint8_t size) {
-            assert(state_.load(std::memory_order_relaxed) != State::sending);
-            assert(state_.load(std::memory_order_relaxed) != State::receiving);
-            assert(size <= buffer_.max_size());
-            assert(size != 0);
-
-            buffer_.clear();
-            std::size_t sendSize;
-            if constexpr(std::is_same_v<std::decay_t<C>, std::byte>) {
-                sendSize = 1;
-                buffer_.push(c);
-            } else {
-                assert(c.size() <= buffer_.max_size());
-                assert(!c.empty());
-                sendSize = c.size();
-                buffer_.push(c);
-            }
-            receiveSize_.store(size, std::memory_order_relaxed);
-            state_.store(State::sending, std::memory_order_relaxed);
-            operationState_.store(OperationState::ongoing, std::memory_order_relaxed);
-            stop        = false;
-            timeoutTime = currentTime + base::calcTransferTimeout(sendSize + size);
-
-            apply(write(Regs::IC_TAR::ic_tar, address));
-            apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
-            apply(base::TxInterrupts);
-        }
-
-        // ISR
-        static void onIsr() {
-            bool const error = fieldEquals(Regs::IC_INTR_STAT::R_TX_ABRTValC::active);
-
-            auto lstate  = state_.load(std::memory_order_relaxed);
-            auto lostate = operationState_.load(std::memory_order_relaxed);
-            if(lstate == State::sending) {
-                if(error) {
-                    lstate           = State::blocked;
-                    lostate          = OperationState::failed;
-                    auto const cause = base::abortCause();
-                    KVASIR_LOG_LIMITED(
-                      faultLog_.allow(Kvasir::rateLimitKey(Fault::abortSend, cause)),
-                      UC_LOG_C,
-                      "i2c{} abort send {}",
-                      base::Instance,
-                      Kvasir::Register::Flags<typename base::AbrtSrc>{cause});
-                    apply(base::abort);
-                } else {
-                    if(!buffer_.empty()) {
-                        auto const data = buffer_.front();
-                        buffer_.pop();
-                        if(buffer_.empty() && stop) {
-                            Regs::IC_DATA_CMD::overrideDefaultsRuntime(
-                              write(Regs::IC_DATA_CMD::STOPValC::enable),
-                              write(Regs::IC_DATA_CMD::dat, static_cast<std::uint8_t>(data)));
-                        } else {
-                            Regs::IC_DATA_CMD::overrideDefaultsRuntime(
-                              write(Regs::IC_DATA_CMD::dat, static_cast<std::uint8_t>(data)));
-                        }
-                    } else {
-                        if(stop) {
-                            lstate  = State::blocked;
-                            lostate = OperationState::succeeded;
-                            apply(Regs::IC_ENABLE::overrideDefaults(
-                              write(Regs::IC_ENABLE::ENABLEValC::disabled)));
-                            apply(base::NoInterrupts);
-                        } else {
-                            auto const lreceiveSize = receiveSize_.load(std::memory_order_relaxed);
-                            lstate                  = State::receiving;
-                            if(lreceiveSize == 1) {
-                                apply(Regs::IC_DATA_CMD::overrideDefaults(
-                                  write(Regs::IC_DATA_CMD::RESTARTValC::enable),
-                                  write(Regs::IC_DATA_CMD::STOPValC::enable),
-                                  write(Regs::IC_DATA_CMD::CMDValC::read)));
-                            } else {
-                                apply(Regs::IC_DATA_CMD::overrideDefaults(
-                                  write(Regs::IC_DATA_CMD::RESTARTValC::enable),
-                                  write(Regs::IC_DATA_CMD::CMDValC::read)));
-                            }
-                            apply(base::RxInterrupts);
-                        }
-                    }
-                }
-            } else if(lstate == State::receiving) {
-                if(error) {
-                    auto const cause = base::abortCause();
-                    KVASIR_LOG_LIMITED(
-                      faultLog_.allow(Kvasir::rateLimitKey(Fault::abortRecv, cause)),
-                      UC_LOG_C,
-                      "i2c{} abort recv {}",
-                      base::Instance,
-                      Kvasir::Register::Flags<typename base::AbrtSrc>{cause});
-                    lstate  = State::blocked;
-                    lostate = OperationState::failed;
-                    apply(base::abort);
-                } else {
-                    auto const lreceiveSize = receiveSize_.load(std::memory_order_relaxed);
-                    auto const data         = apply(read(Regs::IC_DATA_CMD::dat));
-                    buffer_.push(static_cast<std::byte>(Kvasir::Register::get<0>(data)));
-                    auto const bytesLeft = lreceiveSize - buffer_.size();
-                    if(bytesLeft > 1) {
-                        apply(Regs::IC_DATA_CMD::overrideDefaults(
-                          write(Regs::IC_DATA_CMD::CMDValC::read)));
-                    } else if(bytesLeft == 1) {
-                        apply(Regs::IC_DATA_CMD::overrideDefaults(
-                          write(Regs::IC_DATA_CMD::STOPValC::enable),
-                          write(Regs::IC_DATA_CMD::CMDValC::read)));
-                    } else {
-                        lstate  = State::blocked;
-                        lostate = OperationState::succeeded;
-                        apply(Regs::IC_ENABLE::overrideDefaults(
-                          write(Regs::IC_ENABLE::ENABLEValC::disabled)));
-                        apply(base::NoInterrupts);
-                    }
-                }
-            } else {
-                KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::unexpectedIsr)),
-                                   UC_LOG_C,
-                                   "i2c{} unexpected isr",
-                                   base::Instance);
-            }
-
-            operationState_.store(lostate, std::memory_order_relaxed);
-            state_.store(lstate, std::memory_order_relaxed);
-        }
-
-        template<typename... Ts>
-        static constexpr auto makeIsr(brigand::list<Ts...>) {
-            return brigand::list<
-              Kvasir::Nvic::Isr<std::addressof(onIsr), Nvic::Index<Ts::value>>...>{};
-        }
-
-        using Isr = decltype(makeIsr(typename base::InterruptIndexs{}));
-    };
 }}   // namespace Kvasir::I2C

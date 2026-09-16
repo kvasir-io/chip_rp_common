@@ -54,4 +54,48 @@ namespace Kvasir { namespace Clocks {
                                           Clk<ClkAdc, 48'000'000>,
                                           Clk<ClkUsb, 48'000'000>,
                                           Startup::ProcessorClock<ClockSpeed>>;
+
+    // ---- reading a rate back off a Provides list -----------------------------------------
+    //
+    // A config that says "this block counts clk_ref" wants the number the tree programs
+    // clk_ref to, not a copy of it: `hzOf<ClkRef>(Provides{})` is the crystal on a
+    // DefaultProvides. A clock the list does not provide (or provides twice) is a build
+    // error, which is what keeps that config from silently becoming a number.
+    namespace Detail {
+        template<typename Which, typename Resource>
+        struct ClockHz {
+            static constexpr bool               found = false;
+            static constexpr unsigned long long value = 0;
+        };
+
+        template<typename Which, unsigned long long Hz>
+        struct ClockHz<Which, Startup::Detail::ResourceT<Which, Hz>> {
+            static constexpr bool               found = true;
+            static constexpr unsigned long long value = Hz;
+        };
+    }   // namespace Detail
+
+    /// How many entries of the list provide `Which` (1 on a well-formed tree).
+    template<typename Which,
+             typename... Resources>
+    consteval std::size_t providersOf(brigand::list<Resources...>) {
+        return ((Detail::ClockHz<Which, Resources>::found ? std::size_t{1} : std::size_t{0}) + ...
+                + std::size_t{0});
+    }
+
+    /// The rate the list provides `Which` at.
+    template<typename Which,
+             typename... Resources>
+    consteval unsigned long long hzOf(brigand::list<Resources...> provides) {
+        static_assert(providersOf<Which>(provides) == 1,
+                      "the clock tree provides no such clock (or more than one)");
+        return (Detail::ClockHz<Which, Resources>::value + ... + 0ULL);
+    }
+
+    /// The same with the list as a type: `hzOf<ClkRef, Provides>()`.
+    template<typename Which,
+             typename Provides>
+    consteval unsigned long long hzOf() {
+        return hzOf<Which>(Provides{});
+    }
 }}   // namespace Kvasir::Clocks

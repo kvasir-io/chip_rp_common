@@ -2,6 +2,7 @@
 #include "chip/rp_common/DMA.hpp"
 #include "chip/rp_common/PioStateMachine.hpp"
 #include "i2sPio/i2s.hpp"
+#include "kvasir/Util/StaticFunction.hpp"
 
 #include <array>
 #include <cstdint>
@@ -176,9 +177,15 @@ namespace Kvasir { namespace Pio {
 
         /// Called from the DMA completion interrupt to refill the buffer that just finished.
         /// Silence if nothing is installed.
-        using Fill = void (*)(std::span<Frame>);
+        ///
+        /// A StaticFunction, like the I2C and DMA callbacks: it stores a small callable inline,
+        /// so the generator may be a lambda capturing the object that owns the waveform; a plain
+        /// function pointer converts to one. Sized for a capture of one or two pointers.
+        static constexpr std::size_t FillSize = 2 * sizeof(void*);
 
-        static inline Fill fill{nullptr};
+        using Fill = Kvasir::StaticFunction<void(std::span<Frame>), FillSize>;
+
+        static inline Fill fill{};
 
         static inline std::array<std::array<Frame, BufferFrames>, 2> buffers{};
 
@@ -192,12 +199,12 @@ namespace Kvasir { namespace Pio {
 
         /// Start the clocks and the stream. `f` is called for each buffer as it frees up; it runs
         /// in the DMA interrupt, so it should be a waveform generator and not much else.
-        static void start(Fill f) {
+        static void start(Fill const& f) {
             fill        = f;
             underruns   = 0;
             buffersSent = 0;
             for(auto& b : buffers) { b.fill(0); }
-            if(fill != nullptr) {
+            if(fill) {
                 fill(std::span<Frame>{buffers[0]});
                 fill(std::span<Frame>{buffers[1]});
             }
@@ -286,7 +293,7 @@ namespace Kvasir { namespace Pio {
                     BufferFrames);
             next = static_cast<std::uint8_t>(1U - next);
 
-            if(fill != nullptr) {
+            if(fill) {
                 fill(std::span<Frame>{buffers[justFinished]});
             } else {
                 ++underruns;

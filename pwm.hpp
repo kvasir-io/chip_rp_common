@@ -248,6 +248,10 @@ namespace Kvasir { namespace PWM {
 
         using Regs = Kvasir::Peripheral::PWM::Registers<>::CH<detail::getChannel(Pin{})>;
 
+        /// The slice the pin belongs to and whether it is its A output (else B).
+        static constexpr unsigned Slice    = detail::getChannel(Pin{});
+        static constexpr bool     ChannelA = detail::isChannelA(Pin{});
+
         static constexpr std::uint16_t MinTop = []() {
             if constexpr(hasMinTop) {
                 return Config::minTop;
@@ -403,8 +407,11 @@ namespace Kvasir { namespace PWM {
         static constexpr unsigned Slice = detail::getChannel(Pin{});
         using Regs                      = Kvasir::Peripheral::PWM::Registers<>::CH<Slice>;
 
+        /// The divider as the hardware holds it, 8.4 fixed point: clockDiv rounded down
+        /// to a sixteenth. DivExact says whether that rounding lost anything.
         static constexpr std::uint16_t Div16 = static_cast<std::uint16_t>(Config::clockDiv * 16.0);
-        static constexpr std::uint16_t Top   = Config::top;
+        static constexpr bool DivExact     = static_cast<double>(Div16) == Config::clockDiv * 16.0;
+        static constexpr std::uint16_t Top = Config::top;
 
         using Provides
           = brigand::list<OutputResource<Slice, false>, SliceResource<Slice, Div16, Top>>;
@@ -460,9 +467,10 @@ namespace Kvasir { namespace PWM {
         }
 
         /// The rate the counter advances at while its input is high (level mode): clk_sys
-        /// over the divider. For edge modes the count is the number of edges.
-        static constexpr std::uint32_t countRate
-          = static_cast<std::uint32_t>(Config::clockSpeed / Config::clockDiv);
+        /// over the divider the hardware runs, Div16 / 16, not Config::clockDiv. For edge
+        /// modes the count is the number of edges.
+        static constexpr std::uint32_t countRate = static_cast<std::uint32_t>(
+          static_cast<std::uint64_t>(Config::clockSpeed) * 16U / Div16);
     };
 
     template<std::size_t Channel, typename Config, typename Callback>
