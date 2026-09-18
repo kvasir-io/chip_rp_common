@@ -47,13 +47,15 @@ enum class DescriptorSubType : std::uint8_t {
 
 enum class DeviceClass : std::uint8_t {
     Communication = 0x02,
+    CommonClass   = 0x02,   // bDeviceSubClass of the composite-device triple EF/02/01
     CDC_Data      = 0x0A,
     Miscellaneous = 0xEF,
 };
 
+// Bit 7 is reserved and must always be set.
 enum class ConfigurationAttributes : std::uint8_t {
     RemoteWakeup = 0x20,
-    SelfPowered  = 0x40,
+    SelfPowered  = 0xC0,
     BusPowered   = 0x80
 };
 
@@ -88,19 +90,16 @@ struct SetupPacket {
     enum class Recipient : std::uint8_t { device, interface, endpoint, other };
 
     enum class Request : std::uint8_t {
-        getStatus           = 0,
-        clearFeature        = 1,
-        setFeature          = 3,
-        setAddress          = 5,
-        getDescriptor       = 6,
-        setDescriptor       = 7,
-        getConfiguration    = 8,
-        setConfiguration    = 9,
-        getInterface        = 10,
-        setInterface        = 11,
-        setLineCoding       = 0x20,
-        getLineCoding       = 0x21,
-        setControlLineState = 0x22
+        getStatus        = 0,
+        clearFeature     = 1,
+        setFeature       = 3,
+        setAddress       = 5,
+        getDescriptor    = 6,
+        setDescriptor    = 7,
+        getConfiguration = 8,
+        setConfiguration = 9,
+        getInterface     = 10,
+        setInterface     = 11,
     };
 
     Direction direction() const { return static_cast<Direction>((bmRequestType & 0x80) >> 7); }
@@ -118,11 +117,12 @@ struct SetupPacket {
     uint16_t wLength;
 };
 
+// Copied byte for byte out of the DPRAM.
+static_assert(sizeof(SetupPacket) == 8);
+
 namespace detail {
     // USB Full-Speed maximum packet size (64 bytes)
     static constexpr std::size_t MaxPacketSize = 64;
-    // Maximum number of USB endpoints (RP2040/RP2350 supports 16 endpoints)
-    static constexpr std::size_t MaxEndpoints = 16;
 
     static constexpr std::uint16_t bcdUSB{0x0200};
 
@@ -198,15 +198,9 @@ namespace Descriptors {
         std::uint8_t         bInterval{};
     };
 
-    struct [[gnu::packed]] DeviceQualifier
-      : detail::DescriptorBase<DeviceQualifier, DescriptorType::deviceQualifier> {
-        std::uint16_t bcdUSB{detail::bcdUSB};
-        DeviceClass   bDeviceClass;
-        DeviceClass   bDeviceSubClass;
-        std::uint8_t  bDeviceProtocol;
-        std::uint8_t  bMaxPacketSize0;
-        std::uint8_t  bNumConfigurations;
-        std::uint8_t  bReserved{};
+    struct [[gnu::packed]] Bos : detail::DescriptorBase<Bos, DescriptorType::bos> {
+        std::uint16_t wTotalLength;
+        std::uint8_t  bNumDeviceCaps;
     };
 
     namespace detail {
@@ -248,6 +242,19 @@ namespace Descriptors {
             return buffer;
         }
 
+        // Calls f(descriptor) for each descriptor of a bLength-chained block, e.g. a whole
+        // configuration descriptor.
+        template<typename F>
+        constexpr void forEachDescriptor(std::span<std::byte const> block,
+                                         F                          f) {
+            while(block.size() >= 2) {
+                auto const length = std::to_integer<std::size_t>(block[0]);
+                if(length < 2 || length > block.size()) { return; }
+                f(block.first(length));
+                block = block.subspan(length);
+            }
+        }
+
     }   // namespace detail
 
     template<std::uint16_t DeviceVersion,
@@ -257,9 +264,11 @@ namespace Descriptors {
              std::uint8_t  ProductStringID,
              std::uint8_t  SerialNumberStringID,
              DeviceClass   Class,
-             DeviceClass   SubClass>
+             DeviceClass   SubClass,
+             std::uint16_t BcdUSB = Kvasir::USB::detail::bcdUSB>
     consteval auto makeDeviceDescriptorArray() {
         constexpr USB::Descriptors::Device DeviceDescriptor{
+          .bcdUSB{BcdUSB},
           .bDeviceClass{Class},
           .bDeviceSubClass{SubClass},
           .bDeviceProtocol{1},
@@ -410,9 +419,9 @@ IT insertStringDescriptor(std::size_t index,
         if(I == index) {
             result = insertStringDescriptor(std::get<I>(descriptors).get(), first, last);
             found  = true;
-            return true;
+            return false;
         }
-        return Size > I;
+        return true;
     };
 
     [&]<std::size_t... Ns>(std::index_sequence<Ns...>) {

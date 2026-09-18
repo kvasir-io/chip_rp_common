@@ -13,8 +13,16 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <utility>
 
 namespace Kvasir::USB::CDC {
+
+// Class-specific requests (CDC PSTN subclass).
+enum class Request : std::uint8_t {
+    setLineCoding       = 0x20,
+    getLineCoding       = 0x21,
+    setControlLineState = 0x22,
+};
 
 struct [[gnu::packed]] LineCoding {
     std::uint32_t dwDTERate{9600};
@@ -46,26 +54,9 @@ namespace ACM {
     namespace Descriptors {
         struct [[gnu::packed]] Descriptor
           : detail::InterfaceDescriptorBase<Descriptor, DescriptorSubType::CDC_ACM_Descriptor> {
-            // defaulted so `{}` init avoids -Wmissing-field-initializers on the base
-            std::uint8_t bmCapabilities{0};
+            // SET_LINE_CODING, GET_LINE_CODING and SET_CONTROL_LINE_STATE are supported
+            std::uint8_t bmCapabilities{0x02};
         };
-
-        template<std::uint16_t DeviceVersion,
-                 std::uint16_t VendorID,
-                 std::uint16_t ProductID,
-                 std::uint8_t  ManufacturerStringID,
-                 std::uint8_t  ProductStringID,
-                 std::uint8_t  SerialNumberStringID>
-        consteval auto makeDeviceDescriptorArray() {
-            return USB::Descriptors::makeDeviceDescriptorArray<DeviceVersion,
-                                                               VendorID,
-                                                               ProductID,
-                                                               ManufacturerStringID,
-                                                               ProductStringID,
-                                                               SerialNumberStringID,
-                                                               DeviceClass::Miscellaneous,
-                                                               DeviceClass::Communication>();
-        }
 
         template<std::uint8_t ManagementInterfaceId,
                  std::uint8_t DataInterfaceId,
@@ -83,7 +74,7 @@ namespace ACM {
               .bInterfaceNumber{ManagementInterfaceId},
               .bAlternateSetting{0},
               .bNumEndpoints{1},
-              .bInterfaceClass{2},
+              .bInterfaceClass{std::to_underlying(DeviceClass::Communication)},
               .bInterfaceSubClass{2},
               .bInterfaceProtocol{0}};
 
@@ -91,7 +82,7 @@ namespace ACM {
               .bInterfaceNumber{DataInterfaceId},
               .bAlternateSetting{0},
               .bNumEndpoints{2},
-              .bInterfaceClass{10},
+              .bInterfaceClass{std::to_underlying(DeviceClass::CDC_Data)},
               .bInterfaceSubClass{0},
               .bInterfaceProtocol{0}};
 
@@ -155,15 +146,14 @@ namespace ACM {
              typename Derived,
              std::size_t FirstInterfaceNumber,
              std::size_t FirstEndpointNumber,
-             template<typename, typename, typename, typename, std::size_t> class SendRecvImpl
-             = Kvasir::USB::detail::SendRecvAdapter>
+             typename Unused = void>
     struct Mixin {
     private:
         friend Derived;
         friend struct Kvasir::USB::detail::MixinTraits;   // Grants access to helper functions
 
         using Self
-          = Mixin<Clock, Config, Derived, FirstInterfaceNumber, FirstEndpointNumber, SendRecvImpl>;
+          = Mixin<Clock, Config, Derived, FirstInterfaceNumber, FirstEndpointNumber, Unused>;
 
         // CDC-ACM uses 2 interfaces (management + data)
         static constexpr std::size_t InterfaceCount = 2;
@@ -185,7 +175,28 @@ namespace ACM {
                                                         ManagementEndpointNumber,
                                                         EndpointDirection::In,
                                                         EndpointTransferType::Interrupt>;
-        using DataEndpointHandler = SendRecvImpl<Clock, Config, Derived, Self, DataEndpointNumber>;
+        using DataEndpointHandler = Kvasir::USB::detail::
+          BulkDataAdapter<Clock, Config, Derived, Self, DataEndpointNumber, true, true>;
+
+        // The notification endpoint: set up, never sent on, but its halt state is the host's to set.
+        struct Notification {
+            static constexpr std::uint8_t Address
+              = makeEndpointAddress(EndpointDirection::In,
+                                    static_cast<std::uint8_t>(ManagementEndpointNumber));
+
+            static inline bool halted{false};
+
+            static void halt() {
+                halted = true;
+                ManagementEP::stall();
+            }
+
+            static void clearHalt() {
+                halted = false;
+                ManagementEP::clearStall();
+                ManagementEP::resetPid();
+            }
+        };
 
         // Callbacks
         static void SetupEndpointsCallback() {
@@ -196,17 +207,20 @@ namespace ACM {
         static bool SetupPacketRequestCallback(SetupPacket const& pkt) {
             using Direction = SetupPacket::Direction;
             using Recipient = SetupPacket::Recipient;
-            using Request   = SetupPacket::Request;
+            using Type      = SetupPacket::Type;
 
-            if(pkt.recipient() == Recipient::interface) {
+            // A new request ends a SET_LINE_CODING whose data stage never came.
+            lineCodingExpected = false;
+
+            if(pkt.type() == Type::classT && pkt.recipient() == Recipient::interface) {
                 if(pkt.wIndex == ManagementInterface) {
-                    switch(pkt.bRequest) {
+                    switch(static_cast<Request>(std::to_underlying(pkt.bRequest))) {
                     case Request::setControlLineState:
                         {
                             if(pkt.direction() == Direction::hostToDevice) {
                                 using namespace std::string_view_literals;
                                 Derived::acknowledgeSetupRequest();
-                                acm_connected = (pkt.wValue & 0x01) != 0;
+                                connected = (pkt.wValue & 0x01) != 0;
                                 UC_LOG_I("CDC-ACM: Control line state - DTR={}, RTS={}",
                                          (pkt.wValue & 0x01) ? "on"sv : "off"sv,
                                          (pkt.wValue & 0x02) ? "on"sv : "off"sv);
@@ -217,10 +231,10 @@ namespace ACM {
                     case Request::getLineCoding:
                         {
                             if(pkt.direction() == Direction::deviceToHost) {
-                                Derived::ep0INDataPhase(
-                                  std::as_bytes(std::span{std::addressof(lineCoding), 1}));
                                 UC_LOG_I("CDC-ACM: Get line coding request");
-                                return true;
+                                return Derived::ep0INDataPhase(
+                                  std::as_bytes(std::span{std::addressof(lineCoding), 1}),
+                                  pkt.wLength);
                             }
                         }
                         break;
@@ -229,7 +243,7 @@ namespace ACM {
                             if(pkt.direction() == Direction::hostToDevice
                                && pkt.wLength == sizeof(USB::CDC::LineCoding))
                             {
-                                should_handle_line_coding = true;
+                                lineCodingExpected = true;
                                 Derived::ep0OUTDataPhase(sizeof(USB::CDC::LineCoding));
                                 UC_LOG_I("CDC-ACM: Set line coding request");
                                 return true;
@@ -239,37 +253,38 @@ namespace ACM {
                     default: break;
                     }
                 }
-            } else if(pkt.recipient() == Recipient::endpoint) {
-                if(pkt.direction() == Direction::hostToDevice
-                   && pkt.bRequest == Request::clearFeature)
-                {
-                    Derived::acknowledgeSetupRequest();
-                    UC_LOG_I("CDC-ACM: Clear endpoint feature (EP{})", pkt.wIndex & 0x7F);
-                    return true;
-                }
+                return false;
             }
-            return DataEndpointHandler::SetupPacketRequestCallback(pkt);
+            return detail::handleEndpointRequest<Derived, Notification>(pkt)
+                || detail::handleSetInterface<Derived>(pkt,
+                                                       ManagementInterface,
+                                                       ManagementEP::resetPid)
+                || detail::handleSetInterface<Derived>(pkt,
+                                                       DataInterface,
+                                                       DataEndpointHandler::restart)
+                || DataEndpointHandler::SetupPacketRequestCallback(pkt);
         }
 
         static bool EndpointHandlerCallback(std::size_t epNum,
                                             bool        in) {
             // Handle line coding data stage on EP0
-            if(epNum == 0 && !in && should_handle_line_coding) {
+            if(epNum == 0 && !in && lineCodingExpected) {
                 std::array<std::byte, sizeof(lineCoding)> tempBuffer{};
-                if(Derived::ep0OUTGetData(tempBuffer)) {
-                    should_handle_line_coding = false;
-
-                    std::memcpy(std::addressof(lineCoding), tempBuffer.data(), tempBuffer.size());
-                    Derived::acknowledgeSetupRequest();
-                    UC_LOG_I(
-                      "CDC-ACM: Line coding set - {} baud, {} data bits, parity={}, stop "
-                      "bits={}",
-                      lineCoding.dwDTERate,
-                      lineCoding.bDataBits,
-                      lineCoding.bParityType,
-                      lineCoding.bCharFormat);
+                lineCodingExpected = false;
+                if(!Derived::ep0OUTGetData(tempBuffer)) {
+                    Derived::stallControlRequest();
                     return true;
                 }
+                std::memcpy(std::addressof(lineCoding), tempBuffer.data(), tempBuffer.size());
+                Derived::acknowledgeSetupRequest();
+                UC_LOG_I(
+                  "CDC-ACM: Line coding set - {} baud, {} data bits, parity={}, stop "
+                  "bits={}",
+                  lineCoding.dwDTERate,
+                  lineCoding.bDataBits,
+                  lineCoding.bParityType,
+                  lineCoding.bCharFormat);
+                return true;
             }
             return DataEndpointHandler::EndpointHandlerCallback(epNum, in);
         }
@@ -280,27 +295,29 @@ namespace ACM {
         }
 
         static void ResetCallback() {
-            should_handle_line_coding = false;
-            acm_connected             = false;
+            lineCodingExpected   = false;
+            connected            = false;
+            Notification::halted = false;
             ManagementEP::reset();
             DataEndpointHandler::ResetCallback();
         }
 
         static void ConfiguredCallback(std::uint8_t configuration) {
-            if(configuration == 0) { acm_connected = false; }
+            if(configuration == 0) { connected = false; }
+            ManagementEP::resetPid();
             DataEndpointHandler::ConfiguredCallback(configuration);
         }
 
         // State
-        static inline std::atomic<bool>    acm_connected             = false;
-        static inline bool                 should_handle_line_coding = false;
+        static inline std::atomic<bool>    connected          = false;
+        static inline bool                 lineCodingExpected = false;
         static inline USB::CDC::LineCoding lineCoding{};
 
     public:
         // Public API
-        static bool isConnected() { return acm_connected; }
+        static bool isConnected() { return connected; }
 
-        // Expose SendRecvAdapter Public API
+        // The data endpoint
         static bool isSendReady() { return DataEndpointHandler::isSendReady() && isConnected(); }
 
         static auto& getRecvBuffer() { return DataEndpointHandler::getRecvBuffer(); }
@@ -309,9 +326,7 @@ namespace ACM {
             return DataEndpointHandler::send(data);
         }
 
-        static void send_nocopy(std::span<std::byte const> data) {
-            DataEndpointHandler::send_nocopy(data);
-        }
+        static std::size_t writeAvailable() { return DataEndpointHandler::writeAvailable(); }
     };
 
 }   // namespace ACM

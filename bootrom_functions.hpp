@@ -19,27 +19,37 @@ namespace RomFunctions {
         return static_cast<std::uint32_t>(c1) | (static_cast<std::uint32_t>(c2) << 8);
     }
 
-    template<typename T,
-             std::uint32_t Address>
-    T dereferenceAs() {
-        return reinterpret_cast<T>(*reinterpret_cast<std::uint16_t const*>(Address));
+    // The bootrom's function lookup differs between the chips:
+    //   RP2040: rom_table_lookup(table, code) at 0x18, the function table's address at 0x14
+    //   RP2350: rom_table_lookup(code, mask) at 0x16, mask 0x0004 selecting Arm secure code
+    // Both addresses are 16-bit pointers into the ROM.
+    template<typename F>
+    [[KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] inline F lookupRomFunction(std::uint32_t code) {
+#if __has_include("chip/rp2040.hpp")
+        using RomTableLookupFunction = F (*)(std::uint16_t const* table, std::uint32_t code);
+
+        auto const lookup = reinterpret_cast<RomTableLookupFunction>(
+          static_cast<std::uintptr_t>(*reinterpret_cast<std::uint16_t const*>(0x18U)));
+        auto const table = reinterpret_cast<std::uint16_t const*>(
+          static_cast<std::uintptr_t>(*reinterpret_cast<std::uint16_t const*>(0x14U)));
+        return lookup(table, code);
+#else
+        static constexpr std::uint32_t ArmSecureFunction = 0x0004;
+
+        using RomTableLookupFunction = F (*)(std::uint32_t code, std::uint32_t mask);
+
+        auto const lookup = reinterpret_cast<RomTableLookupFunction>(
+          static_cast<std::uintptr_t>(*reinterpret_cast<std::uint16_t const*>(0x16U)));
+        return lookup(code, ArmSecureFunction);
+#endif
     }
 
     template<char C1,
              char C2,
              typename F>
     F getRomFunctionPointer() {
-        static constexpr std::uint32_t LookupFunctionAddress{0x16};
-        static constexpr auto          FunctionLookupCode = lookupCode(C1, C2);
-
-        using RomTabelLookupFunction = F (*)(std::uint32_t code, std::uint32_t mask);
-
-        auto const romTableLookupFunction
-          = dereferenceAs<RomTabelLookupFunction, LookupFunctionAddress>();
-
-        auto const fp = romTableLookupFunction(FunctionLookupCode, 0x0004);
+        auto const fp = lookupRomFunction<F>(lookupCode(C1, C2));
         assert(fp != nullptr);
-
         return fp;
     }
 
@@ -50,14 +60,7 @@ namespace RomFunctions {
              char C2,
              typename F>
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] F getRomFunctionPointerFromRam() {
-        static constexpr std::uint32_t FunctionLookupCode = lookupCode(C1, C2);
-
-        using RomTableLookupFunction = F (*)(std::uint32_t code, std::uint32_t mask);
-
-        auto const romTableLookupFunction = reinterpret_cast<RomTableLookupFunction>(
-          static_cast<std::uintptr_t>(*reinterpret_cast<std::uint16_t const*>(0x16U)));
-
-        return romTableLookupFunction(FunctionLookupCode, 0x0004);
+        return lookupRomFunction<F>(lookupCode(C1, C2));
     }
 
     template<char C1,

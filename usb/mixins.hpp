@@ -1,10 +1,11 @@
 #pragma once
 
-#include "cdcacm.hpp"
+#include "descriptors.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
-#include <kvasir/Atomic/Queue.hpp>
+#include <cstdint>
 #include <utility>
 
 namespace Kvasir::USB::detail {
@@ -94,10 +95,7 @@ struct MixinTraits {
                       std::size_t,
                       std::size_t> class... Mixins>
     static consteval std::size_t countMixinInterfaces() {
-        if constexpr(sizeof...(Mixins) > 0) {
-            return (Mixins<Clock, Config, Derived, 0, 0>::InterfaceCount + ... + 0);
-        }
-        return 0;
+        return (Mixins<Clock, Config, Derived, 0, 0>::InterfaceCount + ... + 0);
     }
 
     template<typename Clock,
@@ -109,10 +107,30 @@ struct MixinTraits {
                       std::size_t,
                       std::size_t> class... Mixins>
     static consteval std::size_t countMixinEndpoints() {
-        if constexpr(sizeof...(Mixins) > 0) {
-            return (Mixins<Clock, Config, Derived, 0, 0>::EndpointCount + ... + 0);
+        return (Mixins<Clock, Config, Derived, 0, 0>::EndpointCount + ... + 0);
+    }
+
+    // A mixin may require a newer bcdUSB than 2.00 (e.g. 2.01 for a BOS descriptor).
+    template<typename Mixin>
+    static consteval std::uint16_t getMixinBcdUSB() {
+        if constexpr(requires { Mixin::BcdUSB; }) {
+            return Mixin::BcdUSB;
+        } else {
+            return Kvasir::USB::detail::bcdUSB;
         }
-        return 0;
+    }
+
+    template<typename Clock,
+             typename Config,
+             typename Derived,
+             template<typename,
+                      typename,
+                      typename,
+                      std::size_t,
+                      std::size_t> class... Mixins>
+    static consteval std::uint16_t maxBcdUSB() {
+        return std::max(
+          {Kvasir::USB::detail::bcdUSB, getMixinBcdUSB<Mixins<Clock, Config, Derived, 0, 0>>()...});
     }
 
     // Helper wrapper for passing mixin packs

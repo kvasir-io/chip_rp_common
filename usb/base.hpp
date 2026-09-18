@@ -10,6 +10,7 @@
 #include "mixins.hpp"
 #include "resetInterface.hpp"
 #include "simplebulk.hpp"
+#include "winUsb.hpp"
 
 #include <algorithm>
 #include <array>
@@ -115,16 +116,19 @@ namespace detail {
                     return 1;
                 }
             }();
-            static constexpr auto DoubleBufferd = [] {
-                if constexpr(requires { ConfigT::DoubleBufferd; }) {
-                    return ConfigT::DoubleBufferd;
+            static_assert(
+              !requires { ConfigT::DoubleBufferd; },
+              "Config::DoubleBufferd is now spelt DoubleBuffered");
+            static constexpr auto DoubleBuffered = [] {
+                if constexpr(requires { ConfigT::DoubleBuffered; }) {
+                    return ConfigT::DoubleBuffered;
                 } else {
                     return true;
                 }
             }();
         };
 
-        static constexpr bool DoubleBufferd = Config::DoubleBufferd;
+        static constexpr bool DoubleBuffered = Config::DoubleBuffered;
 
         // EP0 plus one DPRAM group per mixin endpoint number. EndpointOps always
         // addresses buffers through the DOUBLEBUFFER groups (2 x 2 x 64 bytes each), of
@@ -165,23 +169,24 @@ namespace detail {
               }
           }()};
 
-        static constexpr auto DeviceDescriptor{
-          USB::Descriptors::makeDeviceDescriptorArray<Config::ProductVersionBCD,
-                                                      Config::VendorID,
-                                                      Config::ProductID,
-                                                      1,
-                                                      2,
-                                                      3,
-                                                      Class,
-                                                      SubClass>()};
+        static constexpr auto DeviceDescriptor{USB::Descriptors::makeDeviceDescriptorArray<
+          Config::ProductVersionBCD,
+          Config::VendorID,
+          Config::ProductID,
+          1,
+          2,
+          3,
+          Class,
+          SubClass,
+          detail::MixinTraits::maxBcdUSB<Clock, ConfigT, Self, Mixins...>()>()};
 
         static constexpr auto ConfigDescriptor = []() {
             constexpr std::size_t MixinInterfaceCount
-              = detail::MixinTraits::countMixinInterfaces<Clock, Config, Self, Mixins...>();
+              = detail::MixinTraits::countMixinInterfaces<Clock, ConfigT, Self, Mixins...>();
 
             constexpr auto mixinDescriptors
               = detail::MixinTraits::assembleMixinDescriptors<Clock,
-                                                              Config,
+                                                              ConfigT,
                                                               Self,
                                                               FirstInterfaceNumber,
                                                               FirstEndpointNumber,
@@ -198,9 +203,11 @@ namespace detail {
         static inline std::atomic<std::uint8_t>  configuration{};
         static inline std::uint8_t               deviceBusAddr{};
         static inline bool                       pendingAddressSet{false};
-        static inline std::span<std::byte const> remainingDescriptor{};
+        static inline std::span<std::byte const> remainingControlData{};
+        static inline bool                       endOfTransferPending{false};
         static inline std::array<std::byte, 256> stringDescriptorBuffer{};
         static inline detail::EP0ControlState    ep0_ctrl{};
+        static inline std::uint8_t               isrMaskDepth{};
 
         enum class Fault : std::uint8_t {
             epTxError = 1,
@@ -323,10 +330,11 @@ namespace detail {
 
         static void handleBusReset() {
             ep0_ctrl.reset();
-            deviceBusAddr       = 0;
-            pendingAddressSet   = false;
-            configuration       = 0;
-            remainingDescriptor = {};
+            deviceBusAddr        = 0;
+            pendingAddressSet    = false;
+            configuration        = 0;
+            remainingControlData = {};
+            endOfTransferPending = false;
             EP0_IN::reset();
             EP0_OUT::reset();
 
@@ -345,18 +353,19 @@ namespace detail {
                     apply(write(Regs::EP<0>::ADDR_ENDP::address, deviceBusAddr));
                     pendingAddressSet = false;
                     EP0_IN::bufferFinished();
+                    ep0_ctrl.transition(ControlStage::Idle);
                     return true;
                 }
-                if(!remainingDescriptor.empty()) {
-                    auto const chunkSize = std::min(remainingDescriptor.size(), MaxPacketSize);
-                    bool const isLast    = (remainingDescriptor.size() <= MaxPacketSize);
+                if(!remainingControlData.empty() || endOfTransferPending) {
                     EP0_IN::bufferFinished();
-                    if(isLast) {
-                        ep0IN<true>(remainingDescriptor.first(chunkSize));
-                        remainingDescriptor = {};
+                    auto const chunk = remainingControlData.first(
+                      std::min(remainingControlData.size(), MaxPacketSize));
+                    remainingControlData = remainingControlData.subspan(chunk.size());
+                    if(chunk.empty()) { endOfTransferPending = false; }
+                    if(remainingControlData.empty() && !endOfTransferPending) {
+                        ep0IN<true>(chunk);
                     } else {
-                        ep0IN<false>(remainingDescriptor.first(chunkSize));
-                        remainingDescriptor = remainingDescriptor.subspan(chunkSize);
+                        ep0IN<false>(chunk);
                     }
                     return true;
                 }
@@ -436,34 +445,14 @@ namespace detail {
             }
         }
 
-        static bool handleDeviceDescriptor() {
-            ep0_ctrl.transition(ControlStage::Data);
-            ep0IN<true>(Self::DeviceDescriptor);
-            return true;
+        static bool handleDeviceDescriptor(SetupPacket const& pkt) {
+            return ep0INDataPhase(Self::DeviceDescriptor, pkt.wLength);
         }
 
         static bool handleConfigDescriptor(SetupPacket const& pkt) {
-            if(pkt.wLength >= Self::ConfigDescriptor.size()) {
-                if constexpr(Self::ConfigDescriptor.size() > MaxPacketSize) {
-                    ep0_ctrl.transition(ControlStage::Data);
-                    remainingDescriptor = std::span{Self::ConfigDescriptor.begin() + MaxPacketSize,
-                                                    Self::ConfigDescriptor.end()};
-                    ep0IN<false>(std::span{Self::ConfigDescriptor.begin(),
-                                           Self::ConfigDescriptor.begin() + MaxPacketSize});
-                } else {
-                    ep0_ctrl.transition(ControlStage::Data);
-                    ep0IN<true>(Self::ConfigDescriptor);
-                }
-                return true;
-            } else if(pkt.wLength == sizeof(Kvasir::USB::Descriptors::Configuration)) {
-                ep0_ctrl.transition(ControlStage::Data);
-                // Host queries only config part
-                ep0IN<true>(std::span{Self::ConfigDescriptor.begin(),
-                                      Self::ConfigDescriptor.begin()
-                                        + sizeof(Kvasir::USB::Descriptors::Configuration)});
-                return true;
-            }
-            return false;
+            // The only configuration has index 0.
+            if((pkt.wValue & 0xff) != 0) { return false; }
+            return ep0INDataPhase(Self::ConfigDescriptor, pkt.wLength);
         }
 
         static bool handleStringDescriptor(SetupPacket const& pkt) {
@@ -474,6 +463,10 @@ namespace detail {
             auto const  index  = static_cast<std::size_t>(pkt.wValue & 0xff);
             auto&       buffer = stringDescriptorBuffer;
             std::size_t len{};
+
+            // Windows probes for a Microsoft OS 1.0 descriptor on every enumeration.
+            static constexpr std::size_t MsOs10StringIndex = 0xEE;
+            if(index == MsOs10StringIndex) { return stallQuietly(); }
 
             if(index == 0) {
                 buffer[2] = USBLanguageDescriptor[0];
@@ -493,35 +486,25 @@ namespace detail {
             buffer[0] = std::byte(len);
             buffer[1] = std::byte(DescriptorType::string);
 
-            auto const totalLen = std::min<std::size_t>(pkt.wLength, len);
-            ep0_ctrl.transition(ControlStage::Data);
-
-            if(totalLen <= MaxPacketSize) {
-                ep0IN<true>(std::span{buffer.data(), totalLen});
-            } else {
-                ep0IN<false>(std::span{buffer.data(), MaxPacketSize});
-                remainingDescriptor
-                  = std::span{buffer.data() + MaxPacketSize, totalLen - MaxPacketSize};
-            }
-            return true;
+            return ep0INDataPhase(std::span{buffer.data(), len}, pkt.wLength);
         }
 
-        static bool handleDeviceQualifier() {
-            // Full-Speed devices STALL deviceQualifier requests per USB 2.0 spec
-            // Handle this STALL differently to prevent generic error message since it is default behavior and no error
-            EP0_IN::stall();
-            EP0_OUT::stall();
-            ep0_ctrl.transition(ControlStage::Stall);
+        // Descriptors hosts routinely ask for that a full-speed device does not have; the
+        // STALL is the expected answer, so it is not logged.
+        static bool stallQuietly() {
+            stallControlRequest();
             return true;
         }
 
         static bool handleGetDescriptor(SetupPacket const& pkt) {
             switch(pkt.descriptorType()) {
-            case DescriptorType::device:          return handleDeviceDescriptor();
-            case DescriptorType::configuration:   return handleConfigDescriptor(pkt);
-            case DescriptorType::string:          return handleStringDescriptor(pkt);
-            case DescriptorType::deviceQualifier: return handleDeviceQualifier();
-            default:                              return false;
+            case DescriptorType::device:                  return handleDeviceDescriptor(pkt);
+            case DescriptorType::configuration:           return handleConfigDescriptor(pkt);
+            case DescriptorType::string:                  return handleStringDescriptor(pkt);
+            case DescriptorType::deviceQualifier:
+            case DescriptorType::otherSpeedConfiguration:
+            case DescriptorType::debug:                   return stallQuietly();
+            default:                                      return false;
             }
         }
 
@@ -531,15 +514,18 @@ namespace detail {
 
             case SetupPacket::Request::getStatus:
                 {
-                    ep0_ctrl.transition(ControlStage::Data);
-                    std::array<std::byte, 2> buffer{};
-                    ep0IN<true>(buffer);
-                    return true;
+                    std::array<std::byte, 2> const status{std::byte{Config::BusPowered ? 0 : 1}};
+                    return ep0INDataPhase(status, pkt.wLength);
+                }
+
+            case SetupPacket::Request::getConfiguration:
+                {
+                    std::array<std::byte, 1> const value{std::byte{configuration.load()}};
+                    return ep0INDataPhase(value, pkt.wLength);
                 }
 
             default: return false;
             }
-            return false;
         }
 
         static bool handleSetupPacketDeviceOut(SetupPacket const& pkt) {
@@ -547,12 +533,14 @@ namespace detail {
             case SetupPacket::Request::setAddress:
                 acknowledgeSetupRequest();
                 // Set address is special: send 0-length status packet first with address 0
-                deviceBusAddr     = pkt.wValue & 0xff;
+                deviceBusAddr     = pkt.wValue & 0x7f;
                 pendingAddressSet = true;
                 return true;
 
             case SetupPacket::Request::setConfiguration:
                 using namespace std::string_view_literals;
+                // The only configuration is 1.
+                if((pkt.wValue & 0xff) > 1) { return false; }
                 acknowledgeSetupRequest();
                 configuration = (pkt.wValue & 0xff);
 
@@ -566,16 +554,62 @@ namespace detail {
             }
         }
 
+        static constexpr std::size_t TotalInterfaceCount
+          = MixinTraits::countMixinInterfaces<Clock, ConfigT, Self, Mixins...>();
+
+        // Standard requests no mixin claimed: interfaces without endpoints of their own always
+        // run alternate setting 0, and EP0 is never halted.
+        static bool handleStandardFallback(SetupPacket const& pkt) {
+            using Request   = SetupPacket::Request;
+            using Recipient = SetupPacket::Recipient;
+            bool const in   = pkt.direction() == SetupPacket::Direction::deviceToHost;
+
+            if(pkt.recipient() == Recipient::interface) {
+                if(configuration == 0 || pkt.wIndex >= TotalInterfaceCount) { return false; }
+                switch(pkt.bRequest) {
+                case Request::getStatus:
+                    {
+                        if(!in) { return false; }
+                        static constexpr std::array<std::byte, 2> Status{};
+                        return ep0INDataPhase(Status, pkt.wLength);
+                    }
+                case Request::getInterface:
+                    {
+                        if(!in) { return false; }
+                        static constexpr std::array<std::byte, 1> AlternateSetting{};
+                        return ep0INDataPhase(AlternateSetting, pkt.wLength);
+                    }
+                case Request::setInterface:
+                    if(in || pkt.wValue != 0) { return false; }
+                    acknowledgeSetupRequest();
+                    return true;
+                default: return false;
+                }
+            }
+            if(pkt.recipient() == Recipient::endpoint && (pkt.wIndex & 0x7f) == 0
+               && pkt.bRequest == Request::getStatus && in)
+            {
+                static constexpr std::array<std::byte, 2> Status{};
+                return ep0INDataPhase(Status, pkt.wLength);
+            }
+            return false;
+        }
+
         static void handleSetupPacket(SetupPacket const& pkt) {
-            remainingDescriptor = {};
+            remainingControlData = {};
+            endOfTransferPending = false;
             ep0_ctrl.transition(ControlStage::Setup);
 
+            EP0_IN::cancelTransfer();
+            EP0_OUT::cancelTransfer();
             EP0_IN::state.setDataPhase();
             EP0_OUT::state.setDataPhase();
 
             bool handled = false;
 
-            if(pkt.recipient() == SetupPacket::Recipient::device) {
+            if(pkt.type() == SetupPacket::Type::standard
+               && pkt.recipient() == SetupPacket::Recipient::device)
+            {
                 if(pkt.direction() == SetupPacket::Direction::hostToDevice) {
                     handled = handleSetupPacketDeviceOut(pkt);
                 } else {
@@ -583,6 +617,9 @@ namespace detail {
                 }
             }
             if(!handled) { handled = MixinsBase::callSetupPacketRequest(pkt); }
+            if(!handled && pkt.type() == SetupPacket::Type::standard) {
+                handled = handleStandardFallback(pkt);
+            }
 
             // Centralized error handling - USB 2.0 spec requires STALL for unsupported requests
             if(!handled) {
@@ -592,9 +629,7 @@ namespace detail {
                   UC_LOG_W,
                   "USB: STALL - Unhandled setup packet: {}",
                   pkt);
-                EP0_IN::stall();
-                EP0_OUT::stall();
-                ep0_ctrl.transition(ControlStage::Stall);
+                stallControlRequest();
             }
         }
 
@@ -652,11 +687,34 @@ namespace detail {
     public:
         // We can make them private with c++26 friend pack indexing
         //Mixin API
-        static void ep0INDataPhase(std::span<std::byte const> data) {
-            assert(MaxPacketSize >= data.size());
+        // Multi-packet IN data stage, truncated to wLength. data must outlive the transfer.
+        static bool ep0INDataPhase(std::span<std::byte const> data,
+                                   std::uint16_t              wLength) {
+            // wLength 0: no data stage, the status stage follows directly.
+            if(wLength == 0) {
+                acknowledgeSetupRequest();
+                return true;
+            }
+            data = data.first(std::min<std::size_t>(data.size(), wLength));
+            // A short reply that ends on a packet boundary needs a zero-length packet.
+            bool const endsOnPacketBoundary
+              = !data.empty() && data.size() < wLength && data.size() % MaxPacketSize == 0;
+            auto const first = data.first(std::min(data.size(), MaxPacketSize));
+
             ep0_ctrl.transition(ControlStage::Data);
-            ep0IN<true>(data);
+            remainingControlData = data.subspan(first.size());
+            endOfTransferPending = endsOnPacketBoundary;
+            if(remainingControlData.empty() && !endOfTransferPending) {
+                ep0IN<true>(first);
+            } else {
+                ep0IN<false>(first);
+            }
+            return true;
         }
+
+        // Whole configuration descriptor, for mixins describing other mixins' interfaces.
+        // Only usable where the device type is complete, i.e. inside a callback body.
+        static constexpr std::span<std::byte const> configDescriptor() { return ConfigDescriptor; }
 
         static void ep0OUTDataPhase(std::size_t size) {
             assert(MaxPacketSize >= size);
@@ -689,6 +747,34 @@ namespace detail {
         static void acknowledgeSetupRequest() {
             ep0_ctrl.transition(ControlStage::Status);
             ep0IN<true>(std::span<std::byte const>{});
+        }
+
+        // Ends the current control request with a STALL, from the setup or the data stage.
+        static void stallControlRequest() {
+            EP0_IN::stall();
+            EP0_OUT::stall();
+            ep0_ctrl.transition(ControlStage::Stall);
+        }
+
+        // Runs f with the USB interrupt masked, for thread code touching endpoint state the
+        // interrupt also changes. Nests; safe from inside the interrupt too.
+        template<typename F>
+        static decltype(auto) withIsrMasked(F&& f) {
+            struct Guard {
+                Guard() {
+                    if(isrMaskDepth++ == 0) { apply(Kvasir::Nvic::makeDisable(InterruptIndexes)); }
+                }
+
+                ~Guard() {
+                    if(--isrMaskDepth == 0) { apply(Kvasir::Nvic::makeEnable(InterruptIndexes)); }
+                }
+
+                Guard(Guard const&)            = delete;
+                Guard& operator=(Guard const&) = delete;
+            };
+
+            Guard const guard{};
+            return std::forward<F>(f)();
         }
 
     public:
@@ -733,8 +819,8 @@ namespace detail {
               set(Regs::SIE_CTRL::pullup_en),
               set(Regs::SIE_CTRL::ep0_int_1buf),
               clear(Regs::SIE_CTRL::pulldown_en),
-              write(Regs::SIE_CTRL::ep0_double_buf,
-                    Kvasir::Register::value<DoubleBufferd ? 1 : 0>())));
+              // EP0 single buffered, see EndpointOps::DoubleBuffered.
+              write(Regs::SIE_CTRL::ep0_double_buf, Kvasir::Register::value<0>())));
         };
 
     public:
@@ -758,14 +844,14 @@ using CDC_ACM_Standard = detail::USBBase<Clock,
                                          CDC::ACM::Mixin,
                                          Mixins...>;
 
-// Standard simple bulk device with SendRecv capability
+// Standard simple bulk device. Device class EF/02/01: a composite device.
 template<typename Clock,
          typename Config,
          template<typename, typename, typename, std::size_t, std::size_t> class... Mixins>
 using Bulk_Standard = detail::USBBase<Clock,
                                       Config,
                                       DeviceClass::Miscellaneous,
-                                      DeviceClass::Miscellaneous,
+                                      DeviceClass::CommonClass,
                                       0,   // FirstInterfaceNumber
                                       1,   // FirstEndpointNumber
                                       SimpleBulk::Mixin,

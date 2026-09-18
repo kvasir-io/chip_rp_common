@@ -33,7 +33,7 @@ private:
 
     // Callbacks
     static bool SetupPacketRequestCallback(SetupPacket const& pkt) {
-        if(pkt.wIndex != FirstInterfaceNumber
+        if(pkt.type() == SetupPacket::Type::standard || pkt.wIndex != FirstInterfaceNumber
            || pkt.recipient() != SetupPacket::Recipient::interface)
         {
             return false;

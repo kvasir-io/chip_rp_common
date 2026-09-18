@@ -10,32 +10,20 @@
 
 namespace Kvasir::USB::SimpleBulk {
 namespace Descriptors {
-    template<std::uint16_t DeviceVersion,
-             std::uint16_t VendorID,
-             std::uint16_t ProductID,
-             std::uint8_t  ManufacturerStringID,
-             std::uint8_t  ProductStringID,
-             std::uint8_t  SerialNumberStringID>
-    consteval auto makeDeviceDescriptorArray() {
-        return USB::Descriptors::makeDeviceDescriptorArray<DeviceVersion,
-                                                           VendorID,
-                                                           ProductID,
-                                                           ManufacturerStringID,
-                                                           ProductStringID,
-                                                           SerialNumberStringID,
-                                                           DeviceClass::Miscellaneous,
-                                                           DeviceClass::Miscellaneous>();
-    }
-
+    /// One vendor bulk interface: one IN endpoint, plus the matching OUT endpoint when the
+    /// interface is bidirectional. bInterfaceProtocol tells a host the device's interfaces apart.
     template<std::uint8_t InterfaceID,
-             std::uint8_t DataEndpointID>
+             std::uint8_t DataEndpointID,
+             bool         Bidirectional,
+             std::uint8_t Protocol>
     consteval auto makeInterfaceDescriptorArrays() {
-        constexpr USB::Descriptors::Interface InterfaceDescriptor{.bInterfaceNumber{InterfaceID},
-                                                                  .bAlternateSetting{0},
-                                                                  .bNumEndpoints{2},
-                                                                  .bInterfaceClass{255},
-                                                                  .bInterfaceSubClass{0},
-                                                                  .bInterfaceProtocol{0}};
+        constexpr USB::Descriptors::Interface InterfaceDescriptor{
+          .bInterfaceNumber{InterfaceID},
+          .bAlternateSetting{0},
+          .bNumEndpoints{Bidirectional ? std::uint8_t{2} : std::uint8_t{1}},
+          .bInterfaceClass{255},
+          .bInterfaceSubClass{0},
+          .bInterfaceProtocol{Protocol}};
 
         constexpr USB::Descriptors::Endpoint DataInEndpointDescriptor{
           .bEndpointAddress{makeEndpointAddress(EndpointDirection::In, DataEndpointID)},
@@ -47,68 +35,73 @@ namespace Descriptors {
           .bmAttributes{EndpointTransferType::Bulk},
           .wMaxPacketSize{detail::MaxPacketSize}};
 
-        constexpr auto Interface
-          = USB::Descriptors::detail::generateArray(InterfaceDescriptor,
-                                                    DataOutEndpointDescriptor,
-                                                    DataInEndpointDescriptor);
-
-        return Interface;
-    }
-
-    // Device-to-host only interface. Protocol 2 tells a host apart from the command
-    // interface (protocol 0) and the picotool reset interface (protocol 1) without
-    // relying on interface order.
-    template<std::uint8_t InterfaceID,
-             std::uint8_t DataEndpointID>
-    consteval auto makeInInterfaceDescriptorArrays() {
-        constexpr USB::Descriptors::Interface InterfaceDescriptor{.bInterfaceNumber{InterfaceID},
-                                                                  .bAlternateSetting{0},
-                                                                  .bNumEndpoints{1},
-                                                                  .bInterfaceClass{255},
-                                                                  .bInterfaceSubClass{0},
-                                                                  .bInterfaceProtocol{2}};
-
-        constexpr USB::Descriptors::Endpoint DataInEndpointDescriptor{
-          .bEndpointAddress{makeEndpointAddress(EndpointDirection::In, DataEndpointID)},
-          .bmAttributes{EndpointTransferType::Bulk},
-          .wMaxPacketSize{detail::MaxPacketSize}};
-
-        return USB::Descriptors::detail::generateArray(InterfaceDescriptor,
-                                                       DataInEndpointDescriptor);
+        if constexpr(Bidirectional) {
+            return USB::Descriptors::detail::generateArray(InterfaceDescriptor,
+                                                           DataOutEndpointDescriptor,
+                                                           DataInEndpointDescriptor);
+        } else {
+            return USB::Descriptors::detail::generateArray(InterfaceDescriptor,
+                                                           DataInEndpointDescriptor);
+        }
     }
 }   // namespace Descriptors
 
-// Simple Bulk Mixin - provides simple bulk functionality
+/// A vendor bulk interface, in the shape the application needs:
+///
+///   Framed          send() is one message, and the host reads exactly that message. Without it
+///                   the endpoint carries a byte stream: write() what there is room for, flush()
+///                   where the host's transfer should end.
+///   Bidirectional   an OUT endpoint too, whose data waits in getRecvBuffer() and whose queue
+///                   NAKs the host when it is full.
+///   Protocol        bInterfaceProtocol, to tell a device's interfaces apart on the host.
+///
+/// A device with several of these addresses them by their type rather than through the device:
+///
+///     using Commands = Kvasir::USB::SimpleBulk::Mixin<Clock, Config, Usb, 0, 1>;
+///     Commands::send(payload);
 template<typename Clock,
          typename Config,
          typename Derived,
-         std::size_t FirstInterfaceNumber,
-         std::size_t FirstEndpointNumber,
-         template<typename, typename, typename, typename, std::size_t> class SendRecvImpl
-         = Kvasir::USB::detail::SendRecvAdapter>
+         std::size_t  FirstInterfaceNumber,
+         std::size_t  FirstEndpointNumber,
+         bool         Framed        = true,
+         bool         Bidirectional = true,
+         std::uint8_t Protocol      = 0>
 struct Mixin {
 private:
     friend Derived;
-    friend struct Kvasir::USB::detail::MixinTraits;   // Grants access to helper functions
+    friend struct Kvasir::USB::detail::MixinTraits;
 
-    using Self
-      = Mixin<Clock, Config, Derived, FirstInterfaceNumber, FirstEndpointNumber, SendRecvImpl>;
+    using Self = Mixin<Clock,
+                       Config,
+                       Derived,
+                       FirstInterfaceNumber,
+                       FirstEndpointNumber,
+                       Framed,
+                       Bidirectional,
+                       Protocol>;
 
     static constexpr std::size_t DataEndpointNumber = FirstEndpointNumber;
     static constexpr std::size_t InterfaceCount     = 1;
     static constexpr std::size_t EndpointCount      = 1;
 
     static constexpr auto InterfaceDescriptor
-      = USB::SimpleBulk::Descriptors::makeInterfaceDescriptorArrays<FirstInterfaceNumber,
-                                                                    DataEndpointNumber>();
+      = Descriptors::makeInterfaceDescriptorArrays<FirstInterfaceNumber,
+                                                   DataEndpointNumber,
+                                                   Bidirectional,
+                                                   Protocol>();
 
-    using DataEndpointHandler = SendRecvImpl<Clock, Config, Derived, Self, DataEndpointNumber>;
+    using DataEndpointHandler = Kvasir::USB::detail::
+      BulkDataAdapter<Clock, Config, Derived, Self, DataEndpointNumber, Framed, Bidirectional>;
 
     // Callbacks
     static void SetupEndpointsCallback() { DataEndpointHandler::SetupEndpointsCallback(); }
 
     static bool SetupPacketRequestCallback(SetupPacket const& pkt) {
-        return DataEndpointHandler::SetupPacketRequestCallback(pkt);
+        return detail::handleSetInterface<Derived>(pkt,
+                                                   FirstInterfaceNumber,
+                                                   DataEndpointHandler::restart)
+            || DataEndpointHandler::SetupPacketRequestCallback(pkt);
     }
 
     static bool EndpointHandlerCallback(std::size_t epNum,
@@ -128,92 +121,52 @@ private:
     }
 
 public:
-    // A vendor bulk interface has no notion of a host "opening" it the way CDC-ACM has
-    // DTR. Connected means the bus is configured: that is when the host may talk, and
-    // a bus reset or unplug is the only disconnect there is. Whether an application on
-    // the host is alive is the protocol's business (a heartbeat), not the transport's.
+    /// Connected means configured: a vendor bulk interface has no "open" the way CDC-ACM has DTR.
     static bool isConnected() { return Derived::isConfigured(); }
 
-    // Expose SendRecvAdapter Public API
     static bool isSendReady() { return DataEndpointHandler::isSendReady() && isConnected(); }
-
-    static auto& getRecvBuffer() { return DataEndpointHandler::getRecvBuffer(); }
 
     static bool send(std::span<std::byte const> data) { return DataEndpointHandler::send(data); }
 
-    static void send_nocopy(std::span<std::byte const> data) {
-        DataEndpointHandler::send_nocopy(data);
+    static std::size_t write(std::span<std::byte const> data)
+        requires(!Framed)
+    {
+        return DataEndpointHandler::write(data);
     }
+
+    static std::size_t writeAvailable() { return DataEndpointHandler::writeAvailable(); }
+
+    static void flush()
+        requires(!Framed)
+    {
+        DataEndpointHandler::flush();
+    }
+
+    static auto& getRecvBuffer()
+        requires Bidirectional
+    {
+        return DataEndpointHandler::getRecvBuffer();
+    }
+
+    /// Where the IN side stands, for a test or a log that wants to report it.
+    static auto sendDiagnostics() { return DataEndpointHandler::sendDiagnostics(); }
 };
 
-// IN-only bulk interface: a one-way stream from the device (logs, events). Its public
-// names differ from Mixin's on purpose -- both end up as sibling public bases of the
-// device type, and identical names would make Derived::send / getRecvBuffer ambiguous.
+/// A byte stream in both directions.
 template<typename Clock,
          typename Config,
          typename Derived,
          std::size_t FirstInterfaceNumber,
-         std::size_t FirstEndpointNumber,
-         template<typename, typename, typename, typename, std::size_t> class SendImpl
-         = Kvasir::USB::detail::SendOnlyAdapter>
-struct InMixin {
-private:
-    friend Derived;
-    friend struct Kvasir::USB::detail::MixinTraits;
+         std::size_t FirstEndpointNumber>
+using StreamMixin
+  = Mixin<Clock, Config, Derived, FirstInterfaceNumber, FirstEndpointNumber, false, true, 4>;
 
-    using Self
-      = InMixin<Clock, Config, Derived, FirstInterfaceNumber, FirstEndpointNumber, SendImpl>;
-
-    static constexpr std::size_t DataEndpointNumber = FirstEndpointNumber;
-    static constexpr std::size_t InterfaceCount     = 1;
-    static constexpr std::size_t EndpointCount      = 1;
-
-    static constexpr auto InterfaceDescriptor
-      = USB::SimpleBulk::Descriptors::makeInInterfaceDescriptorArrays<FirstInterfaceNumber,
-                                                                      DataEndpointNumber>();
-
-    using DataEndpointHandler = SendImpl<Clock, Config, Derived, Self, DataEndpointNumber>;
-
-    static void SetupEndpointsCallback() { DataEndpointHandler::SetupEndpointsCallback(); }
-
-    static bool SetupPacketRequestCallback(SetupPacket const& pkt) {
-        return DataEndpointHandler::SetupPacketRequestCallback(pkt);
-    }
-
-    static bool EndpointHandlerCallback(std::size_t epNum,
-                                        bool        in) {
-        return DataEndpointHandler::EndpointHandlerCallback(epNum, in);
-    }
-
-    static bool AbortDoneCallback(std::size_t epNum,
-                                  bool        in) {
-        return DataEndpointHandler::AbortDoneCallback(epNum, in);
-    }
-
-    static void ResetCallback() { DataEndpointHandler::ResetCallback(); }
-
-    static void ConfiguredCallback(std::uint8_t configuration) {
-        DataEndpointHandler::ConfiguredCallback(configuration);
-    }
-
-public:
-    static constexpr std::size_t StreamSendBufferSize = DataEndpointHandler::SendBufferSize;
-
-    static bool isStreamSendReady() {
-        return DataEndpointHandler::isSendReady() && Derived::isConfigured();
-    }
-
-    // Copies; the transfer runs from the adapter's own buffer. False when a previous
-    // transfer is still in flight or the data does not fit.
-    static bool sendStream(std::span<std::byte const> data) {
-        if(!Derived::isConfigured()) { return false; }
-        return DataEndpointHandler::send(data);
-    }
-
-    static bool sendStream_nocopy(std::span<std::byte const> data) {
-        if(!Derived::isConfigured()) { return false; }
-        return DataEndpointHandler::send_nocopy(data);
-    }
-};
-
+/// Device-to-host only, in messages.
+template<typename Clock,
+         typename Config,
+         typename Derived,
+         std::size_t FirstInterfaceNumber,
+         std::size_t FirstEndpointNumber>
+using InMixin
+  = Mixin<Clock, Config, Derived, FirstInterfaceNumber, FirstEndpointNumber, true, false, 2>;
 }   // namespace Kvasir::USB::SimpleBulk

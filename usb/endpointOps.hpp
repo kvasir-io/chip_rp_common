@@ -21,23 +21,25 @@ private:
     using BufferRegs = typename Base::BufferRegs;
     using Regs       = typename Base::Regs;
 
-    static constexpr bool DoubleBufferd = Base::DoubleBufferd;
+    // EP0 is always single buffered: a transfer the host abandons leaves the controller's buffer
+    // selection where software cannot put it back.
+    static constexpr bool DoubleBuffered = Base::DoubleBuffered && EP != 0;
 
     struct EPState {
         bool next_pid_data1{};   // false=DATA0, true=DATA1
 
-        using bufferType = std::conditional_t<DoubleBufferd, bool, std::monostate>;
+        using bufferType = std::conditional_t<DoubleBuffered, bool, std::monostate>;
 
         [[no_unique_address]] bufferType next_buffer_b{};   // false=buffer_0, true=buffer_1
 
         constexpr void togglePid() { next_pid_data1 = !next_pid_data1; }
 
         constexpr void toggleBuffer() {
-            if constexpr(DoubleBufferd) { next_buffer_b = !next_buffer_b; }
+            if constexpr(DoubleBuffered) { next_buffer_b = !next_buffer_b; }
         }
 
         constexpr void resetBuffer() {
-            if constexpr(DoubleBufferd) { next_buffer_b = false; }
+            if constexpr(DoubleBuffered) { next_buffer_b = false; }
         }
 
         constexpr void resetPid() { next_pid_data1 = false; }
@@ -54,7 +56,7 @@ private:
         constexpr bool pid() const { return next_pid_data1; }
 
         constexpr std::size_t buffer() const {
-            if constexpr(DoubleBufferd) {
+            if constexpr(DoubleBuffered) {
                 return next_buffer_b ? 1 : 0;
             } else {
                 return 0;
@@ -67,6 +69,10 @@ public:
     static inline EPState        state{};
     static constexpr std::size_t ep_num = EP;
     static constexpr bool        IsIn   = (Dir == EndpointDirection::In);
+
+    // A double-buffered IN endpoint may have two packets armed, so its buffer and PID cursor
+    // advance on arming; everywhere else on completion.
+    static constexpr bool AdvancesOnArm = IsIn && DoubleBuffered;
 
     enum class Fault : std::uint8_t {
         readEmptyBuffer = 1,
@@ -127,16 +133,10 @@ private:
     }
 
     static void clearBufferControl() {
-        if constexpr(DoubleBufferd) {
+        if constexpr(DoubleBuffered) {
             apply(BothBuffersControlReg::overrideDefaults());
         } else {
             apply(BufferControlReg<0>::overrideDefaults());
-        }
-    }
-
-    static void resetBufferSelect() {
-        if constexpr(DoubleBufferd) {
-            apply(BothBuffersControlReg::overrideDefaults(set(BothBuffersControlReg::reset)));
         }
     }
 
@@ -231,10 +231,12 @@ private:
         }
     }
 
-    static std::array<bool,
-                      DoubleBufferd ? 2 : 1>
-    getBufferAvailable() {
-        if constexpr(DoubleBufferd) {
+public:
+    // Per buffer, whether it is free: not with the controller.
+    using FreeBuffers = std::array<bool, DoubleBuffered ? 2 : 1>;
+
+    static FreeBuffers freeBuffers() {
+        if constexpr(DoubleBuffered) {
             auto const av = apply(read(BothBuffersControlReg::available_0),
                                   read(BothBuffersControlReg::available_1));
             return {!static_cast<bool>(get<0>(av)), !static_cast<bool>(get<1>(av))};
@@ -244,12 +246,18 @@ private:
         }
     }
 
-public:
     template<bool Last,
              typename TransferType>
     static bool tryTransfer(TransferType const& data) {
+        return tryTransfer<Last>(data, freeBuffers());
+    }
+
+    // For a caller that already has freeBuffers(): saves a register read per packet.
+    template<bool Last,
+             typename TransferType>
+    static bool tryTransfer(TransferType const& data,
+                            FreeBuffers const&  buffersAvailable) {
         using namespace std::string_view_literals;
-        auto const buffersAvailable = getBufferAvailable();
 
         // All buffers busy?
         if(std::ranges::none_of(buffersAvailable, [](bool av) { return av; })) {
@@ -269,7 +277,7 @@ public:
         if(buffersAvailable[expectedBuffer]) {
             bool const pidToUse = state.pid();
 
-            if constexpr(DoubleBufferd) {
+            if constexpr(DoubleBuffered) {
                 if(expectedBuffer == 0) {
                     startTransfer<0, Last>(data, pidToUse);
                 } else {
@@ -277,6 +285,10 @@ public:
                 }
             } else {
                 startTransfer<0, Last>(data, pidToUse);
+            }
+            if constexpr(AdvancesOnArm) {
+                state.toggleBuffer();
+                state.togglePid();
             }
             return true;
         }
@@ -294,12 +306,18 @@ public:
         return false;
     }
 
+    // How many buffers the controller still holds. A software count drifts: two completions can
+    // raise a single interrupt.
+    static std::size_t armedBuffers() {
+        return static_cast<std::size_t>(std::ranges::count(freeBuffers(), false));
+    }
+
     // Read data from the current buffer based on BUFF_CPU_SHOULD_HANDLE register
     // Returns the number of bytes read
     static std::size_t readCurrentBuffer(std::span<std::byte> dest) {
         static_assert(!IsIn, "read only on OUT endpoint");
 
-        if constexpr(DoubleBufferd) {
+        if constexpr(DoubleBuffered) {
             std::uint32_t const buffers = apply(read(Regs::BUFF_CPU_SHOULD_HANDLE::FULLREGISTER));
 
             bool const buffer0 = (buffers & EPBitMask) == 0;
@@ -366,15 +384,29 @@ public:
         clearBufferControl();
     }
 
+    // Drops whatever is armed (EP0, when a SETUP arrives). The buffer selection stays: an
+    // abandoned buffer never completed, so nothing toggled it.
+    static void cancelTransfer() { clearBufferControl(); }
+
     static void reset() { state.reset(); }
 
     static void resetPid() { state.resetPid(); }
 
-    static void resetBuffer() { state.resetBuffer(); }
+    // Aborted packets were never sent: a cursor that advanced on arming moves back with them.
+    static void rewindArmed(std::size_t count) {
+        if constexpr(AdvancesOnArm) {
+            for(std::size_t i = 0; i != count; ++i) {
+                state.toggleBuffer();
+                state.togglePid();
+            }
+        }
+    }
 
     static void bufferFinished() {
-        state.toggleBuffer();
-        state.togglePid();
+        if constexpr(!AdvancesOnArm) {
+            state.toggleBuffer();
+            state.togglePid();
+        }
     }
 
     static void clearStall() {
@@ -409,7 +441,7 @@ public:
             apply(EPReg::overrideDefaults(
               set(EPReg::enable),
               write(regValue),
-              write(EPReg::double_buffered, Kvasir::Register::value<DoubleBufferd ? 1 : 0>()),
+              write(EPReg::double_buffered, Kvasir::Register::value<DoubleBuffered ? 1 : 0>()),
               set(EPReg::interrupt_per_buff),
               write(EPReg::buffer_address, Kvasir::Register::value<getBufferOffset()>())));
         }
@@ -432,7 +464,7 @@ private:
       0b11111,   // [1] to Setup:  valid from any state (bits 0-4)
       0b00010,   // [2] to Data:   valid from Setup (bit 1)
       0b00110,   // [3] to Status: valid from Setup or Data (bits 1-2)
-      0b00010,   // [4] to Stall:  valid from Setup (bit 1)
+      0b00110,   // [4] to Stall:  valid from Setup or Data (bits 1-2)
     };
 
 public:
