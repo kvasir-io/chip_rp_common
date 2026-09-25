@@ -396,16 +396,17 @@ namespace Kvasir { namespace UART {
                 }
             }();
 
-            // The PL011's 32-entry FIFOs (UARTLCR_H.FEN). Off, the holding registers are one
-            // deep and every received byte is an interrupt; on, the receive interrupt fires at
-            // rxFifoLevel and the receive-timeout interrupt (32 bit periods of silence) hands
-            // over what is left below it, so a burst costs a few interrupts instead of one per
-            // byte. The DMA transmit path pulls from the TX FIFO either way.
+            // The PL011's 32-entry FIFOs (UARTLCR_H.FEN), on by default: the receive interrupt
+            // fires at rxFifoLevel and the receive-timeout interrupt (32 bit periods of silence)
+            // hands over what is left below it, so a burst costs a few interrupts instead of one
+            // per byte. `fifo = false` makes the holding registers one deep (RP2350 data sheet
+            // 12.1.2.4/12.1.2.5): every received byte is an interrupt, with no timeout latency.
+            // The DMA transmit path pulls from the TX FIFO either way (12.1.5).
             static constexpr bool fifo = [] {
                 if constexpr(requires { UartConfig_::fifo; }) {
                     return static_cast<bool>(UartConfig_::fifo);
                 } else {
-                    return false;
+                    return true;
                 }
             }();
 
@@ -561,6 +562,8 @@ namespace Kvasir { namespace UART {
         // and every reader is in thread context.
         inline static std::atomic<bool> busy{false};
 
+        // `succeeded` once the DMA has handed over the last byte; with the FIFO on, up to 32 of
+        // them are still to go out on the pin - transferInProgress() waits for those too.
         static OperationState operationState() {
             return busy.load(std::memory_order_relaxed) ? OperationState::ongoing
                                                         : OperationState::succeeded;

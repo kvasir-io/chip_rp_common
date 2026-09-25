@@ -277,7 +277,24 @@ namespace Kvasir { namespace DefaultClockSettings {
         (void)detail::flashTiming<ClockSpeed, MaxFlashFreq>();   // the static_asserts
         constexpr std::uint32_t finalClkdiv = detail::flashClkdiv<ClockSpeed, MaxFlashFreq>();
         constexpr std::uint32_t bootClkdiv  = finalClkdiv > 4 ? finalClkdiv : 4;
+        // This divider with rxdelay 2 (XipReadMode::TimingAtClkRef, which the resus handler runs
+        // coreClockInit() on) samples half an SCK period plus one clk_sys cycle after the edge the
+        // flash launches on. The bit is valid from 10 ns after that edge at the latest: 2.5 ns
+        // clk_sys to QSPI output + 1.5 ns QSPI input to clk_sys (RP2350 datasheet Table 1292,
+        // 3.3 V) + 6 ns tCLQV (W25Q128JV AC table; the W25Q64JV family). Holds up to ~300 MHz.
+        constexpr unsigned long long samplePs = (bootClkdiv / 2 + 1) * 1'000'000'000'000ULL
+                                              / static_cast<unsigned long long>(ClockSpeed);
+        static_assert(samplePs >= 10'000,
+                      "clk_sys too fast for the boot/resus flash timing: the flash's data is not "
+                      "valid yet when the QMI samples it (see flashInit)");
         apply(write(QMI::M0_TIMING::clkdiv, value<std::uint32_t, bootClkdiv>()));
+        // A larger divider is only in effect after the next QMI access, and it has to be before
+        // clk_sys goes up (RP2350 datasheet, Table 1297 M0_TIMING.CLKDIV): the next fetch may hit
+        // the XIP cache, so read the uncached alias (XIP_NOCACHE_NOALLOC_BASE, 2.2 address map).
+        asm volatile("dsb" ::: "memory");
+        (void)*reinterpret_cast<std::uint32_t const volatile*>(
+          Kvasir::detail::XipReadMode::XipNoCacheBase);
+        asm volatile("dsb" ::: "memory");
 #endif
 
 #if __has_include("peripherals/XIP_CTRL.hpp")

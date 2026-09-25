@@ -1,6 +1,5 @@
 #pragma once
 
-#include "descriptors.hpp"
 #include "detail.hpp"
 #include "kvasir/Util/RateLimiter.hpp"
 
@@ -9,12 +8,17 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <kvasir/Devices/USB/Descriptors.hpp>
 #include <span>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 
 namespace Kvasir::USB::detail {
+// One endpoint of the RP2040 / RP2350 controller: its buffer control, its DPRAM buffers and the
+// data toggle, which this controller leaves to software. What kvasir/Devices/USB/Backend.hpp asks
+// of an endpoint, plus what only this controller can do (abort(), abortDone(), rewindArmed(),
+// cancelTransfer(), state) - public for an application that drives the DPRAM itself.
 template<typename Base, std::size_t EP, EndpointDirection Dir, EndpointTransferType Type>
 struct EndpointOps {
 private:
@@ -70,9 +74,16 @@ public:
     static constexpr std::size_t ep_num = EP;
     static constexpr bool        IsIn   = (Dir == EndpointDirection::In);
 
-    // A double-buffered IN endpoint may have two packets armed, so its buffer and PID cursor
-    // advance on arming; everywhere else on completion.
-    static constexpr bool AdvancesOnArm = IsIn && DoubleBuffered;
+    // The buffer and PID cursor advance when a packet is armed, on every endpoint: a
+    // double-buffered IN endpoint has to (its second packet is armed behind the first), and with
+    // all of them alike nobody has to be told when a packet is over. A packet that is taken back
+    // unsent moves the cursor back with it (rewindArmed).
+    static constexpr bool AdvancesOnArm = true;
+
+    // How many packets may be with the controller at once.
+    static constexpr std::size_t QueueDepth = IsIn && DoubleBuffered ? 2 : 1;
+
+    static constexpr bool AsyncCancel = Base::AsyncCancel;
 
     enum class Fault : std::uint8_t {
         readEmptyBuffer = 1,
@@ -286,10 +297,8 @@ public:
             } else {
                 startTransfer<0, Last>(data, pidToUse);
             }
-            if constexpr(AdvancesOnArm) {
-                state.toggleBuffer();
-                state.togglePid();
-            }
+            state.toggleBuffer();
+            state.togglePid();
             return true;
         }
 
@@ -322,8 +331,9 @@ public:
 
             bool const buffer0 = (buffers & EPBitMask) == 0;
 
+            // The cursor has moved on to the other buffer when this one was armed.
             if(buffer0) {
-                if(state.buffer() != 0) {
+                if(state.buffer() != 1) {
                     KVASIR_LOG_LIMITED(
                       faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferMismatch, 0)),
                       UC_LOG_W,
@@ -334,7 +344,7 @@ public:
                 }
                 return readBuffer<0>(dest);
             } else {
-                if(state.buffer() != 1) {
+                if(state.buffer() != 0) {
                     KVASIR_LOG_LIMITED(
                       faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferMismatch, 1)),
                       UC_LOG_W,
@@ -388,22 +398,27 @@ public:
     // abandoned buffer never completed, so nothing toggled it.
     static void cancelTransfer() { clearBufferControl(); }
 
+    // Takes the armed packets back. The controller answers with abort_done, and there
+    // cancelComplete() finishes it.
+    static void cancel() { abort(); }
+
+    // How many armed packets were never sent (IN), with the cursor that advanced on arming moved
+    // back over them.
+    static std::size_t cancelComplete() {
+        // Only what the controller still holds was never sent (or, OUT, never filled).
+        std::size_t const unsent = armedBuffers();
+        abortDone();
+        rewindArmed(unsent);
+        return unsent;
+    }
+
     static void reset() { state.reset(); }
 
-    static void resetPid() { state.resetPid(); }
+    static void resetDataToggle() { state.resetPid(); }
 
     // Aborted packets were never sent: a cursor that advanced on arming moves back with them.
     static void rewindArmed(std::size_t count) {
-        if constexpr(AdvancesOnArm) {
-            for(std::size_t i = 0; i != count; ++i) {
-                state.toggleBuffer();
-                state.togglePid();
-            }
-        }
-    }
-
-    static void bufferFinished() {
-        if constexpr(!AdvancesOnArm) {
+        for(std::size_t i = 0; i != count; ++i) {
             state.toggleBuffer();
             state.togglePid();
         }
@@ -446,45 +461,5 @@ public:
               write(EPReg::buffer_address, Kvasir::Register::value<getBufferOffset()>())));
         }
     }
-};
-
-// EP0 Control Transfer State (shared between EP0_IN and EP0_OUT)
-// USB 2.0 Specification Chapter 8.5.3
-struct EP0ControlState {
-private:
-    ControlStage current_stage{ControlStage::Idle};
-    // A protocol bug repeats per transfer; no clock here, so count based.
-    Kvasir::CountLimiter<> badTransitionLog_{};
-
-    // Transition table: for each destination state, bitmask of valid source states
-    // valid_from[to_state] = bitmask where bit N = 1 if transition from state N is valid
-    // Bit 0=Idle, Bit 1=Setup, Bit 2=Data, Bit 3=Status, Bit 4=Stall
-    static constexpr std::array<std::uint8_t, 5> valid_from = {
-      0b01000,   // [0] to Idle:   valid from Status (bit 3)
-      0b11111,   // [1] to Setup:  valid from any state (bits 0-4)
-      0b00010,   // [2] to Data:   valid from Setup (bit 1)
-      0b00110,   // [3] to Status: valid from Setup or Data (bits 1-2)
-      0b00110,   // [4] to Stall:  valid from Setup or Data (bits 1-2)
-    };
-
-public:
-    constexpr void transition(ControlStage new_stage) {
-        auto const valid_mask  = valid_from[std::to_underlying(new_stage)];
-        auto const current_bit = 1U << std::to_underlying(current_stage);
-
-        if(!(valid_mask & current_bit)) {
-            KVASIR_LOG_LIMITED(badTransitionLog_.allow(),
-                               UC_LOG_E,
-                               "Invalid EP0 stage transition {} -> {}",
-                               current_stage,
-                               new_stage);
-        }
-
-        current_stage = new_stage;
-    }
-
-    constexpr ControlStage stage() const { return current_stage; }
-
-    constexpr void reset() { current_stage = ControlStage::Idle; }
 };
 }   // namespace Kvasir::USB::detail

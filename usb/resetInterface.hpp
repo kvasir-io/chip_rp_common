@@ -1,13 +1,26 @@
 #pragma once
 
-#include "descriptors.hpp"
-#include "mixins.hpp"
+// The picotool reset interface (kvasir/Devices/USB/VendorReset.hpp) on an RP2040 / RP2350.
+
+#include "../bootrom_functions.hpp"
 
 #include <cstddef>
-#include <type_traits>
+#include <kvasir/Devices/USB/VendorReset.hpp>
 
-namespace Kvasir::USB::ResetInterface {
+namespace Kvasir::USB::Rp {
 
+struct ResetActions {
+    [[noreturn]] static void bootloader() { Kvasir::Bootrom::resetToUsbBoot(); }
+
+    // A chip reboot (pico-sdk's reset interface does the same through watchdog_reboot):
+    // SYSRESETREQ would only warm-reset this core, see reboot().
+    [[noreturn]] static void reboot() { Kvasir::Bootrom::reboot(); }
+};
+
+// In a device's mixin list as it is; with callbacks, through an alias of the application's:
+//
+//     template<typename C, typename Cfg, typename D, std::size_t I, std::size_t E>
+//     using ResetInterface = Kvasir::USB::Rp::ResetInterfaceWith<C, Cfg, D, I, E, Drain, Drain>;
 template<typename Clock,
          typename Config,
          typename Derived,
@@ -15,65 +28,20 @@ template<typename Clock,
          std::size_t FirstEndpointNumber,
          typename BeforeBootselCallback = void,
          typename BeforeFlashCallback   = void>
-struct Mixin {
-private:
-    friend Derived;
-    friend struct Kvasir::USB::detail::MixinTraits;   // Grants access to helper functions
+using ResetInterfaceWith = Kvasir::USB::VendorReset::Mixin<Clock,
+                                                           Config,
+                                                           Derived,
+                                                           FirstInterfaceNumber,
+                                                           FirstEndpointNumber,
+                                                           ResetActions,
+                                                           BeforeBootselCallback,
+                                                           BeforeFlashCallback>;
 
-    static constexpr std::size_t InterfaceCount = 1;
-    static constexpr std::size_t EndpointCount  = 0;
-
-    static constexpr auto InterfaceDescriptor
-      = Kvasir::USB::Descriptors::Interface{.bInterfaceNumber   = FirstInterfaceNumber,
-                                            .bAlternateSetting  = 0,
-                                            .bNumEndpoints      = 0,
-                                            .bInterfaceClass    = 255,
-                                            .bInterfaceSubClass = 0,
-                                            .bInterfaceProtocol = 1};
-
-    // Callbacks
-    static bool SetupPacketRequestCallback(SetupPacket const& pkt) {
-        if(pkt.type() == SetupPacket::Type::standard || pkt.wIndex != FirstInterfaceNumber
-           || pkt.recipient() != SetupPacket::Recipient::interface)
-        {
-            return false;
-        }
-
-        static constexpr SetupPacket::Request REQUEST_BOOTSEL{0x01};
-        static constexpr SetupPacket::Request REQUEST_FLASH{0x02};
-
-        if(pkt.bRequest == REQUEST_BOOTSEL) {
-            UC_LOG_I("USB: Rebooting to BOOTSEL mode");
-            if constexpr(!std::is_same_v<BeforeBootselCallback, void>) {
-                BeforeBootselCallback{}();
-            }
-            Kvasir::resetToUsbBoot();
-            return true;
-        } else if(pkt.bRequest == REQUEST_FLASH) {
-            UC_LOG_I("USB: Rebooting to flash");
-            if constexpr(!std::is_same_v<BeforeFlashCallback, void>) { BeforeFlashCallback{}(); }
-            // A chip reboot (pico-sdk's reset interface does the same through
-            // watchdog_reboot): SYSRESETREQ would only warm-reset this core, see reboot().
-            Kvasir::reboot();
-            return true;
-        }
-        return false;
-    }
-
-    static bool EndpointHandlerCallback(std::size_t,
-                                        bool) {
-        return false;
-    }
-
-    static bool AbortDoneCallback(std::size_t,
-                                  bool) {
-        return false;
-    }
-
-    static void ResetCallback() {}
-
-    static void ConfiguredCallback(std::uint8_t) {}
-
-    static void SetupEndpointsCallback() {}
-};
-}   // namespace Kvasir::USB::ResetInterface
+template<typename Clock,
+         typename Config,
+         typename Derived,
+         std::size_t FirstInterfaceNumber,
+         std::size_t FirstEndpointNumber>
+using ResetInterface
+  = ResetInterfaceWith<Clock, Config, Derived, FirstInterfaceNumber, FirstEndpointNumber>;
+}   // namespace Kvasir::USB::Rp

@@ -60,6 +60,7 @@ namespace RomFunctions {
              char C2,
              typename F>
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] F getRomFunctionPointerFromRam() {
+        KVASIR_RAM_FUNC_MARK();
         return lookupRomFunction<F>(lookupCode(C1, C2));
     }
 
@@ -135,7 +136,10 @@ namespace detail {
         // min_deselect 2, cooldown 1 - the divider flashInit() uses before the PLL switch
         // with the bootrom's sample delay, i.e. what every boot runs on through the switch
         // until peripheryClockInit(). What a clk_sys resus handler writes before it touches
-        // flash: at 12 MHz the full-clock timing's rxdelay samples after the bit is gone.
+        // flash: at 12 MHz the full-clock timing's rxdelay samples after the bit is gone. The
+        // handler then runs coreClockInit() from flash on it through the PLL switch, like a boot:
+        // flashInit() there raises the divider to the boot one first, and its static_assert
+        // checks that rxdelay 2 still samples a valid bit at the project's clk_sys.
         static constexpr std::uint32_t TimingAtClkRef = (1U << 30) | (2U << 12) | (2U << 8) | 4U;
 
         // The resus handler reads it before the flash is readable: never an out-of-line call.
@@ -157,6 +161,7 @@ namespace detail {
         }
 
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void apply(std::uint32_t timing) {
+            KVASIR_RAM_FUNC_MARK();
             auto* const timingReg
               = reinterpret_cast<std::uint32_t volatile*>(QMI::M0_TIMING::Addr::value);
             auto* const rfmtReg
@@ -239,11 +244,13 @@ namespace detail {
         }
 
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] void disable() {
+            KVASIR_RAM_FUNC_MARK();
             connectInternalFlash();
             flashExitXip();
         }
 
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] void enable() {
+            KVASIR_RAM_FUNC_MARK();
             flushCache();
             xipEnable();
 #if __has_include("peripherals/QMI.hpp")
@@ -380,6 +387,7 @@ namespace detail {
                                std::uint32_t       offset,
                                std::uint8_t const* data,
                                std::size_t         size) {
+        KVASIR_RAM_FUNC_MARK();
         XipGuard guard{xipDisabler};
         erase(offset, 4096, 1 << 16, 0xD8);
         write(offset, data, size);
@@ -409,6 +417,7 @@ namespace detail {
                                    std::uint8_t),
                      std::uint32_t offset,
                      std::size_t   blocks) {
+        KVASIR_RAM_FUNC_MARK();
         XipGuard guard{xipDisabler};
         erase(offset, blocks * 4096, 1 << 16, 0xD8);
     }
@@ -432,6 +441,7 @@ namespace detail {
                      std::uint32_t       offset,
                      std::uint8_t const* data,
                      std::size_t         size) {
+        KVASIR_RAM_FUNC_MARK();
         XipGuard guard{xipDisabler};
         write(offset, data, size);
     }
@@ -453,28 +463,40 @@ namespace detail {
     flash_do_cmd_impl(FlashXipDisabler&          xipDisabler,
                       std::span<std::byte const> txBuffer,
                       std::span<std::byte>       rxBuffer) {
+        KVASIR_RAM_FUNC_MARK();
         using QSPI_CS  = Kvasir::Peripheral::IO_QSPI::Registers<>::GPIO_QSPI_SS_CTRL::OUTOVERValC;
         using SSI_Regs = Kvasir::Peripheral::XIP_SSI::Registers<>;
-        XipGuard guard{xipDisabler};
+        // Plain pointers and counts, taken while the flash can still be executed from: with
+        // libc++'s hardening (the sanitize variant) span::operator[], empty() and subspan() are
+        // real functions, in flash, and a call to one of them with XIP off is a fault whose
+        // handler is in flash too - the core locks up (seen on the bench, 2026-09-19: the
+        // sanitize image died in the first read of the serial number).
+        std::byte const* tx     = txBuffer.data();
+        std::size_t      txLeft = txBuffer.size();
+        std::byte*       rx     = rxBuffer.data();
+        std::size_t      rxLeft = rxBuffer.size();
+        XipGuard         guard{xipDisabler};
 
         apply(write(QSPI_CS::low));
 
         static constexpr std::size_t maxInFlight = 16 - 2;
 
         std::size_t inFlight{};
-        while(!txBuffer.empty() || !rxBuffer.empty()) {
+        while(txLeft != 0 || rxLeft != 0) {
             auto const flags   = apply(read(SSI_Regs::SR::tfnf), read(SSI_Regs::SR::rfne));
             bool const can_put = get<0>(flags);
             bool const can_get = get<1>(flags);
-            if(can_put && !txBuffer.empty() && inFlight < maxInFlight) {
-                apply(write(SSI_Regs::DR0::dr, static_cast<std::uint32_t>(txBuffer[0])));
-                txBuffer = txBuffer.subspan(1);
+            if(can_put && txLeft != 0 && inFlight < maxInFlight) {
+                apply(write(SSI_Regs::DR0::dr, static_cast<std::uint32_t>(*tx)));
+                ++tx;   // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+                --txLeft;
                 ++inFlight;
             }
-            if(can_get && !rxBuffer.empty()) {
+            if(can_get && rxLeft != 0) {
                 auto const v = get<0>(apply(read(SSI_Regs::DR0::dr)));
-                rxBuffer[0]  = static_cast<std::byte>(v);
-                rxBuffer     = rxBuffer.subspan(1);
+                *rx          = static_cast<std::byte>(v);
+                ++rx;   // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+                --rxLeft;
                 --inFlight;
             }
         }
@@ -482,70 +504,15 @@ namespace detail {
         apply(write(QSPI_CS::high));
     }
 
-    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
-    flash_do_cmd(std::span<std::byte const> txBuffer,
-                 std::span<std::byte>       rxBuffer) {
+    // Runs from flash like flash_erase(): the FlashXipDisabler's ROM lookups and boot2 copy
+    // need XIP, only the _impl runs with it off.
+    static inline void flash_do_cmd(std::span<std::byte const> txBuffer,
+                                    std::span<std::byte>       rxBuffer) {
         FlashXipDisabler xipDisabler{};
         flash_do_cmd_impl(xipDisabler, txBuffer, rxBuffer);
     }
 
 #endif
-    static inline std::array<std::byte,
-                             8> read_serial_number() {
-        if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
-#if __has_include("chip/rp2040.hpp")
-            static constexpr std::byte   Cmd{0x4b};
-            static constexpr std::size_t DummyBytes = 5;
-            static constexpr std::size_t DataBytes  = 8;
-            static constexpr std::size_t TotalBytes = DummyBytes + DataBytes;
-
-            std::array<std::byte, TotalBytes> txBuffer{};
-            std::array<std::byte, TotalBytes> rxBuffer{};
-            txBuffer[0] = Cmd;
-            {
-                Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
-                flash_do_cmd(txBuffer, rxBuffer);
-            }
-            std::array<std::byte, DataBytes> id;
-            std::copy(rxBuffer.begin() + DummyBytes, rxBuffer.end(), id.begin());
-            return id;
-#endif
-        } else {
-#if __has_include("chip/rp2350.hpp")
-            std::array<std::uint32_t, 4> buffer{};
-
-            static constexpr std::uint32_t CHIP_INFO = 0x0001;
-
-            auto const length = detail::get_sys_info(buffer.data(), buffer.size(), CHIP_INFO);
-
-            std::array<std::byte, 8> serial_number{};
-
-            if(length != 4 || buffer[0] != CHIP_INFO) {
-                UC_LOG_C("error reading serial_number {}", length);
-            } else {
-                if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2350A) {
-                    if(buffer[1] != 1) {
-                        UC_LOG_C(
-                          "error you probably selected the wrong chip in PinConfig::CurrentChip");
-                    }
-                } else if(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2350B) {
-                    if(buffer[1] != 0) {
-                        UC_LOG_C(
-                          "error you probably selected the wrong chip in PinConfig::CurrentChip");
-                    }
-                }
-
-                // Extract bytes in reverse order from each word to match pico-sdk behavior
-                // pico-sdk accesses bytes[15:8] which is buffer[3] then buffer[2], both word-reversed
-                auto const swapped = std::array{std::byteswap(buffer[3]), std::byteswap(buffer[2])};
-                std::ranges::copy(std::as_bytes(std::span{swapped}), serial_number.begin());
-            }
-
-            return serial_number;
-#endif
-        }
-    }
-
 #if __has_include("chip/rp2350.hpp")
     // STRDEF-only white-label OTP indices (RP2350 datasheet §13.10).
     // VALUE entries (VID=0x0000, PID=0x0001, BCD=0x0002, LANG_ID=0x0003,
@@ -738,54 +705,115 @@ namespace detail {
     }
 }   // namespace detail
 
-[[noreturn]] inline void resetToUsbBoot() {
-    if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
-        using romResetToUsbBoot
-          = void (*)(std::uint32_t gpioActivityPinMask, std::uint32_t disableInterfaceMask);
+// The bootrom's reboot paths and the serial number read, in a namespace of their own for their
+// log module ("bootrom", derived from the scope).
+namespace Bootrom {
+    static inline std::array<std::byte,
+                             8>
+    read_serial_number() {
+        if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
+#if __has_include("chip/rp2040.hpp")
+            static constexpr std::byte   Cmd{0x4b};
+            static constexpr std::size_t DummyBytes = 5;
+            static constexpr std::size_t DataBytes  = 8;
+            static constexpr std::size_t TotalBytes = DummyBytes + DataBytes;
 
-        RomFunctions::call<'U', 'B', romResetToUsbBoot>(0, 0);
-    } else {
-        static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
-        static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL  = 0x0002;
+            std::array<std::byte, TotalBytes> txBuffer{};
+            std::array<std::byte, TotalBytes> rxBuffer{};
+            txBuffer[0] = Cmd;
+            {
+                Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
+                detail::flash_do_cmd(txBuffer, rxBuffer);
+            }
+            std::array<std::byte, DataBytes> id;
+            std::copy(rxBuffer.begin() + DummyBytes, rxBuffer.end(), id.begin());
+            return id;
+#endif
+        } else {
+#if __has_include("chip/rp2350.hpp")
+            std::array<std::uint32_t, 4> buffer{};
 
-        [[maybe_unused]] auto const ret
-          = detail::reboot(REBOOT_TYPE_BOOTSEL | NO_RETURN_ON_SUCCESS, 1, 0, 0);
-        UC_LOG_C("reboot ret {}", ret);
+            static constexpr std::uint32_t CHIP_INFO = 0x0001;
+
+            auto const length = detail::get_sys_info(buffer.data(), buffer.size(), CHIP_INFO);
+
+            std::array<std::byte, 8> serial_number{};
+
+            if(length != 4 || buffer[0] != CHIP_INFO) {
+                UC_LOG_C("error reading serial_number {}", length);
+            } else {
+                if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2350A) {
+                    if(buffer[1] != 1) {
+                        UC_LOG_C(
+                          "error you probably selected the wrong chip in PinConfig::CurrentChip");
+                    }
+                } else if(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2350B) {
+                    if(buffer[1] != 0) {
+                        UC_LOG_C(
+                          "error you probably selected the wrong chip in PinConfig::CurrentChip");
+                    }
+                }
+
+                // Extract bytes in reverse order from each word to match pico-sdk behavior
+                // pico-sdk accesses bytes[15:8] which is buffer[3] then buffer[2], both word-reversed
+                auto const swapped = std::array{std::byteswap(buffer[3]), std::byteswap(buffer[2])};
+                std::ranges::copy(std::as_bytes(std::span{swapped}), serial_number.begin());
+            }
+
+            return serial_number;
+#endif
+        }
     }
 
-    UC_LOG_C("This should not happen reboot returned");
-    detail::watchdogReboot();   // a chip reset at least, see reboot() below
-}
+    [[noreturn]] inline void resetToUsbBoot() {
+        if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
+            using romResetToUsbBoot
+              = void (*)(std::uint32_t gpioActivityPinMask, std::uint32_t disableInterfaceMask);
 
-// Reboot the chip: both cores and every peripheral restart from the bootrom, as after a
-// power-on. PM::reset_cause() reports watchdog_timer on the RP2350 (the bootrom arms the
-// watchdog's timer, 1 ms) and watchdog_force on the raw-trigger path.
-//
-// Not SystemControl::SystemReset: SYSRESETREQ is a warm reset of the core that asserts it
-// and of nothing else (RP2040 datasheet 2.4.2.9, RP2350 datasheet 12.9, pico-feedback #329).
-// Issued from core 1 it parks core 1 in the bootrom and leaves core 0 running; from core 0
-// it leaves core 1 running and the peripherals configured, and only looks like a reboot
-// because FirstInitStep puts the peripherals back into reset.
-//
-// The RP2350 goes through the bootrom's reboot() (datasheet 5.4.8.24), the pico-sdk's and
-// picotool's path: it switches POWMAN off clk_ref before the clock generators reset (a
-// clk_pow glitch otherwise) and keeps the boot diagnostics. NO_RETURN_ON_SUCCESS parks this
-// core in the ROM until the watchdog fires, 1 ms later. The raw watchdog is the RP2040's
-// path and the fallback should the ROM call refuse.
-[[noreturn]] inline void reboot() {
-    if constexpr(PinConfig::CurrentChip != Kvasir::PinConfig::ChipVariant::RP2040) {
-        static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
-        static constexpr std::uint32_t REBOOT_TYPE_NORMAL   = 0x0000;
+            RomFunctions::call<'U', 'B', romResetToUsbBoot>(0, 0);
+        } else {
+            static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
+            static constexpr std::uint32_t REBOOT_TYPE_BOOTSEL  = 0x0002;
 
-        [[maybe_unused]] auto const ret
-          = detail::reboot(REBOOT_TYPE_NORMAL | NO_RETURN_ON_SUCCESS, 1, 0, 0);
-        UC_LOG_C("bootrom reboot returned {}", ret);
+            [[maybe_unused]] auto const ret
+              = detail::reboot(REBOOT_TYPE_BOOTSEL | NO_RETURN_ON_SUCCESS, 1, 0, 0);
+            UC_LOG_C("reboot ret {}", ret);
+        }
+
+        UC_LOG_C("This should not happen reboot returned");
+        detail::watchdogReboot();   // a chip reset at least, see reboot() below
     }
-    detail::watchdogReboot();
-}
+
+    // Reboot the chip: both cores and every peripheral restart from the bootrom, as after a
+    // power-on. PM::reset_cause() reports watchdog_timer on the RP2350 (the bootrom arms the
+    // watchdog's timer, 1 ms) and watchdog_force on the raw-trigger path.
+    //
+    // Not SystemControl::SystemReset: SYSRESETREQ is a warm reset of the core that asserts it
+    // and of nothing else (RP2040 datasheet 2.4.2.9, RP2350 datasheet 12.9, pico-feedback #329).
+    // Issued from core 1 it parks core 1 in the bootrom and leaves core 0 running; from core 0
+    // it leaves core 1 running and the peripherals configured, and only looks like a reboot
+    // because FirstInitStep puts the peripherals back into reset.
+    //
+    // The RP2350 goes through the bootrom's reboot() (datasheet 5.4.8.24), the pico-sdk's and
+    // picotool's path: it switches POWMAN off clk_ref before the clock generators reset (a
+    // clk_pow glitch otherwise) and keeps the boot diagnostics. NO_RETURN_ON_SUCCESS parks this
+    // core in the ROM until the watchdog fires, 1 ms later. The raw watchdog is the RP2040's
+    // path and the fallback should the ROM call refuse.
+    [[noreturn]] inline void reboot() {
+        if constexpr(PinConfig::CurrentChip != Kvasir::PinConfig::ChipVariant::RP2040) {
+            static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
+            static constexpr std::uint32_t REBOOT_TYPE_NORMAL   = 0x0000;
+
+            [[maybe_unused]] auto const ret
+              = detail::reboot(REBOOT_TYPE_NORMAL | NO_RETURN_ON_SUCCESS, 1, 0, 0);
+            UC_LOG_C("bootrom reboot returned {}", ret);
+        }
+        detail::watchdogReboot();
+    }
+}   // namespace Bootrom
 
 inline auto serialNumber() {
-    static std::array<std::byte, 8> const serial_number = detail::read_serial_number();
+    static std::array<std::byte, 8> const serial_number = Bootrom::read_serial_number();
     return serial_number;
 }
 

@@ -118,12 +118,13 @@ namespace Kvasir { namespace I2C {
                 KVASIR_LOG_LIMITED(recoveredLine,
                                    UC_LOG_W,
                                    "i2c{} recovery #{} complete -- SDA {}, SCL {}, {} of 9 "
-                                   "clocks unused",
+                                   "clocks unused, {} forced STOP(s) so far",
                                    base::Instance,
                                    Recovery::recoveries(),
                                    std::string_view{Recovery::sdaIsHigh() ? "high" : "LOW"},
                                    std::string_view{Recovery::sclIsHigh() ? "high" : "LOW"},
-                                   Recovery::clocksLeft());
+                                   Recovery::clocksLeft(),
+                                   Recovery::forcedStops());
                 return;
             }
             if(rv == Recovery::TickResult::busy) { return; }
@@ -269,6 +270,41 @@ namespace Kvasir { namespace I2C {
         static std::uint32_t disableWaitsExhausted() { return disableWaitsExhausted_; }
 
         static TimeoutSnapshot const& lastTimeout() { return lastTimeout_; }
+
+        /// lastTimeout() as a log line. The snapshot's fields are this block's registers, so
+        /// the line is the driver's too: the SAM SERCOM driver has the same call and says
+        /// what its block looked like (state 1 is sending, 2 receiving; sent/received are
+        /// bytes done of bytes asked).
+        static void logLastTimeout() {
+            [[maybe_unused]] auto const& t = lastTimeout_;
+            UC_LOG_W(
+              "i2c{} last timeout: addr {:#04x}, state {}, sent {}/{}, received {}/{}, "
+              "IC_STATUS {:#06x}, IC_RAW_INTR_STAT {:#06x}, IC_INTR_MASK {:#06x}, "
+              "IC_ENABLE_STATUS {:#x}, IC_TX_ABRT_SOURCE {:#010x}, TX FIFO {}, RX FIFO {}, "
+              "SDA {}, SCL {}, IC_TAR {:#x}, IC_ENABLE {:#x}, {} interrupt(s) in the "
+              "request, last {} us before, request {} us old",
+              base::Instance,
+              t.address,
+              t.state,
+              t.sent,
+              t.toSend,
+              t.received,
+              t.toReceive,
+              t.status,
+              t.rawIntr,
+              t.intrMask,
+              t.enableStatus,
+              t.abortSource,
+              t.txLevel,
+              t.rxLevel,
+              std::string_view{t.sdaHigh ? "high" : "LOW"},
+              std::string_view{t.sclHigh ? "high" : "LOW"},
+              t.tar,
+              t.enable,
+              t.isrEntries,
+              t.usSinceIsr,
+              t.usAge);
+        }
 
         /// Interrupt entries that found nothing to do for the state the request was in: a
         /// send with TX_EMPTY clear, a receive with the RX FIFO empty. See onIsr().

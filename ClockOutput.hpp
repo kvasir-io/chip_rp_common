@@ -272,6 +272,7 @@ namespace Kvasir { namespace Clocks {
                                                                    std::uint32_t interval,
                                                                    std::uint32_t minKhz,
                                                                    std::uint32_t maxKhz) {
+            KVASIR_RAM_FUNC_MARK();
             auto* const ref
               = reinterpret_cast<std::uint32_t volatile*>(Clk::FC0_REF_KHZ::Addr::value);
             auto* const min
@@ -461,6 +462,9 @@ namespace Kvasir { namespace Clocks {
         }
 
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void onIsr() {
+            // in RAM for steps 1-3 (the flash may not be readable when it is entered); step 4
+            // calls coreClockInit() in flash on purpose, after step 1 made it readable again
+            KVASIR_RAM_FUNC_MARK_CALLS_FLASH();
             auto* const ints
               = reinterpret_cast<std::uint32_t const volatile*>(Clk::INTS::Addr::value);
             auto* const resusCtrl

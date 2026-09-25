@@ -28,11 +28,20 @@ namespace Kvasir { namespace Qmi {
     using Regs = Kvasir::Peripheral::QMI::Registers<0>;
 
     namespace detail {
-        // In RAM, interrupts off: the transaction on chip select 0 at clk_sys / clkdiv.
-        [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void transfer(std::span<std::byte const> tx,
-                                                            std::span<std::byte>       rx,
-                                                            std::uint32_t              clkdiv) {
-            Kvasir::detail::FlashXipDisabler xip{};
+        // In RAM, interrupts off: the transaction on chip select 0 at clk_sys / clkdiv. The
+        // FlashXipDisabler comes from the caller, like flash_erase_impl's: its constructor looks
+        // up ROM functions and copies the BOOTRAM setup routine, all code in flash.
+        [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void transfer(Kvasir::detail::FlashXipDisabler& xip,
+                                                            std::span<std::byte const>        tx,
+                                                            std::span<std::byte>              rx,
+                                                            std::uint32_t clkdiv) {
+            KVASIR_RAM_FUNC_MARK();
+            // Plain pointers, taken before XIP goes off: with libc++'s hardening (the sanitize
+            // variant) span::operator[] is a real function in flash, and calling it in here is
+            // a fault whose handler is in flash too (bootrom_functions.hpp, flash_do_cmd_impl).
+            std::byte const* const txData = tx.data();
+            std::byte* const       rxData = rx.data();
+            std::size_t const      rxSize = rx.size();
             {
                 Kvasir::detail::XipGuard guard{xip};
                 // Direct mode on, CS0 asserted by hand, the divider (2..255 of clk_sys).
@@ -48,12 +57,12 @@ namespace Kvasir { namespace Qmi {
                     if(sent < n && !txFull && sent - got < 4) {
                         // One byte: 8-bit data, single-width, output enabled.
                         apply(write(Regs::DIRECT_TX::FULLREGISTER,
-                                    (1U << 19) | static_cast<std::uint32_t>(tx[sent])));
+                                    (1U << 19) | static_cast<std::uint32_t>(txData[sent])));
                         ++sent;
                     }
                     if(!rxEmpty) {
                         auto const v = get<0>(apply(read(Regs::DIRECT_RX::FULLREGISTER)));
-                        if(got < rx.size()) { rx[got] = static_cast<std::byte>(v & 0xFFU); }
+                        if(got < rxSize) { rxData[got] = static_cast<std::byte>(v & 0xFFU); }
                         ++got;
                     }
                 }
@@ -69,8 +78,9 @@ namespace Kvasir { namespace Qmi {
     inline void direct(std::span<std::byte const> tx,
                        std::span<std::byte>       rx,
                        std::uint32_t              clkdiv = 6) {
+        Kvasir::detail::FlashXipDisabler                   xip{};
         Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
-        detail::transfer(tx, rx, clkdiv < 2 ? 2U : (clkdiv > 255 ? 255U : clkdiv));
+        detail::transfer(xip, tx, rx, clkdiv < 2 ? 2U : (clkdiv > 255 ? 255U : clkdiv));
     }
 
     struct JedecId {
