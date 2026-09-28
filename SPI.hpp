@@ -98,18 +98,25 @@ namespace Kvasir { namespace SPI {
 
             static constexpr bool spiSlewFast(std::uint32_t f_baud) { return f_baud > 8'000'000; }
 
-            template<typename MISOPIN>
+            // SPIConfig::misoPull (default none): an SD card releases MISO when not selected
+            // (SD spec 7.2.4), and the RP2350's reset pull-down would read that as 0x00 = "no error".
+            template<typename MISOPIN, Io::PullConfiguration Pull = Io::PullConfiguration::PullNone>
             struct GetMISOPinConfig;
 
-            template<typename dummy>
-            struct GetMISOPinConfig<Io::NotUsed<dummy>> {
+            template<typename dummy, Io::PullConfiguration Pull>
+            struct GetMISOPinConfig<Io::NotUsed<dummy>, Pull> {
                 using pinConfig = brigand::list<>;
             };
 
-            template<int Port, int Pin>
-            struct GetMISOPinConfig<Kvasir::Register::PinLocation<Port, Pin>> {
-                using pinConfig = decltype(action(Kvasir::Io::Action::PinFunction<1>{},
-                                                  Register::PinLocation<Port, Pin>{}));
+            template<int Port, int Pin, Io::PullConfiguration Pull>
+            struct GetMISOPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Pull> {
+                using pinConfig
+                  = decltype(action(Kvasir::Io::Action::PinFunction<1,
+                                                                    Io::OutputType::PushPull,
+                                                                    Io::OutputSpeed::Low,
+                                                                    Io::OutputInit::Low,
+                                                                    Pull>{},
+                                    Register::PinLocation<Port, Pin>{}));
             };
             template<typename CSPIN, Io::DriveStrength Drive, bool SlewFast>
             struct GetCSPinConfig;
@@ -406,9 +413,18 @@ namespace Kvasir { namespace SPI {
             }
         }();
 
+        static constexpr Io::PullConfiguration misoPull = [] {
+            if constexpr(requires { SPIConfig::misoPull; }) {
+                return SPIConfig::misoPull;
+            } else {
+                return Io::PullConfiguration::PullNone;
+            }
+        }();
+
         static constexpr auto initStepPinConfig = list(
           typename Config::template GetMISOPinConfig<
-            std::decay_t<decltype(SPIConfig::misoPinLocation)>>::pinConfig{},
+            std::decay_t<decltype(SPIConfig::misoPinLocation)>,
+            misoPull>::pinConfig{},
           typename Config::template GetMOSIPinConfig<
             std::decay_t<decltype(SPIConfig::mosiPinLocation)>,
             pinDrive,

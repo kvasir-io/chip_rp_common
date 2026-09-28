@@ -1,0 +1,43 @@
+;
+; QSPI transport for DCS panel controllers (CO5300, ST77916, ST77922). One program with
+; three entry points, loaded at offset 0; the driver forces a jmp into the one it wants
+; through SMx_INSTR while the state machine is disabled.
+;
+; SPI mode 0, the panel samples on the rising edge (CO5300 datasheet 5.2). Two PIO cycles
+; per bit: div = clockSpeed / (2*baud).
+;
+; Side-set applies even when an instruction stalls, so an empty TX FIFO parks SCK low. The
+; stalling `out` raises FDEBUG_TXSTALL after the last rising edge: that is completion.
+
+.program qspiPanel
+.side_set 1
+
+; ---------------------------------------------------------------------------
+; Single-lane write: instruction, address {00h, CMD, 00h}, parameters (datasheet 5.2.1).
+; Only D0 changes; the panel ignores D1..D3 here.
+; ---------------------------------------------------------------------------
+public single:
+    out pins, 1          side 0   ; drive the bit while the clock is low
+    jmp single           side 1   ; rising edge - the panel samples here
+
+; ---------------------------------------------------------------------------
+; Quad-lane write: the pixel payload after a 32h header. OSR bit 31 lands on D3:
+; high nibble first, as the datasheet's RGB565 lane map wants (R4..R1 on SI3..SI0).
+; ---------------------------------------------------------------------------
+public quad:
+    out pins, 4          side 0
+    jmp quad             side 1
+
+; ---------------------------------------------------------------------------
+; Single-lane read-back after `single` sent the header, all at the read clock
+; (TSCYC >= 100 ns, datasheet 6.4.1). The bit count - 1 comes as one FIFO word (autopull off).
+; ---------------------------------------------------------------------------
+public read:
+    pull                 side 0   ; bit count - 1
+    out x, 32            side 0
+    set pindirs, 0b0000  side 0   ; release all four lanes for the turnaround
+read_loop:
+    in pins, 1           side 1   ; sample at the rising edge, one full clock phase
+    jmp x-- read_loop    side 0   ; after the panel updated on the falling edge
+read_park:
+    jmp read_park        side 0   ; hold the clock low until the driver disables us
