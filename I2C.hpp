@@ -78,8 +78,12 @@ namespace Kvasir { namespace I2C {
                 return (f_clockSpeed + f_baud / 2) / f_baud;
             }
 
-            static constexpr std::uint32_t calcSpkLen(std::uint32_t lcnt) {
-                return lcnt < 16 ? 1 : lcnt / 16;
+            // The I2C spec's 50 ns spike filter in ic_clk cycles, rounded up, at least 1 (RP2350
+            // datasheet 12.2.11, RP2040 datasheet 4.3.11). pico-sdk's lcnt / 16 filters far more.
+            static constexpr std::uint32_t calcSpkLen(std::uint32_t f_clockSpeed) {
+                auto const cycles = static_cast<std::uint32_t>(
+                  (std::uint64_t{f_clockSpeed} * 50 + 999'999'999) / 1'000'000'000);
+                return cycles == 0 ? 1U : cycles;
             }
 
             static constexpr std::uint32_t calcSdaTxHold(std::uint32_t f_clockSpeed,
@@ -112,8 +116,7 @@ namespace Kvasir { namespace I2C {
                 std::uint32_t high_cycles = period - (period * 3 / 5);
                 std::uint32_t low_cycles  = period * 3 / 5;
 
-                // Calculate spike length based on raw cycle counts
-                regs.spklen = calcSpkLen(low_cycles);
+                regs.spklen = calcSpkLen(f_clockSpeed);
 
                 // Program values per RP2350 datasheet Table 1053 / Section 12.2.14:
                 //   actual t_HIGH = (HCNT + SPKLEN + 7) cycles → write HCNT = high_cycles − SPKLEN − 7
@@ -125,13 +128,6 @@ namespace Kvasir { namespace I2C {
                 regs.sda_hold = calcSdaTxHold(f_clockSpeed, f_baud);
 
                 return regs;
-            }
-
-            template<std::uint32_t f_clockSpeed,
-                     std::uint32_t f_baud>
-            static constexpr bool isValidSpkLen() {
-                constexpr auto regs = calcBaudRegs(f_clockSpeed, f_baud);
-                return regs.spklen <= 0xFF;   // IC_FS_SPKLEN is 8-bit
             }
 
             template<std::uint32_t f_clockSpeed,
@@ -319,10 +315,6 @@ namespace Kvasir { namespace I2C {
                           "the RP2040/RP2350 I2C block does fast mode plus (1 MHz) at most: "
                           "high-speed mode's own SCL count registers are not programmed by "
                           "this driver");
-            static_assert(Config::template isValidSpkLen<I2CConfig::clockSpeed,
-                                                         I2CConfig::baudRate>(),
-                          "I2C SPKLEN overflows 8-bit register (max 255) — baud rate too low or "
-                          "clock speed too high");
             static_assert(Config::template isValidLcnt<I2CConfig::clockSpeed,
                                                        I2CConfig::baudRate>(),
                           "I2C LCNT invalid: must fit in 16 bits and be > SPKLEN+7");

@@ -105,6 +105,58 @@ struct OtpPageLocks {
 
 namespace detail {
 #if __has_include("peripherals/QMI.hpp")
+    // One transaction on chip select 0 in QMI direct mode (RP2350 datasheet 12.14.5) at
+    // clk_sys / clkdiv: byte i of `rx` arrives while byte i of `tx` goes out, the first `rxSize`
+    // are kept. XIP must be off. Plain pointers: hardened span accessors live in flash.
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void directTransaction(std::byte const* tx,
+                                                                 std::size_t      n,
+                                                                 std::byte*       rx,
+                                                                 std::size_t      rxSize,
+                                                                 std::uint32_t    clkdiv) {
+        KVASIR_RAM_FUNC_MARK();
+        using QMI        = Kvasir::Peripheral::QMI::Registers<0>;
+        auto* const csr  = reinterpret_cast<std::uint32_t volatile*>(QMI::DIRECT_CSR::Addr::value);
+        auto* const txr  = reinterpret_cast<std::uint32_t volatile*>(QMI::DIRECT_TX::Addr::value);
+        auto* const rxr  = reinterpret_cast<std::uint32_t volatile*>(QMI::DIRECT_RX::Addr::value);
+        *csr             = (clkdiv << 22) | (1U << 2) | 1U;   // clkdiv, assert_cs0n, en
+        std::size_t sent = 0;
+        std::size_t got  = 0;
+        while(got < n) {
+            auto const s = *csr;
+            if(sent < n && (s & (1U << 10)) == 0 && sent - got < 4) {       // not txfull
+                *txr = (1U << 19) | static_cast<std::uint32_t>(tx[sent]);   // 8-bit, oe
+                ++sent;
+            }
+            if((s & (1U << 16)) == 0) {   // not rxempty
+                auto const v = *rxr;
+                if(got < rxSize) { rx[got] = static_cast<std::byte>(v & 0xFFU); }
+                ++got;
+            }
+        }
+        while((*csr & (1U << 1)) != 0) {}   // busy
+        *csr = 0U;                          // CS up, direct mode off
+    }
+
+    // A command of N bytes packed into a word, first byte lowest; returns the reply packed the
+    // same way. The bytes are immediates: a const array would be placed in flash.
+    template<std::size_t N>
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline std::uint32_t directCommand(std::uint32_t tx,
+                                                                      std::uint32_t clkdiv) {
+        KVASIR_RAM_FUNC_MARK();
+        static_assert(N >= 1 && N <= 4);
+        std::uint32_t rx = 0;
+        directTransaction(reinterpret_cast<std::byte const*>(&tx),
+                          N,
+                          reinterpret_cast<std::byte*>(&rx),
+                          N,
+                          clkdiv);
+        return rx;
+    }
+
+    // 25 MHz at 150 MHz clk_sys, below the W25Q16JV's 104 MHz (datasheet rev H, AC
+    // characteristics).
+    inline constexpr std::uint32_t DirectCommandClkdiv = 6;
+
     // The XIP read mode every RP2350 project runs in.
     //
     // The bootrom brings the flash up in EBh quad I/O (command on one line, address, mode
@@ -116,6 +168,8 @@ namespace detail {
     // other mode alone (a flash the bootrom would not run in quad mode is not forced into
     // it). It also writes the timing, because the bootrom's flash_exit_xip resets M0_TIMING
     // to clkdiv 12.
+    //
+    // Exception: with quadEnableSr2 set (FlashQuadEnable), the bootrom's BBh is upgraded too.
     //
     // Runs from RAM with interrupts off and the QMI idle: while the format changes,
     // nothing may fetch from flash. peripheryClockInit() calls it once at boot,
@@ -130,7 +184,12 @@ namespace detail {
         // bits (4 quad clocks): what the bootrom programs for EBh
         static constexpr std::uint32_t RfmtQuadEBh        = 0x0004'92A8U;
         static constexpr std::uint32_t CommandEBh         = 0xEBU;
+        static constexpr std::uint32_t CommandBBh         = 0xBBU;
         static constexpr std::uint32_t ContinuousModeBits = 0xA0U;
+
+        // Status register 2 with QE that FlashQuadEnable set at boot, 0 if it did not.
+        // FlashXipDisabler::enable() writes it again before every return to XIP.
+        static inline std::uint8_t quadEnableSr2 = 0;
 
         // M0_TIMING that reads at clk_ref speed and at the full clock: clkdiv 4, rxdelay 2,
         // min_deselect 2, cooldown 1 - the divider flashInit() uses before the PLL switch
@@ -177,7 +236,9 @@ namespace detail {
 
             auto const rfmt = *rfmtReg;
             auto const rcmd = *rcmdReg;
-            if(!isQuadEBh(rfmt, rcmd) || isContinuous(rfmt, rcmd)) { return; }
+            bool const upgrade
+              = isQuadEBh(rfmt, rcmd) || (quadEnableSr2 != 0 && (rcmd & 0xFFU) == CommandBBh);
+            if(!upgrade || isContinuous(rfmt, rcmd)) { return; }
 
             // The one transfer with the command byte and the continuous mode bits: the
             // flash is in continuous mode after it.
@@ -252,6 +313,13 @@ namespace detail {
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] void enable() {
             KVASIR_RAM_FUNC_MARK();
             flushCache();
+#if __has_include("peripherals/QMI.hpp")
+            // Volatile QE again: a flash reset (66h 99h) restores the stored QE = 0.
+            if(std::uint32_t const sr2 = XipReadMode::quadEnableSr2; sr2 != 0) {
+                directCommand<1>(0x50U, DirectCommandClkdiv);   // write enable, volatile
+                directCommand<2>(0x31U | (sr2 << 8), DirectCommandClkdiv);   // status register 2
+            }
+#endif
             xipEnable();
 #if __has_include("peripherals/QMI.hpp")
             // xipEnable() ran the BOOTRAM setup function: bootrom mode, bootrom timing.
@@ -272,6 +340,53 @@ namespace detail {
         XipGuard(XipGuard const&)            = delete;
         XipGuard& operator=(XipGuard const&) = delete;
     };
+
+#if __has_include("peripherals/QMI.hpp")
+    // Quad I/O for a flash the bootrom left in BBh dual I/O because QE is clear, e.g. the
+    // RP2354's W25Q16JV "IM" (JEDEC EF 70 15, QE = 0 from the factory; W25Q16JV datasheet rev H,
+    // "Quad Enable (QE)"). QE is set as a volatile bit (50h, 31h): no wear. Winbond 40h / 70h
+    // parts with QE = 0 only. With QE = 1 the flash drives IO2/IO3 (/WP, /HOLD).
+    struct FlashQuadEnable {
+        static constexpr std::uint32_t Clkdiv = DirectCommandClkdiv;
+
+        // Leaving the guard rewrites QE and switches to continuous EBh (FlashXipDisabler::enable).
+        [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void run(FlashXipDisabler& xip) {
+            KVASIR_RAM_FUNC_MARK();
+            XipGuard guard{xip};
+
+            auto const id = directCommand<4>(0x9FU, Clkdiv);   // JEDEC id: EF, type, capacity
+            auto const manufacturer = (id >> 8) & 0xFFU;
+            auto const type         = (id >> 16) & 0xFFU;
+            if(manufacturer != 0xEFU || (type != 0x40U && type != 0x70U)) { return; }
+
+            auto const before = (directCommand<2>(0x35U, Clkdiv) >> 8) & 0xFFU;   // SR2
+            if((before & 0x02U) != 0) { return; }
+
+            auto const wanted = before | 0x02U;
+            directCommand<1>(0x50U, Clkdiv);                   // write enable, volatile
+            directCommand<2>(0x31U | (wanted << 8), Clkdiv);   // status register 2
+            for(std::uint32_t i = 0; i < 64; ++i) { asm volatile("" ::: "memory"); }   // tSHSL2
+
+            auto const after = (directCommand<2>(0x35U, Clkdiv) >> 8) & 0xFFU;
+            if((after & 0x02U) != 0) {
+                XipReadMode::quadEnableSr2 = static_cast<std::uint8_t>(wanted);
+            }
+        }
+    };
+
+    // At boot, after initMemory(): FlashQuadEnable if the bootrom settled on BBh.
+    inline void enableQuadIo() {
+        using QMI = Kvasir::Peripheral::QMI::Registers<0>;
+        auto const rcmd
+          = *reinterpret_cast<std::uint32_t const volatile*>(QMI::M0_RCMD::Addr::value);
+        if((rcmd & 0xFFU) != XipReadMode::CommandBBh) { return; }
+        FlashXipDisabler xip{};
+        std::uint32_t    primask{};
+        asm volatile("mrs %0, primask\n cpsid i" : "=r"(primask)::"memory");
+        FlashQuadEnable::run(xip);
+        asm volatile("msr primask, %0" ::"r"(primask) : "memory");
+    }
+#endif
 
     static inline int get_sys_info(std::uint32_t* out_buffer,
                                    std::uint32_t  out_buffer_word_size,

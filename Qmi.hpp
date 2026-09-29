@@ -36,40 +36,13 @@ namespace Kvasir { namespace Qmi {
                                                             std::span<std::byte>              rx,
                                                             std::uint32_t clkdiv) {
             KVASIR_RAM_FUNC_MARK();
-            // Plain pointers, taken before XIP goes off: with libc++'s hardening (the sanitize
-            // variant) span::operator[] is a real function in flash, and calling it in here is
-            // a fault whose handler is in flash too (bootrom_functions.hpp, flash_do_cmd_impl).
-            std::byte const* const txData = tx.data();
-            std::byte* const       rxData = rx.data();
-            std::size_t const      rxSize = rx.size();
-            {
-                Kvasir::detail::XipGuard guard{xip};
-                // Direct mode on, CS0 asserted by hand, the divider (2..255 of clk_sys).
-                apply(write(Regs::DIRECT_CSR::FULLREGISTER,
-                            (clkdiv << 22) | (1U << 2) | 1U));   // clkdiv, assert_cs0n, en
-                std::size_t sent = 0;
-                std::size_t got  = 0;
-                auto const  n    = tx.size();
-                while(got < n) {
-                    auto const csr     = get<0>(apply(read(Regs::DIRECT_CSR::FULLREGISTER)));
-                    bool const txFull  = (csr & (1U << 10)) != 0;
-                    bool const rxEmpty = (csr & (1U << 16)) != 0;
-                    if(sent < n && !txFull && sent - got < 4) {
-                        // One byte: 8-bit data, single-width, output enabled.
-                        apply(write(Regs::DIRECT_TX::FULLREGISTER,
-                                    (1U << 19) | static_cast<std::uint32_t>(txData[sent])));
-                        ++sent;
-                    }
-                    if(!rxEmpty) {
-                        auto const v = get<0>(apply(read(Regs::DIRECT_RX::FULLREGISTER)));
-                        if(got < rxSize) { rxData[got] = static_cast<std::byte>(v & 0xFFU); }
-                        ++got;
-                    }
-                }
-                while((get<0>(apply(read(Regs::DIRECT_CSR::FULLREGISTER))) & (1U << 1)) != 0) {
-                }   // busy
-                apply(write(Regs::DIRECT_CSR::FULLREGISTER, 0U));   // CS up, direct mode off
-            }
+            // Plain pointers, taken before XIP goes off.
+            std::byte const* const   txData = tx.data();
+            std::byte* const         rxData = rx.data();
+            std::size_t const        txSize = tx.size();
+            std::size_t const        rxSize = rx.size();
+            Kvasir::detail::XipGuard guard{xip};
+            Kvasir::detail::directTransaction(txData, txSize, rxData, rxSize, clkdiv);
         }
     }   // namespace detail
 

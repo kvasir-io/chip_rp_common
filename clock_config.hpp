@@ -449,6 +449,7 @@ namespace Kvasir { namespace DefaultClockSettings {
              auto MaxFlashFreq = 100'000'000>
     void peripheryClockInit() {
 #if __has_include("peripherals/QMI.hpp")
+        Kvasir::detail::enableQuadIo();
         std::uint32_t primask{};
         asm volatile("mrs %0, primask\n cpsid i" : "=r"(primask)::"memory");
         Kvasir::detail::XipReadMode::apply(detail::flashTiming<ClockSpeed, MaxFlashFreq>());
