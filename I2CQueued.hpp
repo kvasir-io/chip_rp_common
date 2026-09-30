@@ -11,6 +11,7 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <type_traits>
 
 namespace Kvasir { namespace I2C {
 
@@ -24,6 +25,25 @@ namespace Kvasir { namespace I2C {
         StaticFunction<void(I2CRequestResult), CallbackSize> callback{};
     };
 
+    /// The request of a bus with I2CConfig::perDeviceClock: the device's SCL counts ride along.
+    /// A type of its own, not a parameter of I2CRequest, so that a bus without the feature
+    /// keeps the very same type (and names: a sanitize image hashes them).
+    ///
+    /// `BusDefault` is the timing of the bus's own rate: a request nobody gave a timing - the bus
+    /// scan's probes, a raw request of the application's - goes out at baudRate, never at the
+    /// all-zero counts a value-initialised member would be.
+    template<std::size_t CallbackSize, typename Timing, Timing BusDefault>
+    struct I2CTimedRequest : I2CRequest<CallbackSize> {
+        Timing timing{BusDefault};
+    };
+
+    namespace Detail {
+        /// Not constexpr: reaching one in timing() is the compile error that says why.
+        inline void i2cDeviceClockBelowTheBusClockSetPerDeviceClockOnTheBus() {}
+
+        inline void i2cDeviceClockBelowMinBaudRateOfTheBus() {}
+    }   // namespace Detail
+
     template<typename I2CConfig, typename Clock, std::size_t QueueDepth_, std::size_t CallbackSize_>
     struct I2CBehaviorQueued : Detail::I2CBase<I2CConfig> {
         static constexpr std::size_t QueueDepth   = QueueDepth_;
@@ -33,9 +53,49 @@ namespace Kvasir { namespace I2C {
         using base                     = Detail::I2CBase<I2CConfig>;
         using Regs                     = typename base::Regs;
         using tp                       = typename Clock::time_point;
-        using Request                  = I2CRequest<CallbackSize>;
         using Result                   = I2CRequestResult;
         using Recovery                 = I2CBusRecovery<I2CConfig, Clock>;
+
+        /// Each device at its own clock (I2CConfig::perDeviceClock). Off, a request has no
+        /// timing member and startNext() never looks at the SCL counts: nothing of this
+        /// is in the image.
+        static constexpr bool PerDeviceClock = base::I2CConfig::perDeviceClock;
+        using ClockTiming                    = typename base::Config::ClockTiming;
+        /// The timing of baudRate itself, what a request without one of its own carries.
+        static constexpr ClockTiming DefaultTiming = [] {
+            if constexpr(PerDeviceClock) {
+                return base::Config::clockTiming(I2CConfig::clockSpeed,
+                                                 static_cast<std::uint32_t>(BaudRate),
+                                                 base::I2CConfig::maxBaudRateError);
+            } else {
+                return ClockTiming{};
+            }
+        }();
+        using Request
+          = std::conditional_t<PerDeviceClock,
+                               I2CTimedRequest<CallbackSize, ClockTiming, DefaultTiming>,
+                               I2CRequest<CallbackSize>>;
+
+        /// What a request carries for a device clocked at most at `hz` (kvasir_devices'
+        /// Device fills it in from Config::BusClock / Chip::I2cMaxClock): the counts for
+        /// min(hz, baudRate). On a bus without perDeviceClock a device slower than the bus
+        /// is a compile error, and the answer is nothing.
+        static consteval auto timing(std::uint32_t hz) {
+            if constexpr(PerDeviceClock) {
+                auto const f = std::min(hz, static_cast<std::uint32_t>(BaudRate));
+                if(f < base::I2CConfig::minBaudRate) {
+                    Detail::i2cDeviceClockBelowMinBaudRateOfTheBus();
+                }
+                return base::Config::clockTiming(I2CConfig::clockSpeed,
+                                                 f,
+                                                 base::I2CConfig::maxBaudRateError);
+            } else {
+                if(hz < BaudRate) {
+                    Detail::i2cDeviceClockBelowTheBusClockSetPerDeviceClockOnTheBus();
+                }
+                return std::false_type{};
+            }
+        }
 
         /// Bus faults in an unbroken row that mean the bus is dead. A success resets it, and
         /// so does a NAK: the address went out and nobody took it, which is a working wire
@@ -80,6 +140,8 @@ namespace Kvasir { namespace I2C {
             // RESET_DONE before any register of the block is written: see waitResetDone().
             Traits::I2C::waitResetDone<base::Instance>();
             apply(base::initStepPeripheryConfig);
+            // The block is back at baudRate's counts: the next request writes its own.
+            if constexpr(PerDeviceClock) { timingValid_ = false; }
             apply(base::initStepInterruptConfig);
             resetting_ = outer;
             apply(base::initStepPeripheryEnable);
@@ -269,6 +331,16 @@ namespace Kvasir { namespace I2C {
         /// IC_TAR write may have been dropped.
         static std::uint32_t disableWaitsExhausted() { return disableWaitsExhausted_; }
 
+        /// Times startNext() rewrote the SCL counts for a device at another clock
+        /// (perDeviceClock only, 0 without it).
+        static std::uint32_t clockSwitches() {
+            if constexpr(PerDeviceClock) {
+                return clockSwitches_;
+            } else {
+                return 0;
+            }
+        }
+
         static TimeoutSnapshot const& lastTimeout() { return lastTimeout_; }
 
         /// lastTimeout() as a log line. The snapshot's fields are this block's registers, so
@@ -341,6 +413,12 @@ namespace Kvasir { namespace I2C {
         inline static std::uint32_t   disableWaitsExhausted_{};
         inline static TimeoutSnapshot lastTimeout_{};
 
+        // perDeviceClock: the counts in the block, and whether they are known (not after a
+        // reset). Members of a class template: never instantiated on a bus without it.
+        inline static ClockTiming   timing_{};
+        inline static bool          timingValid_{};
+        inline static std::uint32_t clockSwitches_{};
+
         static TimeoutSnapshot snapshot_() {
             return TimeoutSnapshot{
               .status       = get<0>(apply(read(Regs::IC_STATUS::FULLREGISTER))),
@@ -382,6 +460,24 @@ namespace Kvasir { namespace I2C {
         static std::uint32_t faultKey(Fault                                 kind,
                                       typename base::AbrtSrc::Addr::RegType cause = 0) {
             return Kvasir::rateLimitKey(kind, currentRequest_.address, cause);
+        }
+
+        /// The SCL counts of the request about to start, written only when they differ from
+        /// the last ones. HCNT, LCNT and SPKLEN take a write only while the block is disabled
+        /// ("Writes at other times have no effect", RP2350 datasheet 12.2, Tables 1062, 1063,
+        /// 1093; RP2040 4.3): called after waitDisabled_(). IC_SDA_HOLD has no such rule
+        /// (Table 1084). IC_CON.SPEED stays fast for every rate (Config::getSpeedModeRegister).
+        /// The pads keep the drive chosen for baudRate (Config::i2cDrive), which is at least
+        /// as strong as a slower device's. Interrupts disabled or in the ISR.
+        static void applyTiming_(ClockTiming const& t) {
+            if(timingValid_ && t == timing_) { return; }
+            apply(write(Regs::IC_FS_SCL_HCNT::ic_fs_scl_hcnt, std::uint32_t{t.hcnt}),
+                  write(Regs::IC_FS_SCL_LCNT::ic_fs_scl_lcnt, std::uint32_t{t.lcnt}),
+                  write(Regs::IC_FS_SPKLEN::ic_fs_spklen, std::uint32_t{t.spklen}));
+            apply(write(Regs::IC_SDA_HOLD::ic_sda_tx_hold, std::uint32_t{t.sdaHold}));
+            timing_      = t;
+            timingValid_ = true;
+            ++clockSwitches_;
         }
 
         /// Spin until IC_ENABLE_STATUS says the block is inactive. Bounded: this runs in
@@ -444,7 +540,13 @@ namespace Kvasir { namespace I2C {
             auto const totalBytes
               = currentRequest_.sendData.size() + currentRequest_.receiveData.size();
             requestStart_ = Clock::now();
-            timeoutTime_  = requestStart_ + base::calcTransferTimeout(totalBytes);
+            if constexpr(PerDeviceClock) {
+                timeoutTime_
+                  = requestStart_
+                  + base::calcTransferTimeout(totalBytes, currentRequest_.timing.usPerByte);
+            } else {
+                timeoutTime_ = requestStart_ + base::calcTransferTimeout(totalBytes);
+            }
 
             // ENABLE.ABORT after a NAK raises its own TX_ABRT (ABRT_USER_ABRT) once the
             // abort has gone through, which is after the ISR that issued it has cleared the
@@ -456,6 +558,8 @@ namespace Kvasir { namespace I2C {
             // effect only once the master is done: without this wait the address write
             // below is dropped and the transfer goes out to the previous address.
             waitDisabled_();
+
+            if constexpr(PerDeviceClock) { applyTiming_(currentRequest_.timing); }
 
             apply(write(Regs::IC_TAR::ic_tar, currentRequest_.address));
             apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));

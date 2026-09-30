@@ -172,6 +172,64 @@ namespace Kvasir { namespace I2C {
                 return write(Regs::IC_CON::SPEEDValC::fast);
             }
 
+            /// One device's SCL counts on a bus that runs each device at its own clock
+            /// (I2CConfig::perDeviceClock): what GetBaudConfig writes, as values a request
+            /// carries, plus its microseconds per byte for the transfer timeout.
+            struct ClockTiming {
+                std::uint16_t hcnt{};
+                std::uint16_t lcnt{};
+                std::uint16_t sdaHold{};
+                std::uint16_t usPerByte{};
+                std::uint8_t  spklen{};
+
+                constexpr bool operator==(ClockTiming const&) const = default;
+            };
+
+            /// The same numbers and the same checks as GetBaudConfig and I2CBase's
+            /// static_asserts, for a rate known only per device. A failed check is a call to
+            /// one of the functions below it, which are not constexpr: the compile error
+            /// names what is wrong.
+            template<std::intmax_t Num,
+                     std::intmax_t Denom>
+            static consteval ClockTiming clockTiming(std::uint32_t f_clockSpeed,
+                                                     std::uint32_t f_baud,
+                                                     std::ratio<Num,
+                                                                Denom>) {
+                if(f_baud == 0 || f_baud > 1'000'000) { i2cDeviceClockAboveFastModePlus(); }
+                auto const regs = calcBaudRegs(f_clockSpeed, f_baud);
+                if(regs.hcnt > 0xFFFF || regs.hcnt <= regs.spklen + 5) {
+                    i2cDeviceClockGivesAnInvalidHcnt();
+                }
+                if(regs.lcnt > 0xFFFF || regs.lcnt <= regs.spklen + 7) {
+                    i2cDeviceClockGivesAnInvalidLcnt();
+                }
+                auto const period = (regs.hcnt + regs.spklen + 7) + (regs.lcnt + 1);
+                auto const actual = f_clockSpeed / period;
+                auto const err    = actual > f_baud ? actual - f_baud : f_baud - actual;
+                if(err > (f_baud * Num) / Denom) { i2cDeviceClockErrorAboveMaxBaudRateError(); }
+                return ClockTiming{.hcnt      = static_cast<std::uint16_t>(regs.hcnt),
+                                   .lcnt      = static_cast<std::uint16_t>(regs.lcnt),
+                                   .sdaHold   = static_cast<std::uint16_t>(regs.sda_hold),
+                                   .usPerByte = static_cast<std::uint16_t>(usPerDataByte(f_baud)),
+                                   .spklen    = static_cast<std::uint8_t>(regs.spklen)};
+            }
+
+            // Not constexpr: reaching one in clockTiming() is the compile error that says why.
+            static void i2cDeviceClockAboveFastModePlus() {}
+
+            static void i2cDeviceClockGivesAnInvalidHcnt() {}
+
+            static void i2cDeviceClockGivesAnInvalidLcnt() {}
+
+            static void i2cDeviceClockErrorAboveMaxBaudRateError() {}
+
+            /// The transfer timeout's time per byte: 9 bits, 4 times over.
+            static constexpr std::uint32_t usPerDataByte(std::uint32_t f_baud) {
+                constexpr std::uint32_t bitsPerDataByte = 9;
+                constexpr std::uint32_t safetyFactor    = 4;
+                return (bitsPerDataByte * 1'000'000 * safetyFactor) / f_baud;
+            }
+
             template<std::uint32_t f_clockSpeed, std::uint32_t f_baud>
             struct GetBaudConfig {
                 static constexpr auto config_ = []() {
@@ -257,6 +315,27 @@ namespace Kvasir { namespace I2C {
                         return std::ratio<1, 100>{};
                     }
                 }();
+
+                /// Each device at its own clock, switched between transfers (I2CQueued's
+                /// timing()); `baudRate` is then the fastest any device gets and the rate
+                /// the block starts with.
+                static constexpr bool perDeviceClock = [] {
+                    if constexpr(requires { I2CConfig_::perDeviceClock; }) {
+                        return static_cast<bool>(I2CConfig_::perDeviceClock);
+                    } else {
+                        return false;
+                    }
+                }();
+
+                /// The slowest rate a device on this bus runs at: what the idle watchdog of
+                /// LineRecovery scales its threshold with. Only perDeviceClock makes it differ.
+                static constexpr std::uint32_t minBaudRate = [] {
+                    if constexpr(requires { I2CConfig_::minBaudRate; }) {
+                        return static_cast<std::uint32_t>(I2CConfig_::minBaudRate);
+                    } else {
+                        return static_cast<std::uint32_t>(I2CConfig_::baudRate);
+                    }
+                }();
             };
 
             // needed config
@@ -325,6 +404,11 @@ namespace Kvasir { namespace I2C {
               Config::template isValidBaudConfig<I2CConfig::clockSpeed,
                                                  I2CConfig::baudRate>(I2CConfig::maxBaudRateError),
               "I2C baud rate error too large — adjust clockSpeed, baudRate, or maxBaudRateError");
+            static_assert(I2CConfig::minBaudRate <= I2CConfig::baudRate
+                            && (I2CConfig::perDeviceClock
+                                || I2CConfig::minBaudRate == I2CConfig::baudRate),
+                          "minBaudRate is the slowest device on a perDeviceClock bus, at most "
+                          "baudRate");
             static_assert(Config::isValidPinLocationSDA(I2CConfig::sdaPinLocation),
                           "invalid SDAPin");
             static_assert(Config::isValidPinLocationSCL(I2CConfig::sclPinLocation),
@@ -361,13 +445,12 @@ namespace Kvasir { namespace I2C {
             static constexpr auto initStepPeripheryEnable
               = list(Nvic::makeEnable(InterruptIndexs{}));
 
-            static constexpr auto calcTransferTimeout(std::size_t numBytes) {
+            static constexpr auto
+            calcTransferTimeout(std::size_t   numBytes,
+                                std::uint32_t microsecondsPerDataByte
+                                = Config::usPerDataByte(I2CConfig::baudRate)) {
                 using namespace std::chrono_literals;
-                constexpr std::uint32_t bitsPerDataByte = 9;
-                constexpr std::uint32_t safetyFactor    = 4;
-                constexpr auto          baseTimeout     = 10ms;
-                constexpr std::uint32_t microsecondsPerDataByte
-                  = (bitsPerDataByte * 1'000'000 * safetyFactor) / I2CConfig::baudRate;
+                constexpr auto baseTimeout = 10ms;
 
                 std::uint32_t const timeoutUs = (numBytes + 1) * microsecondsPerDataByte;
 
