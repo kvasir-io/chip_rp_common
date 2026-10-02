@@ -65,6 +65,19 @@
 //                              `set pindirs` (pico-sdk gpio_set_outover / _oeover)
 //   inputSyncBypass (empty)    pins whose 2-flop input synchroniser is bypassed (INPUT_SYNC_
 //                              BYPASS): fast synchronous inputs, a counter above ~37 MHz
+//   foreignPads (empty)        input pins (in pins, the jmp pin) whose pads belong to someone
+//                              else: the machine maps and reads them but leaves their function,
+//                              pull, overrides and direction alone. A PIO reads a pad's input
+//                              whatever its function ("the input is always connected, so the
+//                              PIOs can always see the state of all pins": RP2350 datasheet 9.4,
+//                              RP2040 datasheet 2.19.2), as long as the owner keeps the pad's
+//                              input enabled (PADS IE; every Io pin action does). So a clock
+//                              on a GPOUT pin, the clock block's GPIN, or a pin the board's pin
+//                              table sets up can be counted without the two fighting over it.
+//                              Claimed rather than provided, so their owner has to be in the
+//                              Startup list. Never an output; no pullUpPins / pullDownPins /
+//                              outputInverted / oeInverted (inPullUp leaves them out); the
+//                              synchroniser bypass is the PIO's own and stays allowed
 //   rxFifoPut, rxFifoGet (from the program's .fifo txput / txget / putget, RP2350)
 //   startEnabled (true)        false: loaded and configured but left stopped; the driver
 //                              starts it itself (restartAt(), setEnabled())
@@ -468,6 +481,13 @@ namespace Kvasir { namespace Pio {
                     return brigand::list<>{};
                 }
             }();
+            static constexpr auto foreignPads = [] {
+                if constexpr(requires { Config_::foreignPads; }) {
+                    return Config_::foreignPads;
+                } else {
+                    return brigand::list<>{};
+                }
+            }();
             static constexpr auto driveStrength = [] {
                 if constexpr(requires { Config_::driveStrength; }) {
                     return Config_::driveStrength;
@@ -670,7 +690,8 @@ namespace Kvasir { namespace Pio {
         using InputPins = typename detail::Unique<
           brigand::append<std::remove_cvref_t<decltype(Config::inPins)>,
                           std::remove_cvref_t<decltype(Config::jmpPin)>>>::type;
-        using AllPins = typename detail::Unique<brigand::append<OutputPins, InputPins>>::type;
+        using AllPins     = typename detail::Unique<brigand::append<OutputPins, InputPins>>::type;
+        using ForeignPads = std::remove_cvref_t<decltype(Config::foreignPads)>;
 
         // The instance's GPIO window: a machine names 32 pins counted from it, so a pin above
         // 31 needs 16 (PIO.hpp). Derived from this machine's own pins unless the config pins
@@ -765,7 +786,9 @@ namespace Kvasir { namespace Pio {
         // machines on one program share them), the instance's GPIO window, the pins, the
         // clock.
         using Provides = Kvasir::Pio::Provides<Instance, Sm, Offset, Program, GpioBase>;
-        using Claims   = Clocks::Claim<Clocks::ClkSys, Config::ClockSpeed>;
+        // foreign pads are claimed: their owner has to be in the list and configure them
+        using Claims = brigand::append<Clocks::Claim<Clocks::ClkSys, Config::ClockSpeed>,
+                                       brigand::wrap<ForeignPads, Kvasir::Io::PinClaims>>;
 
         static constexpr auto powerClockEnable = list(Kvasir::Pio::getEnable<Instance>());
 
@@ -818,9 +841,12 @@ namespace Kvasir { namespace Pio {
         // An input that is also an output (a bidirectional line) is configured as an output.
         using PureInputPins = typename detail::Difference<InputPins, OutputPins>::type;
 
+        // The inputs whose pads are this machine's: all but the foreign ones.
+        using OwnInputPins = typename detail::Difference<PureInputPins, ForeignPads>::type;
+
         static constexpr auto initStepPinConfig
           = brigand::append<decltype(pinConfigs<false>(OutputPins{})),
-                            decltype(pinConfigs<true>(PureInputPins{}))>{};
+                            decltype(pinConfigs<true>(OwnInputPins{}))>{};
 
         // Every pin a pin option names is one of the machine's pins.
         template<typename... Pins>
@@ -835,6 +861,31 @@ namespace Kvasir { namespace Pio {
                         && allMine(std::remove_cvref_t<decltype(Config::inputSyncBypass)>{}),
                       "pullUpPins / pullDownPins / outputInverted / oeInverted / inputSyncBypass "
                       "name a pin that is not one of this machine's (set, out, side-set, in, jmp)");
+
+        template<typename... Pins>
+        static constexpr bool noneOf(brigand::list<Pins...>,
+                                     auto list) {
+            return (!listed<decltype(list), Pins> && ...);
+        }
+
+        static_assert(allMine(ForeignPads{})
+                        && noneOf(ForeignPads{},
+                                  OutputPins{}),
+                      "foreignPads names a pin that is not an input of this machine (in, jmp): "
+                      "an output needs its pad set to the PIO's function");
+        // Pulls and overrides are written by the pad's pin action, which a foreign pad does not
+        // get: named for one they would be dropped without a word. inPullUp reaches the
+        // configured pads only, so it needs no rule here.
+        static_assert(noneOf(ForeignPads{},
+                             std::remove_cvref_t<decltype(Config::pullUpPins)>{})
+                        && noneOf(ForeignPads{},
+                                  std::remove_cvref_t<decltype(Config::pullDownPins)>{})
+                        && noneOf(ForeignPads{},
+                                  std::remove_cvref_t<decltype(Config::outputInverted)>{})
+                        && noneOf(ForeignPads{},
+                                  std::remove_cvref_t<decltype(Config::oeInverted)>{}),
+                      "pullUpPins / pullDownPins / outputInverted / oeInverted name a foreign "
+                      "pad: its pad and GPIO settings are its owner's");
 
         // INPUT_SYNC_BYPASS: one bit per GPIO, counted from the instance's GPIO window (as
         // pico-sdk pio_set_input_sync_bypass_with_mask64 shifts it by the GPIO base)
@@ -961,7 +1012,7 @@ namespace Kvasir { namespace Pio {
 
             setPinLevels(std::remove_cvref_t<decltype(Config::pinsInitialHigh)>{}, true);
             setPinDirs(OutputPins{}, true);
-            setPinDirs(PureInputPins{}, false);
+            setPinDirs(OwnInputPins{}, false);
 
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::set_base,
