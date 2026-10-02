@@ -6,6 +6,7 @@
 #include "kvasir/Atomic/Atomic.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
+#include "kvasir/Util/Rollover.hpp"
 #include "kvasir/Util/attributes.hpp"
 
 #include <chrono>
@@ -303,8 +304,8 @@ public:
     static void armRaw(std::uint32_t low) {
         Nvic::InterruptGuard<Irq> const guard;
         apply(write(alarmField(), low));
-        auto const behind = static_cast<std::int32_t>(low - lowNow());
-        if(behind <= 0 && armed()) {
+        using Low = Rollover<std::uint32_t>;
+        if(!after(Low{low}, Low{lowNow()}) && armed()) {
             disarm();
             apply(set(intfField()));
         }

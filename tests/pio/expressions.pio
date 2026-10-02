@@ -1,0 +1,32 @@
+; pioasm's expression grammar and name lookup: precedence (parser.yy's %left order), unary - and
+; ::, bases, one/zero, forward references to labels, global and program defines
+.define public GLOBAL_A 3
+.define GLOBAL_HIDDEN 2
+
+.program expressions
+.define public P1 1 + 2 * 3 & 1
+.define public P2 -2*3+1
+.define public P3 (::1 + 1) >> 28
+.define public P4 1 << 2 + 1
+.define public P5 (0b101 ^ 0x3) | one
+.define public P6 zero - -1
+.define public P7 later + 1
+.define public P8 GLOBAL_A * GLOBAL_HIDDEN
+.define public P9 100 / 7 - 7 * 2
+.define public P10 -(4) & 7
+.define *STAR 5
+.origin 2
+    set x, P1
+    set y, P3 [P9 + 1]
+    jmp P7
+public later:
+    set pins, (P5 << 1) [P4 + P6]
+    mov y, ::x
+    mov x, !y
+    in x, GLOBAL_A
+    out pins, (P8 + 26)
+    jmp !osre later
+    jmp x!=y, 0
+    wait 1 gpio 17
+    .word 0xa042
+    nop [(1 << 4) + P10 + 8]

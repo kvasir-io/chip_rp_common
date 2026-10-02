@@ -5,6 +5,8 @@
 
 #if __has_include("peripherals/POWMAN.hpp")
     #include "peripherals/POWMAN.hpp"
+#else
+    #include "peripherals/VREG_AND_CHIP_RESET.hpp"
 #endif
 #include "peripherals/WATCHDOG.hpp"
 
@@ -34,8 +36,12 @@ namespace Kvasir { namespace PM {
 
     // All reset bits, not just the summary of `reset_cause()`: CHIP_RESET is read-only and never
     // cleared, so bits from an earlier reset can survive alongside the current one.
-    // Values are the CHIP_RESET bit positions; wd_timer/wd_force come from WATCHDOG::REASON and use
-    // bits 2 and 3, which CHIP_RESET leaves unused.
+    // Values are the RP2350 CHIP_RESET bit positions (POWMAN, datasheet Table 489); wd_timer/wd_force
+    // come from WATCHDOG::REASON (Table 1250) and use bits 2 and 3, which CHIP_RESET leaves unused.
+    // had_watchdog_reset_rsm is the datasheet's HAD_WATCHDOG_RESET_PSM (bit 28; the SVD says RSM).
+    // On the RP2040 the three bits of VREG_AND_CHIP_RESET.CHIP_RESET (RP2040 datasheet Table 191)
+    // map onto had_por (HAD_POR: power-on or brown-out), had_run_low (HAD_RUN) and had_rescue
+    // (HAD_PSM_RESTART: the debugger's rescue restart), REASON is the same register (Table 548).
     enum class ResetSource : std::uint32_t {
         none                            = 0,
         wd_timer                        = 1U << 2U,
@@ -130,8 +136,25 @@ namespace Kvasir { namespace PM {
         add(chip_reset[ChipReset::had_hzd_sys_reset_req] != 0, ResetSource::had_hzd_sys_reset_req);
         add(chip_reset[ChipReset::had_watchdog_reset_rsm] != 0,
             ResetSource::had_watchdog_reset_rsm);
+#else
+        using ChipReset = Kvasir::Peripheral::VREG_AND_CHIP_RESET::Registers<>::CHIP_RESET;
+        using WdReason  = Kvasir::Peripheral::WATCHDOG::Registers<>::REASON;
+
+        auto const wd_reasons = apply(read(WdReason::force), read(WdReason::timer));
+        auto const chip_reset = apply(read(ChipReset::had_psm_restart),
+                                      read(ChipReset::had_run),
+                                      read(ChipReset::had_por));
+
+        auto add = [&](bool present, ResetSource source) {
+            if(present) { sources |= source; }
+        };
+
+        add(wd_reasons[WdReason::timer] != 0, ResetSource::wd_timer);
+        add(wd_reasons[WdReason::force] != 0, ResetSource::wd_force);
+        add(chip_reset[ChipReset::had_por] != 0, ResetSource::had_por);
+        add(chip_reset[ChipReset::had_run] != 0, ResetSource::had_run_low);
+        add(chip_reset[ChipReset::had_psm_restart] != 0, ResetSource::had_rescue);
 #endif
-        //TODO rp2040
         return sources;
     }
 
@@ -164,8 +187,24 @@ namespace Kvasir { namespace PM {
         if(chip_reset[ChipReset::had_por]) { return ResetCause::por; }
         if(chip_reset[ChipReset::had_run_low]) { return ResetCause::run_low; }
         if(chip_reset[ChipReset::had_swcore_pd]) { return ResetCause::swcore_pd; }
+#else
+        // RP2040: the same REASON register (datasheet Table 548), and CHIP_RESET in
+        // VREG_AND_CHIP_RESET (Table 191). A debugger's SYSRESETREQ resets core 0 only and
+        // leaves both as they were (unlike the RP2350, whose REASON it clears, Table 1250).
+        using ChipReset = Kvasir::Peripheral::VREG_AND_CHIP_RESET::Registers<>::CHIP_RESET;
+        using WdReason  = Kvasir::Peripheral::WATCHDOG::Registers<>::REASON;
+
+        auto wd_reasons = apply(read(WdReason::force), read(WdReason::timer));
+        auto chip_reset = apply(read(ChipReset::had_psm_restart),
+                                read(ChipReset::had_run),
+                                read(ChipReset::had_por));
+
+        if(wd_reasons[WdReason::force]) { return ResetCause::watchdog_force; }
+        if(wd_reasons[WdReason::timer]) { return ResetCause::watchdog_timer; }
+        if(chip_reset[ChipReset::had_psm_restart]) { return ResetCause::rescue; }
+        if(chip_reset[ChipReset::had_por]) { return ResetCause::por; }
+        if(chip_reset[ChipReset::had_run]) { return ResetCause::run_low; }
 #endif
-        //TODO rp2040
         return ResetCause::unknown;
     }
 }}   // namespace Kvasir::PM

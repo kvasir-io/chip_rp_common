@@ -7,6 +7,7 @@
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Apply.hpp"
 #include "kvasir/Register/RegisterFmt.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 #include "kvasir/Util/using_literals.hpp"
 #include "peripherals/I2C.hpp"
 
@@ -146,19 +147,12 @@ namespace Kvasir { namespace I2C {
                     && regs.lcnt > regs.spklen + 7;
             }
 
-            template<std::uint32_t f_clockSpeed,
-                     std::uint32_t f_baud,
-                     std::intmax_t Num,
-                     std::intmax_t Denom>
-            static constexpr bool isValidBaudConfig(std::ratio<Num,
-                                                               Denom>) {
-                constexpr auto regs         = calcBaudRegs(f_clockSpeed, f_baud);
-                constexpr auto period       = (regs.hcnt + regs.spklen + 7) + (regs.lcnt + 1);
-                constexpr auto f_baudActual = f_clockSpeed / period;
-                constexpr auto err
-                  = f_baudActual > f_baud ? f_baudActual - f_baud : f_baud - f_baudActual;
-                constexpr auto maxErr = (f_baud * Num) / Denom;
-                return err <= maxErr;
+            /// The SCL rate the counts give, rise and fall times left out: a period of
+            /// (HCNT + SPKLEN + 7) + (LCNT + 1) ic_clk cycles (RP2350 datasheet 12.2.14.1,
+            /// Figure 90; RP2040 datasheet 4.3.14.1, Figure 86).
+            static constexpr Prescaler::Rational achievedRate(std::uint32_t   f_clockSpeed,
+                                                              BaudRegs const& regs) {
+                return {f_clockSpeed, std::uint64_t{regs.hcnt} + regs.spklen + 7U + regs.lcnt + 1U};
             }
 
             /// Fast mode for every rate: standard mode (<= 100 kHz) is buggy on this block,
@@ -203,10 +197,10 @@ namespace Kvasir { namespace I2C {
                 if(regs.lcnt > 0xFFFF || regs.lcnt <= regs.spklen + 7) {
                     i2cDeviceClockGivesAnInvalidLcnt();
                 }
-                auto const period = (regs.hcnt + regs.spklen + 7) + (regs.lcnt + 1);
-                auto const actual = f_clockSpeed / period;
-                auto const err    = actual > f_baud ? actual - f_baud : f_baud - actual;
-                if(err > (f_baud * Num) / Denom) { i2cDeviceClockErrorAboveMaxBaudRateError(); }
+                // out of tolerance: the note "in call to 'rateOutOfTolerance(...)'" has the numbers
+                Prescaler::requireInTolerance(achievedRate(f_clockSpeed, regs),
+                                              f_baud,
+                                              Prescaler::Tolerance{std::ratio<Num, Denom>{}});
                 return ClockTiming{.hcnt      = static_cast<std::uint16_t>(regs.hcnt),
                                    .lcnt      = static_cast<std::uint16_t>(regs.lcnt),
                                    .sdaHold   = static_cast<std::uint16_t>(regs.sda_hold),
@@ -220,8 +214,6 @@ namespace Kvasir { namespace I2C {
             static void i2cDeviceClockGivesAnInvalidHcnt() {}
 
             static void i2cDeviceClockGivesAnInvalidLcnt() {}
-
-            static void i2cDeviceClockErrorAboveMaxBaudRateError() {}
 
             /// The transfer timeout's time per byte: 9 bits, 4 times over.
             static constexpr std::uint32_t usPerDataByte(std::uint32_t f_baud) {
@@ -327,6 +319,16 @@ namespace Kvasir { namespace I2C {
                     }
                 }();
 
+                /// Count the requests accepted for the wire (I2CQueued's transfers()). Off,
+                /// neither the counter nor its increment is in the image.
+                static constexpr bool countTransfers = [] {
+                    if constexpr(requires { I2CConfig_::countTransfers; }) {
+                        return static_cast<bool>(I2CConfig_::countTransfers);
+                    } else {
+                        return false;
+                    }
+                }();
+
                 /// The slowest rate a device on this bus runs at: what the idle watchdog of
                 /// LineRecovery scales its threshold with. Only perDeviceClock makes it differ.
                 static constexpr std::uint32_t minBaudRate = [] {
@@ -400,10 +402,20 @@ namespace Kvasir { namespace I2C {
             static_assert(Config::template isValidHcnt<I2CConfig::clockSpeed,
                                                        I2CConfig::baudRate>(),
                           "I2C HCNT invalid: must fit in 16 bits and be > SPKLEN+5");
-            static_assert(
-              Config::template isValidBaudConfig<I2CConfig::clockSpeed,
-                                                 I2CConfig::baudRate>(I2CConfig::maxBaudRateError),
-              "I2C baud rate error too large — adjust clockSpeed, baudRate, or maxBaudRateError");
+            // the achieved SCL against maxBaudRateError; a failure prints wanted, got and ppm
+            static constexpr bool BaudInTolerance = [] {
+                Prescaler::assertInTolerance<Config::achievedRate(
+                                               I2CConfig::clockSpeed,
+                                               Config::calcBaudRegs(I2CConfig::clockSpeed,
+                                                                    I2CConfig::baudRate)),
+                                             I2CConfig::baudRate,
+                                             Prescaler::Tolerance{I2CConfig::maxBaudRateError},
+                                             "I2C SCL">();
+                return true;
+            }();
+            // a static data member of a class template is initialised only when used: this use
+            // is what runs the check
+            static_assert(BaudInTolerance);
             static_assert(I2CConfig::minBaudRate <= I2CConfig::baudRate
                             && (I2CConfig::perDeviceClock
                                 || I2CConfig::minBaudRate == I2CConfig::baudRate),

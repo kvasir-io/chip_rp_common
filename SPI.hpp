@@ -6,10 +6,13 @@
 #include "PinConfig.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Io/Types.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 #include "peripherals/SPI.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <ranges>
 #include <span>
 
 namespace Kvasir { namespace SPI {
@@ -182,61 +185,48 @@ namespace Kvasir { namespace SPI {
                 using config = decltype(config_);
             };
 
-            static constexpr double calcf_Baud(std::uint32_t f_clockSpeed,
-                                               std::uint32_t scr,
-                                               std::uint32_t cpsdvsr) {
-                return (double(f_clockSpeed) / (double(cpsdvsr) * (1.0 + double(scr))));
+            // SCK = SSPCLK / (CPSDVSR x (1 + SCR)), CPSDVSR even 2..254, SCR 0..255 (PL022 TRM
+            // DDI0194H 3.3.1, Table 3-6). One index over the grid, CPSDVSR outer: the closest rate
+            // not above the request (a peripheral's maximum is never overshot), else the closest.
+            static constexpr std::pair<std::uint32_t,
+                                       std::uint32_t>
+            decodeDivider(std::uint32_t i) {
+                return {i % 256, 2 * (i / 256 + 1)};   // {scr, cpsdvsr}
+            }
+
+            // Per CPSDVSR only the two SCRs around the ideal divisor can win (the rate falls with
+            // SCR), so the search sees 2 x 127 candidates instead of 32 512, in the same order:
+            // the result is the full grid's (util_prescaler_tests compares the two).
+            static constexpr auto baudDivider(std::uint32_t f_clockSpeed,
+                                              std::uint32_t f_baud) {
+                auto const candidates
+                  = std::views::iota(0U, 127U * 2U) | std::views::transform([=](std::uint32_t i) {
+                        std::uint64_t const cps  = 2 * (i / 2 + 1);
+                        std::uint64_t const den  = cps * f_baud;
+                        std::uint64_t const q    = f_clockSpeed / den;   // 1 + SCR, floor
+                        std::uint64_t const ceil = q + (f_clockSpeed % den != 0 ? 1 : 0);
+                        std::uint64_t const n    = i % 2 == 0 ? q : ceil;
+                        auto const          scr
+                          = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(n, 1, 256) - 1);
+                        return (i / 2) * 256 + scr;
+                    });
+                return Prescaler::search(
+                  f_clockSpeed,
+                  f_baud,
+                  candidates,
+                  [](std::uint32_t i) {
+                      auto const [scr, cps] = decodeDivider(i);
+                      return Prescaler::Rational{1, std::uint64_t{cps} * (1 + scr)};
+                  },
+                  Prescaler::Pick::notAbove);
             }
 
             static constexpr std::pair<std::uint8_t,
                                        std::uint8_t>
             calcBaudRegs(std::uint32_t f_clockSpeed,
                          std::uint32_t f_baud) {
-                std::pair<std::uint8_t, std::uint8_t> ret{};
-                std::pair<std::uint8_t, std::uint8_t> retClosest{};
-                double bestUnder = std::numeric_limits<double>::max();
-                double bestAbs   = std::numeric_limits<double>::max();
-                bool   haveUnder = false;
-
-                for(std::uint32_t cpsdvsr = 2; cpsdvsr < 255; cpsdvsr += 2) {
-                    for(std::uint32_t scr = 0; scr < 256; ++scr) {
-                        double f_div     = f_baud - calcf_Baud(f_clockSpeed, scr, cpsdvsr);
-                        double abs_f_div = f_div > 0.0 ? f_div : -f_div;
-
-                        if(bestAbs > abs_f_div) {
-                            bestAbs           = abs_f_div;
-                            retClosest.first  = static_cast<std::uint8_t>(scr);
-                            retClosest.second = static_cast<std::uint8_t>(cpsdvsr);
-                        }
-
-                        // Prefer configurations whose rate does not exceed the requested baud,
-                        // so the configured clock never overshoots a peripheral's maximum.
-                        if(f_div >= 0.0 && bestUnder > f_div) {
-                            haveUnder  = true;
-                            bestUnder  = f_div;
-                            ret.first  = static_cast<std::uint8_t>(scr);
-                            ret.second = static_cast<std::uint8_t>(cpsdvsr);
-                            if(f_div == 0.0) { return ret; }
-                        }
-                    }
-                }
-                return haveUnder ? ret : retClosest;
-            }
-
-            template<std::uint32_t f_clockSpeed,
-                     std::uint32_t f_baud,
-                     std::intmax_t Num,
-                     std::intmax_t Denom>
-            static constexpr bool isValidBaudConfig(std::ratio<Num,
-                                                               Denom>) {
-                constexpr auto baudRegs     = calcBaudRegs(f_clockSpeed, f_baud);
-                constexpr auto scr          = std::get<0>(baudRegs);
-                constexpr auto cpsdvsr      = std::get<1>(baudRegs);
-                constexpr auto f_baudCalced = calcf_Baud(f_clockSpeed, scr, cpsdvsr);
-                constexpr auto err          = f_baudCalced - double(f_baud);
-                constexpr auto absErr       = err > 0.0 ? err : -err;
-                constexpr auto ret = absErr <= (double(f_baud) * (double(Num) / (double(Denom))));
-                return (cpsdvsr >= 2) && (cpsdvsr % 2 == 0) && ret;
+                auto const [scr, cps] = decodeDivider(baudDivider(f_clockSpeed, f_baud).setting);
+                return {static_cast<std::uint8_t>(scr), static_cast<std::uint8_t>(cps)};
             }
 
             template<std::uint32_t f_clockSpeed,
@@ -361,10 +351,18 @@ namespace Kvasir { namespace SPI {
         static constexpr auto RxDmaTrigger = Traits::SPI::DmaRX_Trigger<Instance>();
         static constexpr auto TxDmaTrigger = Traits::SPI::DmaTX_Trigger<Instance>();
 
-        static_assert(
-          (Config::template isValidBaudConfig<SPIConfig::clockSpeed,
-                                              SPIConfig::baudRate>(SPIConfig::maxBaudRateError)),
-          "invalid baud configuration baudRate error too big");
+        // the achieved SCK against maxBaudRateError; a failure prints wanted, got and ppm
+        static constexpr bool BaudInTolerance = [] {
+            Prescaler::assertInTolerance<
+              Config::baudDivider(SPIConfig::clockSpeed, SPIConfig::baudRate).achieved,
+              SPIConfig::baudRate,
+              Prescaler::Tolerance{SPIConfig::maxBaudRateError},
+              "SPI SCK">();
+            return true;
+        }();
+        // a static data member of a class template is initialised only when used: this use is
+        // what runs the check
+        static_assert(BaudInTolerance);
         static_assert(Config::isValidPinLocationMISO(SPIConfig::misoPinLocation),
                       "invalid MISOPin");
         static_assert(Config::isValidPinLocationMOSI(SPIConfig::mosiPinLocation),

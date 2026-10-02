@@ -1,0 +1,16 @@
+; PIO v1 wait and irq forms: jmppin, prev/next, rel (11.4.3, 11.4.11)
+.pio_version 1
+.program v1_wait_irq
+    wait 1 jmppin
+    wait 0 jmppin + 3
+    wait 1 irq prev 2
+    wait 0 irq next, 5
+    wait 1 irq 3 rel
+    irq prev set 1
+    irq next wait 2
+    irq clear 3 rel
+    irq nowait 4
+    irq 5 rel
+    irq prev clear 7
+    mov pindirs, x
+    mov pindirs, ~null

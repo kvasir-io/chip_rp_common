@@ -1,5 +1,6 @@
 #pragma once
 #include "Clocks.hpp"
+#include "PllSearch.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/CLOCKS.hpp"
 
@@ -36,88 +37,6 @@ namespace Kvasir { namespace DefaultClockSettings {
     using Provides = Clocks::DefaultProvides<ClockSpeed, CrystalSpeed>;
 
     namespace detail {
-        struct PllSettings {
-            std::uint32_t fbdiv;
-            std::uint32_t pd1;
-            std::uint32_t pd2;
-            std::uint32_t refdiv;
-        };
-
-        //Use a lower VCO frequency when possible. This reduces power consumption, at the cost of increased jitter"
-        template<bool LowVco = false>
-        static constexpr PllSettings calcPllSettings(double clockSpeed,
-                                                     double crystalSpeed) {
-            // RP2350 PLL constraints from datasheet
-            constexpr double vco_max = 1'600'000'000;
-            constexpr double vco_min = 750'000'000;
-            constexpr double ref_min = 5'000'000;
-
-            constexpr std::uint32_t fbdiv_max   = 320;
-            constexpr std::uint32_t fbdiv_min   = 16;
-            constexpr std::uint32_t refdiv_min  = 1;
-            constexpr std::uint32_t refdiv_max  = 63;
-            constexpr std::uint32_t postdiv_max = 7;
-            constexpr std::uint32_t postdiv_min = 1;
-
-            // Calculate REFDIV range based on minimum reference frequency constraint
-            auto refdiv_range_max = static_cast<std::uint32_t>(crystalSpeed / ref_min);
-            refdiv_range_max      = std::min(refdiv_range_max, refdiv_max);
-            refdiv_range_max      = std::max(refdiv_range_max, refdiv_min);
-
-            PllSettings bestSettings{.fbdiv = 0, .pd1 = 0, .pd2 = 0, .refdiv = 0};
-            double      bestMargin = clockSpeed;
-            double      bestVco    = 0.0;
-
-            // Search algorithm matching RP2350 vcocalc.py
-            for(std::uint32_t refdiv = refdiv_min; refdiv <= refdiv_range_max; ++refdiv) {
-                double const refFreq = crystalSpeed / refdiv;
-                if(refFreq < ref_min) {
-                    continue;   // Skip if reference frequency too low
-                }
-
-                for(std::uint32_t fbdiv = fbdiv_min; fbdiv <= fbdiv_max; ++fbdiv) {
-                    double const vco = refFreq * fbdiv;
-                    if(vco < vco_min || vco > vco_max) { continue; }
-
-                    // pd1 is inner loop to prefer higher pd1:pd2 ratios for lower power
-                    for(std::uint32_t pd2 = postdiv_min; pd2 <= postdiv_max; ++pd2) {
-                        for(std::uint32_t pd1 = postdiv_min; pd1 <= postdiv_max; ++pd1) {
-                            // Check for integer frequency ratios (from vcocalc.py line 50)
-                            if(static_cast<std::uint64_t>(vco * 1000)
-                                 % static_cast<std::uint64_t>(pd1 * pd2)
-                               != 0)
-                            {
-                                continue;
-                            }
-
-                            double const out = vco / pd1 / pd2;
-                            double const margin
-                              = out > clockSpeed ? out - clockSpeed : clockSpeed - out;
-
-                            // VCO preference logic from vcocalc.py line 49
-                            bool const vcoIsBetter = LowVco ? (vco < bestVco) : (vco > bestVco);
-
-                            // Accept if better margin, or same margin with preferred VCO
-                            constexpr double tolerance   = 1e-9;
-                            bool const       marginEqual = (margin - bestMargin) < tolerance
-                                                        && (margin - bestMargin) > -tolerance;
-
-                            if(margin < bestMargin || (marginEqual && vcoIsBetter)) {
-                                bestSettings = PllSettings{.fbdiv  = fbdiv,
-                                                           .pd1    = pd1,
-                                                           .pd2    = pd2,
-                                                           .refdiv = refdiv};
-                                bestMargin   = margin;
-                                bestVco      = vco;
-                            }
-                        }
-                    }
-                }
-            }
-
-            return bestSettings;
-        }
-
         namespace impl {
             template<auto CrystalSpeed,
                      typename Reg>
@@ -191,7 +110,10 @@ namespace Kvasir { namespace DefaultClockSettings {
             // so the wait is a counted loop: 12 000 turns of a 1-cycle-ish loop is at
             // least 1 ms at any ROSC speed, and only a few ms at the slowest.
             std::uint32_t turns = 12'000;
+            // gcc assembles Thumb-1 inline asm in divided syntax, where `subs` with three operands
+            // does not exist; clang is always unified. The directive emits nothing.
             asm volatile(
+              ".syntax unified\n"
               "1:\n"
               "subs %0, %0, #1\n"
               "bne 1b\n"
@@ -314,15 +236,19 @@ namespace Kvasir { namespace DefaultClockSettings {
         static constexpr auto pllSettings     = detail::calcPllSettings(ClockSpeed, CrystalSpeed);
         static constexpr auto usb_pllSettings = detail::calcPllSettings(48'000'000, CrystalSpeed);
 
-        static_assert(ClockSpeed
-                        == (CrystalSpeed / pllSettings.refdiv) * pllSettings.fbdiv
-                             / (pllSettings.pd1 * pllSettings.pd2),
-                      "bad clock config");
-
-        static_assert(48'000'000
-                        == (CrystalSpeed / usb_pllSettings.refdiv) * usb_pllSettings.fbdiv
-                             / (usb_pllSettings.pd1 * usb_pllSettings.pd2),
-                      "bad clock config");
+        static_assert(pllSettings.refdiv != 0,
+                      "no PLL setting for ClockSpeed: none comes nearer than ClockSpeed itself "
+                      "(the PLL gives 750 MHz / 49 at the least, see detail::calcPllSettings)");
+        static_assert(usb_pllSettings.refdiv != 0, "no USB PLL setting for 48 MHz");
+        // exactly, or the message says by how much it is missed
+        Prescaler::assertInTolerance<detail::pllOutput(CrystalSpeed, pllSettings),
+                                     ClockSpeed,
+                                     Prescaler::Tolerance{0, 1},
+                                     "clk_sys PLL">();
+        Prescaler::assertInTolerance<detail::pllOutput(CrystalSpeed, usb_pllSettings),
+                                     48'000'000,
+                                     Prescaler::Tolerance{0, 1},
+                                     "clk_usb PLL">();
 
         using PERI_CLOCK    = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_PERI_CTRL;
         using SYS_CLOCK     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_CTRL;

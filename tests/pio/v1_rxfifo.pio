@@ -1,0 +1,19 @@
+; PIO v1 (RP2350) FIFO random access: 11.4.8 / 11.4.9. The corpus has none of these.
+.pio_version 1
+
+.program put_get
+.fifo putget
+    mov rxfifo[y], isr
+    mov rxfifo[0], isr
+    mov rxfifo[3], isr
+    mov osr, rxfifo[y]
+    mov osr, rxfifo[2]
+
+.program put_only
+.fifo txput
+    mov rxfifo[1], isr
+    pull
+
+.program get_only
+.fifo txget
+    mov osr, rxfifo[y]

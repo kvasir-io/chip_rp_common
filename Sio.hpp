@@ -2,6 +2,7 @@
 #include "chip/Interrupt.hpp"
 #include "core/core.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/StartUp/SharedIsr.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -197,41 +198,42 @@ struct FifoIsrOn {
 template<void (*F)(), int Priority = 3, typename I = Kvasir::Interrupt>
 using FifoIsr = FifoIsrOn<0, F, Priority, I>;
 
-// F receives the mask of bells (bit N for Doorbell<N>) that were pending, restricted to
-// Bells...; those are cleared before F runs, so a ring that lands during F sets the bit
-// again and the line, which stays asserted while any bell is pending, fires once more.
-// Priority is the NVIC priority (0 highest); it comes before the bells because a pack has
-// to be last: DoorbellIsr<&onRing, 3, 0, 1> is priority 3, bells 0 and 1.
 namespace detail {
     // Makes a lookup depend on a template's own parameters (a struct, not an alias: an alias
     // is substituted at once and the lookup would be checked at definition), so a chip
-    // without doorbells (the RP2040) only errors when a DoorbellIsr is instantiated.
+    // without doorbells (the RP2040) only errors when a DoorbellIrq is instantiated.
     template<typename T, auto...>
     struct Dependent {
         using type = T;
     };
 }   // namespace detail
 
-template<void (*F)(std::uint32_t), int Priority, unsigned... Bells>
-struct DoorbellIsr {
-    using Irq
-      = std::decay_t<decltype(detail::Dependent<Kvasir::Interrupt, Bells...>::type::sio_bell)>;
+// One bell as a sub-interrupt of sio_bell (kvasir/StartUp/SharedIsr.hpp): any number of these,
+// from any drivers, share the vector, and Startup generates its ISR - one read of
+// DOORBELL_IN_SET, then per pending bell: clear it, call its F. A ring that lands during F sets
+// the bell again and the line fires once more. R as in Doorbell: only an instantiation fails on a chip without doorbells.
+template<unsigned N, void (*F)(), int Priority = 3, typename R = Regs>
+struct DoorbellIrq {
+    static_assert(N < 8,
+                  "eight doorbells, 0..7");
 
-    static constexpr std::uint32_t mask = ((1U << Bells) | ...);
+    using Irq = std::decay_t<decltype(detail::Dependent<Kvasir::Interrupt, N>::type::sio_bell)>;
 
-    static constexpr auto initStepInterruptConfig
-      = list(Nvic::makeSetPriority<Priority>(Irq{}), Nvic::makeClearPending(Irq{}));
-    static constexpr auto initStepPeripheryEnable = list(Nvic::makeEnable(Irq{}));
+    static constexpr std::uint32_t bit = 1U << N;
 
-    static void onIsr() {
-        using R = typename detail::Dependent<Regs, Bells...>::type;
-        auto const pending
-          = get<0>(apply(Register::read(R::DOORBELL_IN_SET::doorbell_in_set))) & mask;
-        apply(Register::write(R::DOORBELL_IN_CLR::doorbell_in_clr, pending));
-        F(pending);
-    }
+    // this core's inbox, and its write-one-to-clear twin
+    static constexpr Register::
+      FieldLocation<typename R::DOORBELL_IN_SET::Addr, bit, Register::ReadOnlyAccess, std::uint32_t>
+        status{};
+    static constexpr Register::FieldLocation<typename R::DOORBELL_IN_CLR::Addr,
+                                             bit,
+                                             Register::ROneToClearAccess,
+                                             std::uint32_t>
+      clear{};
 
-    static constexpr Nvic::Isr<std::addressof(onIsr), Irq> isr{};
+    using SubIsrs = brigand::list<
+      Nvic::
+        SubIsr<Irq, F, Nvic::Status<status>, Nvic::ClearFirst<clear>, Nvic::NoEnable, Priority>>;
 };
 
 }   // namespace Kvasir::Sio

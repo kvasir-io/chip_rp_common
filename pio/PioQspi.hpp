@@ -2,10 +2,10 @@
 
 #include "chip/rp_common/Io.hpp"
 #include "chip/rp_common/PIO.hpp"
-#include "displayPio/PioQspi.hpp"
+#include "chip/rp_common/PioStateMachine.hpp"
+#include "chip/rp_common/pio/PioQspiProgram.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "peripherals/PIO.hpp"
-#include "peripherals/RESETS.hpp"
 
 #include <cassert>
 #include <chip/rp_common/Clocks.hpp>
@@ -19,8 +19,8 @@ namespace Kvasir { namespace Display {
 
     /// QSPI transport for a DCS panel controller (CO5300, ST77916, ST77922) on one RP2350 PIO
     /// state machine plus one DMA channel; the PL022 is single-lane only. The panel driver is
-    /// kvasir_devices' Display::DcsPanel. The firmware generates `displayPio/PioQspi.hpp`:
-    /// pioasm_generate(displayPio INPUT_FILE ${CHIP_ROOT}/src/chip/rp_common/pio/PioQspi.pio).
+    /// kvasir_devices' Display::DcsPanel. The PIO program is QspiPanelProgram
+    /// (PioQspiProgram.hpp), built by the compiler: no build step.
     ///
     /// Framing: an instruction byte, a 24 bit address {00h, CMD, 00h}, then parameters
     /// single-lane (02h) or pixels on four lanes (32h). Reads differ per chip, so
@@ -47,10 +47,6 @@ namespace Kvasir { namespace Display {
              typename Dma::Priority DmaPriority,
              typename Config_>
     struct PioQspi {
-        using Claims
-          = brigand::append<Kvasir::DMA::Claims<Dma, DmaChannel>,
-                            Kvasir::Clocks::Claim<Kvasir::Clocks::ClkSys, Config_::clockSpeed>>;
-
         struct Config : Config_ {
             static constexpr auto baudRate = [] {
                 if constexpr(requires { Config_::baudRate; }) {
@@ -93,7 +89,7 @@ namespace Kvasir { namespace Display {
             }();
         };
 
-        using Programm = Kvasir::Pio::qspiPanelProgramm;
+        using Programm = QspiPanelProgram;
 
         /// What the bus runs at; DcsPanel checks it against the chip's ceilings.
         static constexpr auto WriteHz = Config::baudRate;
@@ -106,12 +102,6 @@ namespace Kvasir { namespace Display {
                       "the RP2350 has PIO0..PIO2");
         static_assert(SmInstance < 4,
                       "invalid state machine index");
-
-        using PioRegs = Kvasir::Peripheral::PIO::Registers<PioInstance>;
-        using SmRegs  = typename PioRegs::template SM<SmInstance>;
-        using Fifo    = typename PioRegs::template FIFO<SmInstance>;
-
-        static constexpr std::uint32_t SmMask = 1U << SmInstance;
 
         static constexpr auto pinNumber(auto pin) {
             return []<int Port, int PinN>(Kvasir::Register::PinLocation<Port, PinN>) {
@@ -140,169 +130,108 @@ namespace Kvasir { namespace Display {
         static_assert(ReadDiv >= 1.0 && ReadDiv < 256.0,
                       "readBaudRate unreachable from clockSpeed with an 8 bit PIO divider");
 
-        static_assert(Programm::Instructions.size() <= 32,
-                      "PIO instruction memory is 32 words");
-
         // jmp targets are absolute: the program only runs at offset 0.
         static constexpr unsigned ProgrammOffset = 0;
 
+        template<auto Location>
+        using PinOf = std::remove_cvref_t<decltype(Location)>;
+
+        // The state machine: StateMachine (PioStateMachine.hpp) loads the program, maps the
+        // pins, gives SCK and the lanes the PIO function with this bus's pad drive and slew,
+        // makes them outputs, sets the write clock, and checks it all against the program's
+        // .side_set. It stays stopped after Startup: every transfer starts it at an entry point.
+        // The pin groups stay the same in every phase; SET covers all four lanes so the read
+        // entry's `set pindirs` can release them, and `in pins, 1` samples D0.
+        struct SmConfig {
+            static constexpr auto     ClockSpeed    = Config::clockSpeed;
+            static constexpr auto     PioInstance   = Config::pioInstance;
+            static constexpr auto     SmInstance    = Config::smInstance;
+            static constexpr unsigned ProgramOffset = ProgrammOffset;
+            static constexpr double   clockDiv      = WriteDiv;
+            static constexpr auto     sidesetPins = brigand::list<PinOf<Config::sclkPinLocation>>{};
+            using Lanes                           = brigand::list<PinOf<Config::d0PinLocation>,
+                                                                  PinOf<Config::d1PinLocation>,
+                                                                  PinOf<Config::d2PinLocation>,
+                                                                  PinOf<Config::d3PinLocation>>;
+            static constexpr auto outPins         = Lanes{};
+            static constexpr auto setPins         = Lanes{};
+            static constexpr auto inPins          = brigand::list<PinOf<Config::d0PinLocation>>{};
+            static constexpr auto driveStrength   = Config::driveStrength;
+            static constexpr bool slewFast        = Config::slewFast;
+            static constexpr bool startEnabled    = false;
+        };
+
+        using Sm = Kvasir::Pio::StateMachine<Programm, SmConfig>;
+
         /// A second program at offset 0 of this PIO is a build error.
-        using Provides = Kvasir::Pio::Provides<PioInstance, SmInstance, ProgrammOffset, Programm>;
+        using Provides = typename Sm::Provides;
+        using Claims   = brigand::append<Kvasir::DMA::Claims<Dma, DmaChannel>, typename Sm::Claims>;
 
         enum class State : std::uint8_t { idle, payload, drain, failed };
 
-        static constexpr int PioFunction = Kvasir::Pio::pinFunction<PioInstance>;
+        static constexpr auto powerClockEnable = Sm::powerClockEnable;
 
-        using LanePinConfig = Kvasir::Io::Action::
-          PinFunctionDrive<PioFunction, Config::driveStrength, Config::slewFast>;
-
-        static constexpr auto powerClockEnable = list(Kvasir::Pio::getEnable<PioInstance>());
-
+        // the chip select is a plain GPIO, driven here
         static constexpr auto initStepPinConfig
-          = list(action(LanePinConfig{}, Config::sclkPinLocation),
-                 action(LanePinConfig{}, Config::d0PinLocation),
-                 action(LanePinConfig{}, Config::d1PinLocation),
-                 action(LanePinConfig{}, Config::d2PinLocation),
-                 action(LanePinConfig{}, Config::d3PinLocation),
-                 makeOutputInitHigh(Config::csPinLocation));
+          = brigand::append<std::remove_cvref_t<decltype(Sm::initStepPinConfig)>,
+                            decltype(list(makeOutputInitHigh(Config::csPinLocation)))>{};
 
-        // The pin groups stay the same in every phase. SET covers all four lanes so the read
-        // program's `set pindirs` can release them.
-        static constexpr auto PinCtrlConfig = SmRegs::PINCTRL::overrideDefaults(
-          write(SmRegs::PINCTRL::sideset_count, Kvasir::Register::value<1>()),
-          write(SmRegs::PINCTRL::sideset_base, Kvasir::Register::value<SclkPin>()),
-          write(SmRegs::PINCTRL::out_base, Kvasir::Register::value<D0Pin>()),
-          write(SmRegs::PINCTRL::out_count, Kvasir::Register::value<4>()),
-          write(SmRegs::PINCTRL::set_base, Kvasir::Register::value<D0Pin>()),
-          write(SmRegs::PINCTRL::set_count, Kvasir::Register::value<4>()),
-          write(SmRegs::PINCTRL::in_base, Kvasir::Register::value<D0Pin>()));
+        static constexpr auto initStepPeripheryConfig = Sm::initStepPeripheryConfig;
+        static constexpr auto initStepPeripheryEnable = Sm::initStepPeripheryEnable;
 
-        static constexpr auto initStepPeripheryConfig
-          = list(PinCtrlConfig,
+        static void runtimeInit() { Sm::runtimeInit(); }
 
-                 // Every entry point loops by jmp; the wrap spans all of instruction memory.
-                 SmRegs::EXECCTRL::overrideDefaults(
-                   write(SmRegs::EXECCTRL::wrap_bottom, Kvasir::Register::value<0>()),
-                   write(SmRegs::EXECCTRL::wrap_top, Kvasir::Register::value<31>()),
-                   clear(SmRegs::EXECCTRL::side_en),
-                   clear(SmRegs::EXECCTRL::side_pindir)));
-
-        /// The reset release is asynchronous: no PIO access before RESET_DONE (the CYW43
-        /// transport failed intermittently without this wait).
-        static bool resetDone() {
-            using Resets = Kvasir::Peripheral::RESETS::Registers<>;
-            if constexpr(PioInstance == 0) {
-                return get<0>(apply(read(Resets::RESET_DONE::pio0))) != 0;
-            } else {
-                return get<0>(apply(read(Resets::RESET_DONE::pio1))) != 0;
-            }
-        }
-
-        static void preEnableRuntimeInit() {
-            while(!resetDone()) {}
-
-            for(std::uint32_t volatile* addr = reinterpret_cast<std::uint32_t volatile*>(
-                  PioRegs::template INSTR_MEM<ProgrammOffset>::Addr::value);
-                auto const v : Programm::Instructions)
-            {
-                *addr = v;
-                ++addr;
-            }
-
-            setEnabled(false);
-
-            // Side-set writes values, not directions: SCK's output enable has to be set
-            // through the SET group once, or the clock stays an input and the panel is dead.
-            apply(SmRegs::PINCTRL::overrideDefaults(
-              write(SmRegs::PINCTRL::set_base, Kvasir::Register::value<SclkPin>()),
-              write(SmRegs::PINCTRL::set_count, Kvasir::Register::value<1>())));
-            forceInstruction(SetPinDirsOneOutput);
-
-            apply(PinCtrlConfig);
-            forceInstruction(SetPinDirsAllOutputs);
-
-            setDivider(WriteDiv);
-        }
+        static void preEnableRuntimeInit() { Sm::preEnableRuntimeInit(); }
 
     private:
         static inline State                      state_{State::idle};
         static inline typename Clock::time_point deadline_{};
         static inline std::uint16_t              fillWord_{};
 
-        // `set pindirs, 0b1111 side 0`: SET 0xE000, destination 4 = pindirs in [7:5], data [4:0].
-        static constexpr std::uint32_t SetPinDirsAllOutputs = 0xE000U | (4U << 5U) | 0x0FU;
-        static constexpr std::uint32_t SetPinDirsOneOutput  = 0xE000U | (4U << 5U) | 0x01U;
+        using SmRegs = typename Sm::SmRegs;
+        using Fifo   = typename Sm::Fifo;
 
-        static void setEnabled(bool on) {
-            // Read-modify-write: CTRL.SM_ENABLE holds the other state machines' bits too.
-            auto const cur = get<0>(apply(read(PioRegs::CTRL::sm_enable)));
-            apply(write(PioRegs::CTRL::sm_enable, on ? (cur | SmMask) : (cur & ~SmMask)));
-        }
+        // `set pindirs, 0b1111`: the four lanes outputs again after a read (SET 0xE000,
+        // destination 4 = pindirs in [7:5], data [4:0])
+        static constexpr std::uint16_t SetPinDirsAllOutputs = 0xE000U | (4U << 5U) | 0x0FU;
 
-        static void forceInstruction(std::uint32_t instr) {
-            apply(write(SmRegs::INSTR::instr, instr));
-        }
+        static void setEnabled(bool on) { Sm::setEnabled(on); }
 
-        static void setDivider(double div) {
-            auto const d = Kvasir::Pio::getDiv(div);
-            apply(write(SmRegs::CLKDIV::_int, static_cast<std::uint32_t>(std::get<0>(d))),
-                  write(SmRegs::CLKDIV::frac, static_cast<std::uint32_t>(std::get<1>(d))));
-        }
+        static void clearTxStall() { Sm::clearTxStall(); }
 
-        static void clearTxStall() { apply(write(PioRegs::FDEBUG::txstall, SmMask)); }
+        static bool txStalled() { return Sm::txStalled(); }
 
-        static bool txStalled() {
-            return (get<0>(apply(read(PioRegs::FDEBUG::txstall))) & SmMask) != 0;
-        }
+        static bool txFull() { return Sm::txFull(); }
 
-        static bool txFull() { return (get<0>(apply(read(PioRegs::FSTAT::txfull))) & SmMask) != 0; }
+        static bool rxEmpty() { return Sm::rxEmpty(); }
 
-        static bool rxEmpty() {
-            return (get<0>(apply(read(PioRegs::FSTAT::rxempty))) & SmMask) != 0;
-        }
-
-        /// Toggling FJOIN_RX flushes both FIFOs.
-        static void clearFifos() {
-            apply(write(SmRegs::SHIFTCTRL::fjoin_rx, 1U));
-            apply(write(SmRegs::SHIFTCTRL::fjoin_rx, 0U));
-        }
-
-        /// Write-phase shift setup: PullThresh 8 for bytes, 16 for the fill pattern.
+        // The write phases: TX FIFO joined (eight entries), autopull, shift left - MSB first,
+        // on four lanes high nibble first with D3 as its MSB; PullThresh 8 for bytes, 16 for the
+        // fill pattern.
         template<unsigned PullThresh>
         static void configureWriteShift() {
             static_assert(PullThresh == 8 || PullThresh == 16,
                           "only the byte-wise payload and the two-byte fill pattern exist");
-            apply(SmRegs::SHIFTCTRL::overrideDefaults(
-              // TX FIFO joined: eight entries.
-              write(SmRegs::SHIFTCTRL::fjoin_tx, Kvasir::Register::value<1>()),
-              write(SmRegs::SHIFTCTRL::fjoin_rx, Kvasir::Register::value<0>()),
-              // Shift left: MSB first, on four lanes high nibble first with D3 as its MSB.
-              write(SmRegs::SHIFTCTRL::out_shiftdir, Kvasir::Register::value<0>()),
-              write(SmRegs::SHIFTCTRL::autopull, Kvasir::Register::value<1>()),
-              write(SmRegs::SHIFTCTRL::autopush, Kvasir::Register::value<0>()),
-              write(SmRegs::SHIFTCTRL::push_thresh, Kvasir::Register::value<0>()),
-              write(SmRegs::SHIFTCTRL::pull_thresh, Kvasir::Register::value<PullThresh>())));
+            Sm::template setShift<Kvasir::Pio::Shift{.autopull      = true,
+                                                     .pullThreshold = PullThresh,
+                                                     .outShiftRight = false,
+                                                     .joinTx        = true}>();
         }
 
+        // The read phase: no join (the bit count arrives through the TX FIFO), autopull off (the
+        // read entry `pull`s its bit count itself), autopush every 8 bits, shift left.
         static void configureReadShift() {
-            apply(SmRegs::SHIFTCTRL::overrideDefaults(
-              // No join: the bit count arrives through the TX FIFO.
-              write(SmRegs::SHIFTCTRL::fjoin_rx, Kvasir::Register::value<0>()),
-              write(SmRegs::SHIFTCTRL::fjoin_tx, Kvasir::Register::value<0>()),
-              // Autopull off: the read entry `pull`s its bit count itself.
-              write(SmRegs::SHIFTCTRL::autopull, Kvasir::Register::value<0>()),
-              write(SmRegs::SHIFTCTRL::in_shiftdir, Kvasir::Register::value<0>()),
-              write(SmRegs::SHIFTCTRL::autopush, Kvasir::Register::value<1>()),
-              write(SmRegs::SHIFTCTRL::push_thresh, Kvasir::Register::value<8>())));
+            Sm::template setShift<
+              Kvasir::Pio::Shift{.autopush = true, .pushThreshold = 8, .inShiftRight = false}>();
         }
+
+        static void clearFifos() { Sm::clearFifos(); }
 
         /// Point the stopped state machine at an entry point. SM_RESTART leaves the PC alone,
         /// hence the forced jmp after it.
         static void enterPhase(unsigned entry) {
             setEnabled(false);
-            apply(write(PioRegs::CTRL::sm_restart, SmMask),
-                  write(PioRegs::CTRL::clkdiv_restart, SmMask));
-            forceInstruction(entry + ProgrammOffset);
+            Sm::restartAt(entry);
         }
 
         static void pushByte(std::uint8_t b) {
@@ -325,7 +254,7 @@ namespace Kvasir { namespace Display {
                                std::span<std::byte const> params) {
             assert(params.size() <= 4);
 
-            enterPhase(Programm::offset_single);
+            enterPhase(Programm::offset("single"));
             clearFifos();
             configureWriteShift<8>();
 
@@ -358,10 +287,10 @@ namespace Kvasir { namespace Display {
             // lands in OSR[31:24]: no alignment or byte swapping (as ws2812.hpp does).
             Dma::template start<DmaChannel,
                                 DmaPriority,
-                                Kvasir::Pio::getTxDmaTrigger<Dma, PioInstance, SmInstance>(),
+                                Sm::template txDmaTrigger<Dma>(),
                                 Size,
                                 false,
-                                IncrementSource>(Fifo::TXF::Addr::value, source, count);
+                                IncrementSource>(Sm::txFifoAddress, source, count);
         }
 
     public:
@@ -414,7 +343,7 @@ namespace Kvasir { namespace Display {
                 return;
             }
 
-            enterPhase(Programm::offset_quad);
+            enterPhase(Programm::offset("quad"));
             configureWriteShift<8>();
             startPayloadDma<Dma::TransferSize::_8, true>(
               reinterpret_cast<std::uint32_t>(data.data()),
@@ -443,7 +372,7 @@ namespace Kvasir { namespace Display {
                 return;
             }
 
-            enterPhase(Programm::offset_quad);
+            enterPhase(Programm::offset("quad"));
             configureWriteShift<16>();
             startPayloadDma<Dma::TransferSize::_16, false>(
               reinterpret_cast<std::uint32_t>(&fillWord_),
@@ -463,15 +392,15 @@ namespace Kvasir { namespace Display {
             assert(idle());
             assert(!out.empty());
 
-            setDivider(ReadDiv);
+            Sm::template setClockDiv<ReadDiv>();
             csAssert();
 
             auto const restore = [] {
                 setEnabled(false);
                 // The read left the lanes as inputs.
-                forceInstruction(SetPinDirsAllOutputs);
+                Sm::exec(SetPinDirsAllOutputs);
                 csRelease();
-                setDivider(WriteDiv);
+                Sm::template setClockDiv<WriteDiv>();
             };
 
             // CO5300 datasheet 5.2.3.
@@ -481,7 +410,7 @@ namespace Kvasir { namespace Display {
                 return false;
             }
 
-            enterPhase(Programm::offset_read);
+            enterPhase(Programm::offset("read"));
             clearFifos();
             configureReadShift();
             auto const total = out.size() + dummyBytes;

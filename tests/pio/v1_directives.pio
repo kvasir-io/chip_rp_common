@@ -1,0 +1,27 @@
+; the directives that only fill header fields: .fifo, .mov_status, .in, .out, .set, .clock_div
+.program dirs_a
+.pio_version 1
+.fifo txput
+.mov_status irq next set 3
+.in 5 left manual 12
+.out 3 right manual
+.set 4
+.clock_div 3
+    in pins, 5
+    out pins, 3
+
+.program dirs_b
+.pio_version rp2350
+.fifo rx
+.mov_status rxfifo < 4
+.in 32 right
+.out 32 left auto 24
+    push iffull noblock
+    out exec, 16
+
+.program dirs_c
+.pio_version rp2040
+.mov_status txfifo < 2
+.fifo tx
+.set 0
+    pull ifempty

@@ -7,16 +7,12 @@
 #include "kvasir/Atomic/Atomic.hpp"
 #include "kvasir/Devices/Quantities.hpp"
 #include "kvasir/Devices/SPI/QueueCore.hpp"
+#include "kvasir/StartUp/Hooks.hpp"
 
 #include <cstdint>
 #include <string_view>
 
 namespace Kvasir { namespace SPI {
-
-    namespace Detail {
-        /// Not constexpr: reaching it in setup() is the compile error that says why.
-        inline void deviceClockBelowWhatThePl022CanDivideTo() {}
-    }   // namespace Detail
 
     /// DMA channel A sends, B receives; the completion of B ends a transfer.
     template<typename Dma,
@@ -68,23 +64,23 @@ namespace Kvasir { namespace SPI {
                                       static_cast<std::uint32_t>(SPIConfig::baudRate));
 
             std::uint32_t const clk = SPIConfig::clockSpeed;
-            std::uint32_t       div = (clk + max - 1U) / max;
-            if(div < 2U) { div = 2U; }
-            if(div > 254U * 256U) { Detail::deviceClockBelowWhatThePl022CanDivideTo(); }
-            for(std::uint32_t cps = 2; cps <= 254; cps += 2) {
-                std::uint32_t const scr1 = (div + cps - 1U) / cps;
-                if(scr1 >= 1U && scr1 <= 256U) {
-                    auto const m = static_cast<std::uint8_t>(mode);
-                    return Setup{.scr         = static_cast<std::uint8_t>(scr1 - 1U),
-                                 .cpsdvsr     = static_cast<std::uint8_t>(cps),
-                                 .spo         = static_cast<std::uint8_t>((m >> 1U) & 1U),
-                                 .sph         = static_cast<std::uint8_t>(m & 1U),
-                                 .hz          = clk / (cps * scr1),
-                                 .usPerBitQ10 = Kvasir::SPI::usPerBitQ10(clk / (cps * scr1))};
-                }
+            if(std::uint64_t{max} * 254U * 256U < clk) {
+                // the note "in call to 'rateOutOfReach(wanted Hz, slowest mHz, fastest mHz)'"
+                Prescaler::rateOutOfReach(max,
+                                          std::uint64_t{clk} * 1000U / (254U * 256U),
+                                          std::uint64_t{clk} * 1000U / 2U);
+                return Setup{};
             }
-            Detail::deviceClockBelowWhatThePl022CanDivideTo();
-            return Setup{};
+            // SPI.hpp's search: the closest clock not above max, the smallest CPSDVSR on a tie
+            auto const [scr, cps]
+              = base::Config::decodeDivider(base::Config::baudDivider(clk, max).setting);
+            auto const m = static_cast<std::uint8_t>(mode);
+            return Setup{.scr         = static_cast<std::uint8_t>(scr),
+                         .cpsdvsr     = static_cast<std::uint8_t>(cps),
+                         .spo         = static_cast<std::uint8_t>((m >> 1U) & 1U),
+                         .sph         = static_cast<std::uint8_t>(m & 1U),
+                         .hz          = clk / (cps * (scr + 1U)),
+                         .usPerBitQ10 = Kvasir::SPI::usPerBitQ10(clk / (cps * (scr + 1U)))};
         }
 
         struct Snapshot {
@@ -285,6 +281,10 @@ namespace Kvasir { namespace SPI {
         static void releaseHold(Lines const& l) { Core::releaseHold(l); }
 
         static void handler() { Core::handler(); }
+
+        // once per main-loop turn: Startup::run<Kvasir::Hook::MainLoop>() calls it (StartUp/Hooks.hpp);
+        // a firmware that runs the hook must not also call handler() by hand
+        using Extends = Kvasir::Startup::Extend<Kvasir::Hook::MainLoop, &handler>;
 
         static void reset() { Core::reset(); }
     };

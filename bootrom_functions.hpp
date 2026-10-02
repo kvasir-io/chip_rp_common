@@ -1,10 +1,14 @@
 #pragma once
 #include "peripherals/PSM.hpp"
 #include "peripherals/WATCHDOG.hpp"
+#if __has_include("peripherals/TICKS.hpp")   // the RP2350: SYSCFG.AUXCTRL for watchdogReboot()
+    #include "peripherals/SYSCFG.hpp"
+#endif
 
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <kvasir/Util/AnnouncedReset.hpp>
 #include <kvasir/Util/StaticString.hpp>
 #include <kvasir/Util/attributes.hpp>
 #include <string_view>
@@ -796,6 +800,14 @@ namespace detail {
               set(PSM::WDSEL::rosc),
               set(PSM::WDSEL::otp),
               clear(PSM::WDSEL::proc_cold));
+        // SYSCFG.AUXCTRL bit 0 before a watchdog reset of a stage that includes CLOCKS while POWMAN
+        // runs from clk_ref, its default (RP2350 datasheet Table 1317, POWMAN SEQ_CFG Table 491) -
+        // as the boot ROM's reboot() and Watchdog::trigger() do; WDSEL above includes CLOCKS.
+        {
+            using AuxCtrl    = Kvasir::Peripheral::SYSCFG::Registers<>::AUXCTRL;
+            auto const value = get<0>(apply(read(AuxCtrl::auxctrl)));
+            apply(write(AuxCtrl::auxctrl, value | 1U));
+        }
 #else
         apply(set(PSM::WDSEL::proc1),
               set(PSM::WDSEL::proc0),
@@ -880,7 +892,12 @@ namespace Bootrom {
         }
     }
 
+    // Both reboots announce themselves first (Kvasir_SDK Util/AnnouncedReset.hpp): a J-Link that
+    // touches the chip while it resets makes SEGGER's DLL "recover" the RP2040 through the Rescue
+    // DP, and the boot ROM then parks the core instead of booting. With a log printer attached
+    // this waits until the printer is off the chip (or ~0.5 s); without one it returns at once.
     [[noreturn]] inline void resetToUsbBoot() {
+        (void)AnnouncedReset::announce();
         if constexpr(PinConfig::CurrentChip == Kvasir::PinConfig::ChipVariant::RP2040) {
             using romResetToUsbBoot
               = void (*)(std::uint32_t gpioActivityPinMask, std::uint32_t disableInterfaceMask);
@@ -912,9 +929,11 @@ namespace Bootrom {
     // The RP2350 goes through the bootrom's reboot() (datasheet 5.4.8.24), the pico-sdk's and
     // picotool's path: it switches POWMAN off clk_ref before the clock generators reset (a
     // clk_pow glitch otherwise) and keeps the boot diagnostics. NO_RETURN_ON_SUCCESS parks this
-    // core in the ROM until the watchdog fires, 1 ms later. The raw watchdog is the RP2040's
-    // path and the fallback should the ROM call refuse.
+    // core in the ROM until the watchdog fires, 1 ms later. It writes p0/p1 (0, 0) into watchdog
+    // SCRATCH2/3 (5.4.8.24, md l.20618): keep nothing there across it.
+    // The raw watchdog is the RP2040's path and the fallback should the ROM call refuse.
     [[noreturn]] inline void reboot() {
+        (void)AnnouncedReset::announce();
         if constexpr(PinConfig::CurrentChip != Kvasir::PinConfig::ChipVariant::RP2040) {
             static constexpr std::uint32_t NO_RETURN_ON_SUCCESS = 0x0100;
             static constexpr std::uint32_t REBOOT_TYPE_NORMAL   = 0x0000;

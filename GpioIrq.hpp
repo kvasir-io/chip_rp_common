@@ -5,36 +5,28 @@
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/StartUp/Resources.hpp"
+#include "kvasir/StartUp/SharedIsr.hpp"
 
 #include <cstdint>
 #include <peripherals/IO_BANK0.hpp>
 #include <tuple>
 #include <type_traits>
 
-// GPIO edge interrupts through IO_BANK0. One instance watches a set of pins in one group of
-// eight (one INTR/INTE/INTS register triple) for the configured edges and calls F(pending)
-// with the INTR bits that fired, restricted to the configured ones; the bits are cleared
-// before F runs, so an edge during F fires the line again. Edges only: the level bits are
+// GPIO edge interrupts through IO_BANK0, one Startup entry per pin (GpioPinEdges / GpioPinIrq,
+// below): each declares its edges as sub-interrupts of the io_bank0 vector, and Startup generates
+// the one ISR all of them share (kvasir/StartUp/SharedIsr.hpp). Edges only: the level bits are
 // read-only mirrors of the pad, so an ISR could not acknowledge them.
 //
-// The enable register and the NVIC line are per core, so an instance belongs to one core:
-// GpioIrq<F, E, Pins...> is core 0's, GpioIrqOn<1, F, E, Pins...> goes in a SecondaryCore's
-// list, and `startupCore` lets Startup refuse the wrong list (the interrupt would be enabled
-// in one core's mask and the other core's NVIC). Clearing INTR is a write of ones to our
-// own bits, so it is safe from either core after launch.
+// The enable register and the NVIC line are per core, so an entry belongs to one core: the plain
+// names are core 0's, the ...On<1, ...> forms go in a SecondaryCore's list, and `startupCore` lets
+// Startup refuse the wrong list. Clearing INTR is a write of ones to the edge's own bit, so it is
+// safe from either core.
 //
 // The pad (input, pull) is configured in the application's pin configuration like every
 // other pin; the pins are claimed, so a missing one is a build error.
 namespace Kvasir::Io {
 
 enum class Edge : std::uint8_t { falling = 1, rising = 2, both = 3 };
-
-// The resource a GpioIrq owns: one group of eight on one core (kvasir/StartUp/Resources.hpp).
-struct GpioIrqGroupTag {
-    static constexpr unsigned    keyArity = 2;
-    static constexpr char const* message
-      = "one GpioIrq per group of eight pins per core: list every pin of the group in it";
-};
 
 namespace detail {
     template<typename T>
@@ -132,87 +124,81 @@ namespace detail {
     };
 }   // namespace detail
 
-template<unsigned Core_, void (*F)(std::uint32_t pending), Edge E, typename... Pins>
-struct GpioIrqOn {
-    static_assert(sizeof...(Pins) > 0,
-                  "GpioIrq needs at least one pin");
+// One pin's edges as sub-interrupts of io_bank0 (kvasir/StartUp/SharedIsr.hpp): any number of
+// these, from any drivers, share the vector, and Startup generates its ISR - one read of each
+// INTS register, then per pending edge: clear its INTR bit, call its handler. Each edge is a child
+// of its own, so clearing one never drops the other's pending bit; when both are pending, the
+// falling edge's handler runs first. A handler of nullptr leaves that edge off. The enable bits
+// of a group's INTE are set in one write at init. The pad is configured in the pin
+// configuration, as for every input; the pin is claimed.
+template<unsigned Core_, void (*OnFalling)(), void (*OnRising)(), typename Pin, int Priority = 3>
+struct GpioPinEdgesOn {
     static_assert(Core_ < 2,
                   "two cores");
+    static_assert(OnFalling != nullptr || OnRising != nullptr,
+                  "a GPIO edge interrupt with neither edge");
 
-    static constexpr unsigned Core = Core_;
-
-    // Startup: this belongs in core `Core`'s list, and uses pins it does not configure.
     static constexpr unsigned startupCore = Core_;
-    using Claims                          = Io::PinClaims<Pins...>;
+    using Claims                          = Io::PinClaims<Pin>;
 
     using Irq = std::decay_t<decltype(Kvasir::Interrupt::io_bank0)>;
 
-    static constexpr unsigned Group = [] {
-        constexpr unsigned groups[] = {(detail::GpioNumber<Pins>::value / 8U)...};
-        return groups[0];
-    }();
-    static_assert((((detail::GpioNumber<Pins>::value / 8U) == Group) && ...),
-                  "all pins of one GpioIrq must share a group of eight (one register triple)");
+    static constexpr unsigned Gpio = detail::GpioNumber<Pin>::value;
+    using Regs                     = detail::IoBankIrqRegs<Gpio / 8U, Core_>;
 
-    // Startup: one instance per (core, group) - two on one group would each install the
-    // io_bank0 vector and mask each other's INTE bits. Keyed by both ids.
-    using Provides = brigand::list<Startup::Resource<GpioIrqGroupTag, Core_, Group>>;
+    template<unsigned Kind, void (*F)()>
+    struct EdgeIrq {
+        static constexpr std::uint32_t mask = detail::irqBit(Gpio, Kind);
 
-    static constexpr bool WantFalling
-      = (static_cast<std::uint8_t>(E) & static_cast<std::uint8_t>(Edge::falling)) != 0;
-    static constexpr bool WantRising
-      = (static_cast<std::uint8_t>(E) & static_cast<std::uint8_t>(Edge::rising)) != 0;
+        // this core's masked status, the shared raw status (edges write-one-to-clear), this
+        // core's enable: the pin's bit in each
+        static constexpr Register::
+          FieldLocation<typename Regs::Ints::Addr, mask, Register::ReadOnlyAccess, std::uint32_t>
+            status{};
+        static constexpr Register::
+          FieldLocation<typename Regs::Intr::Addr, mask, Register::ROneToClearAccess, std::uint32_t>
+            clear{};
+        static constexpr Register::
+          FieldLocation<typename Regs::Inte::Addr, mask, Register::ReadWriteAccess, std::uint32_t>
+            enable{};
 
-    // The bits F sees: which pin, and which way it went.
-    static constexpr std::uint32_t fallingMask
-      = WantFalling ? (detail::irqBit(detail::GpioNumber<Pins>::value, detail::EdgeLow) | ...) : 0U;
-    static constexpr std::uint32_t risingMask
-      = WantRising ? (detail::irqBit(detail::GpioNumber<Pins>::value, detail::EdgeHigh) | ...) : 0U;
-    static constexpr std::uint32_t mask = fallingMask | risingMask;
+        using Sub = Nvic::SubIsr<Irq,
+                                 F,
+                                 Nvic::Status<status>,
+                                 Nvic::ClearFirst<clear>,
+                                 Nvic::Enable<enable>,
+                                 Priority>;
+    };
 
-    template<typename Pin>
-    static constexpr std::uint32_t fallingBit
-      = WantFalling ? detail::irqBit(detail::GpioNumber<Pin>::value, detail::EdgeLow) : 0U;
-    template<typename Pin>
-    static constexpr std::uint32_t risingBit
-      = WantRising ? detail::irqBit(detail::GpioNumber<Pin>::value, detail::EdgeHigh) : 0U;
+    using Falling = EdgeIrq<detail::EdgeLow, OnFalling>;
+    using Rising  = EdgeIrq<detail::EdgeHigh, OnRising>;
 
-    using Regs = detail::IoBankIrqRegs<Group, Core>;
-    using Intr = typename Regs::Intr;
-    using Inte = typename Regs::Inte;
-    using Ints = typename Regs::Ints;
+    using SubIsrs = brigand::append<
+      std::
+        conditional_t<OnFalling != nullptr, brigand::list<typename Falling::Sub>, brigand::list<>>,
+      std::
+        conditional_t<OnRising != nullptr, brigand::list<typename Rising::Sub>, brigand::list<>>>;
 
-    // Our bits of the enable register as one field: a literal write of `mask` into a field
-    // whose mask is `mask` is a read-modify-write that sets exactly those bits and leaves
-    // the rest of the register alone (Register::set would do the same, but only for one bit).
-    using EnableField = Register::
-      FieldLocation<typename Inte::Addr, mask, Register::ReadWriteAccess, std::uint32_t>;
-    static constexpr auto enable
-      = Register::Action<EnableField, Register::WriteLiteralAction<mask>>{};
-
-    // A literal full-register write of our bits to INTR is a plain store: zeros are ignored
-    // by the hardware, so it clears exactly the edges we own -- stale ones from before boot,
-    // or from before the pad was configured.
-    static constexpr auto clearPending
-      = Register::write(Intr::FULLREGISTER, Register::value<std::uint32_t, mask>());
-
-    static constexpr auto initStepPeripheryConfig = list(clearPending, enable);
-
-    static constexpr auto initStepInterruptConfig
-      = list(Nvic::makeSetPriority<3>(Irq{}), Nvic::makeClearPending(Irq{}));
-    static constexpr auto initStepPeripheryEnable = list(Nvic::makeEnable(Irq{}));
-
-    static void onIsr() {
-        auto const pending = get<0>(apply(Register::read(Ints::FULLREGISTER))) & mask;
-        apply(Register::write(Intr::FULLREGISTER, pending));
-        F(pending);
-    }
-
-    static constexpr Nvic::Isr<std::addressof(onIsr), Irq> isr{};
+    // stale edges from before boot or before the pad was configured: a plain store of ones
+    static constexpr std::uint32_t edgeBits
+      = (OnFalling != nullptr ? Falling::mask : 0U) | (OnRising != nullptr ? Rising::mask : 0U);
+    static constexpr auto initStepPeripheryConfig
+      = list(Register::write(Regs::Intr::FULLREGISTER, Register::value<std::uint32_t, edgeBits>()));
 };
 
-// The boot core's, which is what a single-core chip and most instances want.
-template<void (*F)(std::uint32_t pending), Edge E, typename... Pins>
-using GpioIrq = GpioIrqOn<0, F, E, Pins...>;
+template<void (*OnFalling)(), void (*OnRising)(), typename Pin, int Priority = 3>
+using GpioPinEdges = GpioPinEdgesOn<0, OnFalling, OnRising, Pin, Priority>;
+
+// One handler for the edges E names.
+template<unsigned Core_, void (*F)(), Edge E, typename Pin, int Priority = 3>
+using GpioPinIrqOn = GpioPinEdgesOn<
+  Core_,
+  ((static_cast<std::uint8_t>(E) & static_cast<std::uint8_t>(Edge::falling)) != 0 ? F : nullptr),
+  ((static_cast<std::uint8_t>(E) & static_cast<std::uint8_t>(Edge::rising)) != 0 ? F : nullptr),
+  Pin,
+  Priority>;
+
+template<void (*F)(), Edge E, typename Pin, int Priority = 3>
+using GpioPinIrq = GpioPinIrqOn<0, F, E, Pin, Priority>;
 
 }   // namespace Kvasir::Io

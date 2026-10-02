@@ -1,0 +1,29 @@
+/* a block comment
+   over two lines */ .program first
+// comments of every kind
+    jmp pin 0 ; trailing
+.wrap_target
+loop:   out pins, 1   [1]
+    jmp !x loop
+.wrap
+% c-sdk {
+static inline void never_compiled(void) { %% }
+%}
+.program SECOND
+.origin 0
+PUBLIC entry:
+    PULL BLOCK
+    OUT X, 8
+    SET PINDIRS, 0x1F [0b11]
+    JMP X-- entry
+    MOV EXEC, OSR
+    OUT PC, 5
+    OUT NULL, 32
+    IN NULL, 31
+    IN ISR, 1
+    IN OSR, 2
+    MOV PC, STATUS
+    IRQ WAIT 7
+    IRQ CLEAR 0 REL
+    WAIT ONE GPIO 0
+    WAIT ZERO IRQ 4

@@ -184,12 +184,20 @@ namespace Kvasir { namespace Io {
         }
     }
 
+    // GPIOn_CTRL's OUTOVER / OEOVER for a pin a peripheral drives: the peripheral's signal as
+    // it is, or inverted (pico-sdk gpio_set_outover / gpio_set_oeover with
+    // GPIO_OVERRIDE_INVERT: a clock with the other idle level, an open-drain line driven
+    // through its output enable).
+    enum class PinOverride { normal, invert };
+
     namespace Action {
         template<int               Function,
                  DriveStrength     DS,
                  bool              SlewFast = false,
                  PullConfiguration PC       = PullConfiguration::PullNone,
-                 OutputInit        OI       = OutputInit::Low>
+                 OutputInit        OI       = OutputInit::Low,
+                 PinOverride       OutOver  = PinOverride::normal,
+                 PinOverride       OeOver   = PinOverride::normal>
         struct PinFunctionDrive {
             static constexpr int value = Function;
         };
@@ -252,10 +260,12 @@ namespace Kvasir { namespace Io {
              bool              SlewFast,
              Io::OutputInit    OI,
              PullConfiguration PC,
+             PinOverride       OutOver,
+             PinOverride       OeOver,
              int               Port,
              int               Pin,
              int               Function>
-    struct MakeAction<Action::PinFunctionDrive<Function, DS, SlewFast, PC, OI>,
+    struct MakeAction<Action::PinFunctionDrive<Function, DS, SlewFast, PC, OI, OutOver, OeOver>,
                       Register::PinLocation<Port, Pin>>
       : decltype(MPL::list(
           set(detail::Pad<Pin>::ie),
@@ -271,8 +281,20 @@ namespace Kvasir { namespace Io {
           set(detail::Pad<Pin>::schmitt),
           write(detail::Ctrl<Pin>::IRQOVERValC::normal),
           write(detail::Ctrl<Pin>::INOVERValC::normal),
-          write(detail::Ctrl<Pin>::OEOVERValC::normal),
-          write(detail::Ctrl<Pin>::OUTOVERValC::normal),
+          []() {
+              if constexpr(OeOver == PinOverride::invert) {
+                  return write(detail::Ctrl<Pin>::OEOVERValC::invert);
+              } else {
+                  return write(detail::Ctrl<Pin>::OEOVERValC::normal);
+              }
+          }(),
+          []() {
+              if constexpr(OutOver == PinOverride::invert) {
+                  return write(detail::Ctrl<Pin>::OUTOVERValC::invert);
+              } else {
+                  return write(detail::Ctrl<Pin>::OUTOVERValC::normal);
+              }
+          }(),
           write(detail::Ctrl<Pin>::funcsel,
                 Register::value<typename detail::Ctrl<Pin>::FUNCSELVal,
                                 static_cast<typename detail::Ctrl<Pin>::FUNCSELVal>(Function)>()),

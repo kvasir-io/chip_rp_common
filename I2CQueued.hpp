@@ -3,10 +3,13 @@
 #include "I2CBusRecovery.hpp"
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Register/Apply.hpp"
+#include "kvasir/StartUp/Hooks.hpp"
 #include "kvasir/Util/RateLimiter.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 
 #include <algorithm>
+#include <array>
+#include <concepts>
 #include <cstddef>
 #include <limits>
 #include <span>
@@ -19,11 +22,39 @@ namespace Kvasir { namespace I2C {
 
     template<std::size_t CallbackSize>
     struct I2CRequest {
-        std::uint8_t                                         address{};
+        static constexpr std::size_t MaxPrefix = 2;
+
+        std::uint8_t address{};
+        /// Sent ahead of sendData in the same write, with no START or STOP between them: a
+        /// register address, an EEPROM memory address, a display's control byte. Up to two
+        /// bytes, kept in the padding behind `address`, so the request stays the size it was
+        /// (a gather list would need storage that outlives the queued request, for the one or
+        /// two bytes every user has).
+        std::uint8_t                                         prefixBytes{};
+        std::array<std::byte, MaxPrefix>                     prefix{};
         std::span<std::byte const>                           sendData{};
         std::span<std::byte>                                 receiveData{};
         StaticFunction<void(I2CRequestResult), CallbackSize> callback{};
+
+        template<std::integral... B>
+            requires(sizeof...(B) <= MaxPrefix)
+        constexpr void setPrefix(B... b) {
+            prefix      = {std::byte{static_cast<std::uint8_t>(b)}...};
+            prefixBytes = sizeof...(B);
+        }
+
+        /// Everything that goes out after the address, prefix first.
+        [[nodiscard]] constexpr std::size_t sendBytes() const {
+            return prefixBytes + sendData.size();
+        }
+
+        [[nodiscard]] constexpr std::byte sendByte(std::size_t i) const {
+            return i < prefixBytes ? prefix[i] : sendData[i - prefixBytes];
+        }
     };
+
+    static_assert(sizeof(void*) != 4 || sizeof(I2CRequest<16>) == 40,
+                  "the prefix must stay in the padding behind address");
 
     /// The request of a bus with I2CConfig::perDeviceClock: the device's SCL counts ride along.
     /// A type of its own, not a parameter of I2CRequest, so that a bus without the feature
@@ -60,6 +91,8 @@ namespace Kvasir { namespace I2C {
         /// timing member and startNext() never looks at the SCL counts: nothing of this
         /// is in the image.
         static constexpr bool PerDeviceClock = base::I2CConfig::perDeviceClock;
+        /// Count the requests accepted for the wire (I2CConfig::countTransfers, transfers()).
+        static constexpr bool CountTransfers = base::I2CConfig::countTransfers;
         using ClockTiming                    = typename base::Config::ClockTiming;
         /// The timing of baudRate itself, what a request without one of its own carries.
         static constexpr ClockTiming DefaultTiming = [] {
@@ -152,6 +185,8 @@ namespace Kvasir { namespace I2C {
             requestQueue_.push(req);
 
             apply(makeDisable(typename base::InterruptIndexs{}));
+            // inside the masked window: submit() also runs from completion callbacks in the ISR
+            if constexpr(CountTransfers) { ++transfers_; }
             tryStart_(Clock::now());
             // From a callback reset() or requestRecovery() runs, the interrupt stays masked:
             // they unmask it when they are done.
@@ -262,6 +297,11 @@ namespace Kvasir { namespace I2C {
             }
         }
 
+        // once per main-loop turn: Startup::run<Kvasir::Hook::MainLoop>() calls it (StartUp/Hooks.hpp);
+        // a firmware that runs the hook must not also call handler() by hand
+        using Extends
+          = Kvasir::Startup::Extend<Kvasir::Hook::MainLoop, &I2CBehaviorQueued::handler>;
+
         // Request a full bus recovery sequence non-blocking.
         // Safe to call at any time. Any active transaction is immediately failed.
         static void requestRecovery() {
@@ -318,6 +358,16 @@ namespace Kvasir { namespace I2C {
 
         /// Transactions the handler gave up on after calcTransferTimeout().
         static std::uint32_t timeouts() { return timeouts_; }
+
+        /// Requests accepted for the wire since boot: what tells "nothing talks on this bus"
+        /// from "nothing went wrong on it" (I2CConfig::countTransfers only, 0 without it).
+        static std::uint32_t transfers() {
+            if constexpr(CountTransfers) {
+                return transfers_;
+            } else {
+                return 0;
+            }
+        }
 
         /// Aborts after which SDA read low the moment the master went idle. Each one defers
         /// the next start; whether the line is really held is the idle watchdog's to decide,
@@ -408,6 +458,7 @@ namespace Kvasir { namespace I2C {
         inline static std::uint32_t longestIsrGapUs_{};
 
         inline static std::uint32_t   timeouts_{};
+        inline static std::uint32_t   transfers_{};   // countTransfers only: never used without it
         inline static std::uint32_t   sdaLowAfterAbort_{};
         inline static std::uint32_t   drainedRequests_{};
         inline static std::uint32_t   disableWaitsExhausted_{};
@@ -429,7 +480,7 @@ namespace Kvasir { namespace I2C {
               .txLevel      = get<0>(apply(read(Regs::IC_TXFLR::FULLREGISTER))),
               .rxLevel      = get<0>(apply(read(Regs::IC_RXFLR::FULLREGISTER))),
               .sent         = static_cast<std::uint16_t>(sendIndex_),
-              .toSend       = static_cast<std::uint16_t>(currentRequest_.sendData.size()),
+              .toSend       = static_cast<std::uint16_t>(currentRequest_.sendBytes()),
               .received     = static_cast<std::uint16_t>(receivedCount_),
               .toReceive    = static_cast<std::uint16_t>(currentRequest_.receiveData.size()),
               .address      = currentRequest_.address,
@@ -536,9 +587,12 @@ namespace Kvasir { namespace I2C {
             sendIndex_      = 0;
             receivedCount_  = 0;
             isrEntries_     = 0;
+            // Every start goes through here -- submit(), handler(), and the ISR chaining the
+            // next request after a success -- and each one is the bus seen free.
+            Recovery::noteBusFree();
 
             auto const totalBytes
-              = currentRequest_.sendData.size() + currentRequest_.receiveData.size();
+              = currentRequest_.sendBytes() + currentRequest_.receiveData.size();
             requestStart_ = Clock::now();
             if constexpr(PerDeviceClock) {
                 timeoutTime_
@@ -564,7 +618,7 @@ namespace Kvasir { namespace I2C {
             apply(write(Regs::IC_TAR::ic_tar, currentRequest_.address));
             apply(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled)));
 
-            bool const hasSend = !currentRequest_.sendData.empty();
+            bool const hasSend = currentRequest_.sendBytes() != 0;
             bool const hasRecv = !currentRequest_.receiveData.empty();
 
             if(hasSend) {
@@ -713,13 +767,17 @@ namespace Kvasir { namespace I2C {
                     return;
                 }
 
-                if(sendIndex_ < currentRequest_.sendData.size()) {
+                // The prefix and sendData go into the FIFO in one pass: without STOP on a byte
+                // the master goes on with the next FIFO entry, or holds SCL low until there is
+                // one (RP2350 data sheet 12.2.7.1, IC_DATA_CMD.STOP in Table 1059).
+                auto const total = currentRequest_.sendBytes();
+                if(sendIndex_ < total) {
                     // As many bytes as the FIFO has room for: TX_EMPTY comes back once they
                     // are all out, where it used to come back for each one.
                     auto room = FifoDepth - get<0>(apply(read(Regs::IC_TXFLR::txflr)));
-                    while(room != 0 && sendIndex_ < currentRequest_.sendData.size()) {
-                        auto const byte = currentRequest_.sendData[sendIndex_++];
-                        if(sendIndex_ == currentRequest_.sendData.size() && stop) {
+                    while(room != 0 && sendIndex_ < total) {
+                        auto const byte = currentRequest_.sendByte(sendIndex_++);
+                        if(sendIndex_ == total && stop) {
                             Regs::IC_DATA_CMD::overrideDefaultsRuntime(
                               write(Regs::IC_DATA_CMD::STOPValC::enable),
                               write(Regs::IC_DATA_CMD::dat, static_cast<std::uint8_t>(byte)));

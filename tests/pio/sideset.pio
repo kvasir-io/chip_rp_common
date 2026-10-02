@@ -1,0 +1,30 @@
+; every side-set shape: count, opt, pindirs, and the delay bits they leave (11.4.1)
+.program ss1
+.side_set 1
+    nop side 1 [15]
+    nop side 0
+
+.program ss2opt
+.side_set 2 opt
+    nop side 3 [3]
+    nop [1]
+    jmp 0 side 2
+
+.program ss3optpindirs
+.side_set 3 opt pindirs
+    nop side 7 [1]
+    set pins, 1
+
+.program ss5
+.side_set 5
+    nop side 31
+    nop side 0
+
+.program ss0
+.side_set 0
+    nop side 0 [31]
+
+.program ss4opt
+.side_set 4 opt
+    nop side 15
+    nop

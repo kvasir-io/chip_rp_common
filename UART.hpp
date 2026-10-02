@@ -6,6 +6,7 @@
 #include "core/Nvic.hpp"
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Io/Types.hpp"
+#include "kvasir/Util/Prescaler.hpp"
 #include "kvasir/Util/RateLimiter.hpp"
 
 #include <array>
@@ -50,49 +51,25 @@ namespace Kvasir { namespace UART {
 
         // Use chip-agnostic pin configuration
 
-        static constexpr double calcf_Baud(std::uint32_t f_clockSpeed,
-                                           std::uint32_t divint,
-                                           std::uint32_t divfrac) {
-            return (double(f_clockSpeed) / (16.0 * (double(divint) + double(divfrac) / 64.0)));
+        // The PL011 divisor UARTCLK / (16 x baud) as a 16-bit integer and a 6-bit fraction
+        // (RP2350 data sheet 12.1.3.2.1, UARTIBRD/UARTFBRD Tables 1033/1034). One integer in
+        // 1/64 steps, so a fraction that rounds to 64/64 carries into the integer part.
+        static constexpr Prescaler::Fixed Pl011Divider{.intMin   = 1,
+                                                       .intMax   = 65535,
+                                                       .fracBits = 6,
+                                                       .scale    = 16};
+
+        static constexpr auto baudDivider(std::uint32_t f_clockSpeed,
+                                          std::uint32_t f_baud) {
+            return Prescaler::fromFixedPoint(f_clockSpeed, f_baud, Pl011Divider);
         }
 
         static constexpr std::pair<std::uint16_t,
                                    std::uint8_t>
         calcBaudRegs(std::uint32_t f_clockSpeed,
                      std::uint32_t f_baud) {
-            std::pair<std::uint16_t, std::uint8_t> ret{};
-            double                                 best = std::numeric_limits<double>::max();
-
-            std::uint32_t divint = f_clockSpeed / (16 * f_baud);
-            ret.first            = static_cast<std::uint16_t>(divint);
-
-            for(std::uint32_t divfrac = 0; divfrac < 65; ++divfrac) {
-                double f_div     = f_baud - calcf_Baud(f_clockSpeed, divint, divfrac);
-                double abs_f_div = f_div > 0.0 ? f_div : -f_div;
-                if(best > abs_f_div) {
-                    best       = abs_f_div;
-                    ret.second = static_cast<std::uint8_t>(divfrac);
-                    if(abs_f_div == 0.0) { return ret; }
-                }
-            }
-            return ret;
-        }
-
-        template<std::uint32_t f_clockSpeed,
-                 std::uint32_t f_baud,
-                 std::intmax_t Num,
-                 std::intmax_t Denom>
-        static constexpr bool isValidBaudConfig(std::ratio<Num,
-                                                           Denom>) {
-            constexpr auto baudRegs = calcBaudRegs(f_clockSpeed, f_baud);
-            constexpr auto divint   = std::get<0>(baudRegs);
-            static_assert(divint != 0, "baudrate too heigh");
-            constexpr auto divfrac      = std::get<1>(baudRegs);
-            constexpr auto f_baudCalced = calcf_Baud(f_clockSpeed, divint, divfrac);
-            constexpr auto err          = f_baudCalced - double(f_baud);
-            constexpr auto absErr       = err > 0.0 ? err : -err;
-            constexpr auto ret = absErr <= (double(f_baud) * (double(Num) / (double(Denom))));
-            return ret;
+            auto const d = baudDivider(f_clockSpeed, f_baud).setting;
+            return {static_cast<std::uint16_t>(d.integer), static_cast<std::uint8_t>(d.fraction)};
         }
 
         template<unsigned Instance>
@@ -455,9 +432,18 @@ namespace Kvasir { namespace UART {
         static constexpr std::uint32_t TxDmaTarget = Regs::UARTDR::Addr::value;
         static constexpr std::uint32_t RxDmaSource = Regs::UARTDR::Addr::value;
 
-        static_assert(Detail::isValidBaudConfig<UartConfig::clockSpeed,
-                                                UartConfig::baudRate>(UartConfig::maxBaudRateError),
-                      "invalid baud configuration baudRate error too big");
+        // the achieved baud rate against maxBaudRateError; a failure prints wanted, got and ppm
+        static constexpr bool BaudInTolerance = [] {
+            Prescaler::assertInTolerance<
+              Detail::baudDivider(UartConfig::clockSpeed, UartConfig::baudRate).achieved,
+              UartConfig::baudRate,
+              Prescaler::Tolerance{UartConfig::maxBaudRateError},
+              "UART baud rate">();
+            return true;
+        }();
+        // a static data member of a class template is initialised only when used: this use is
+        // what runs the check
+        static_assert(BaudInTolerance);
         static_assert(Config::isValidPinLocationTX(UartConfig::txPinLocation),
                       "invalid TXPin");
         static_assert(Config::isValidPinLocationRX(UartConfig::rxPinLocation),

@@ -1,7 +1,7 @@
 #pragma once
 #include "chip/rp_common/DMA.hpp"
 #include "chip/rp_common/PioStateMachine.hpp"
-#include "i2sPio/i2s.hpp"
+#include "chip/rp_common/pio/I2sOutProgram.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 
 #include <array>
@@ -10,7 +10,6 @@
 #include <type_traits>
 
 namespace Kvasir { namespace Pio {
-
     /// Which side of the serial port makes the clocks.
     enum class I2sRole : std::uint8_t {
         /// This chip drives BCLK and LRCK, as a plain I2S DAC wants.
@@ -32,6 +31,9 @@ namespace Kvasir { namespace Pio {
     ///                           mode only the buffer maths uses it.
     ///   Role         (default master)
     ///   BufferFrames (default 512) frames in each of the two buffers (21 ms at 48 kHz).
+    ///   Statistics   (default true) count the buffers sent and the underruns (frames(),
+    ///                           underrunCount()); false: no counters in RAM, no counting in
+    ///                           the DMA interrupt
     ///   ProgramOffset, GpioBase   as PioStateMachine.hpp
     ///
     /// `BclkPin` and `LrckPin` must be consecutive GPIOs, LRCK the higher: master mode side-sets
@@ -136,9 +138,7 @@ namespace Kvasir { namespace Pio {
             static constexpr bool joinTx = true;
         };
 
-        using Program = std::conditional_t<IsMaster,
-                                           Kvasir::Pio::i2s_out_masterProgramm,
-                                           Kvasir::Pio::i2s_out_slaveProgramm>;
+        using Program = std::conditional_t<IsMaster, I2sOutMasterProgram, I2sOutSlaveProgram>;
 
         using Sm = Kvasir::Pio::StateMachine<Program, SmConfig>;
 
@@ -189,9 +189,26 @@ namespace Kvasir { namespace Pio {
 
         static inline std::array<std::array<Frame, BufferFrames>, 2> buffers{};
 
-        static inline std::uint32_t underruns{};
+        static constexpr bool Statistics = [] {
+            if constexpr(requires { Config_::Statistics; }) {
+                return static_cast<bool>(Config_::Statistics);
+            } else {
+                return true;
+            }
+        }();
 
-        static inline std::uint32_t buffersSent{};
+        // The counters exist only with Statistics: without, the struct is empty and no
+        // variable is emitted at all.
+        template<bool On, typename = void>
+        struct Counters {
+            static inline std::uint32_t underruns{};
+            static inline std::uint32_t buffersSent{};
+        };
+
+        template<typename Dummy>
+        struct Counters<false, Dummy> {};
+
+        using Stats = Counters<Statistics>;
 
         static inline bool running{false};
 
@@ -200,9 +217,11 @@ namespace Kvasir { namespace Pio {
         /// Start the clocks and the stream. `f` is called for each buffer as it frees up; it runs
         /// in the DMA interrupt, so it should be a waveform generator and not much else.
         static void start(Fill const& f) {
-            fill        = f;
-            underruns   = 0;
-            buffersSent = 0;
+            fill = f;
+            if constexpr(Statistics) {
+                Stats::underruns   = 0;
+                Stats::buffersSent = 0;
+            }
             for(auto& b : buffers) { b.fill(0); }
             if(fill) {
                 fill(std::span<Frame>{buffers[0]});
@@ -223,10 +242,18 @@ namespace Kvasir { namespace Pio {
         [[nodiscard]] static bool isRunning() { return running; }
 
         /// Frames sent so far.
-        [[nodiscard]] static std::uint32_t frames() { return buffersSent * BufferFrames; }
+        [[nodiscard]] static std::uint32_t frames()
+            requires Statistics
+        {
+            return Stats::buffersSent * BufferFrames;
+        }
 
         /// Buffers handed to the DMA before their refill finished, i.e. audible glitches.
-        [[nodiscard]] static std::uint32_t underrunCount() { return underruns; }
+        [[nodiscard]] static std::uint32_t underrunCount()
+            requires Statistics
+        {
+            return Stats::underruns;
+        }
 
         /// TX FIFO level: full with the DMA part-way through means the machine is not consuming,
         /// empty with the DMA untouched means it never started.
@@ -236,8 +263,8 @@ namespace Kvasir { namespace Pio {
             return Dma::template remaining<DmaChannel>();
         }
 
-        /// The instruction the state machine sits on; subtract the program offset for the line
-        /// in the .pio.
+        /// The instruction the state machine sits on; subtract the program offset for the
+        /// instruction's index in I2sOutProgram.hpp.
         [[nodiscard]] static std::uint32_t programCounter() {
             using PioRegs = Kvasir::Peripheral::PIO::Registers<Config_::PioInstance>;
             using SmRegs  = typename PioRegs::template SM<Config_::SmInstance>;
@@ -279,7 +306,7 @@ namespace Kvasir { namespace Pio {
         /// not `start`, which would reassign the callback slot this runs out of (see ADC.hpp).
         static void onComplete_() {
             if(!running) { return; }
-            ++buffersSent;
+            if constexpr(Statistics) { ++Stats::buffersSent; }
             auto const justFinished = static_cast<std::uint8_t>(1U - next);
 
             Dma::template retrigger<
@@ -296,7 +323,7 @@ namespace Kvasir { namespace Pio {
             if(fill) {
                 fill(std::span<Frame>{buffers[justFinished]});
             } else {
-                ++underruns;
+                if constexpr(Statistics) { ++Stats::underruns; }
             }
         }
     };
