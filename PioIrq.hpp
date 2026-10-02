@@ -45,7 +45,7 @@ namespace Kvasir { namespace Pio {
                       "a PIO instance has two interrupt lines");
         static_assert(Kind == IrqSourceKind::flag ? N < 8 : N < 4,
                       "four state machines, eight IRQ flags");
-        static_assert(F == nullptr || Kind != IrqSourceKind::flag
+        static_assert(Nvic::isNullHandler<F> || Kind != IrqSourceKind::flag
                         || !PinConfig::isRp2040(PinConfig::CurrentChip) || N < 4,
                       "the RP2040 routes IRQ flags 0..3 to the NVIC only");
 
@@ -106,7 +106,7 @@ namespace Kvasir { namespace Pio {
           = std::conditional_t<Kind == IrqSourceKind::flag, Nvic::ClearLast<flag>, Nvic::NoClear>;
 
         using SubIsrs = std::conditional_t<
-          F == nullptr,
+          Nvic::isNullHandler<F>,
           brigand::list<>,
           brigand::list<
             Nvic::

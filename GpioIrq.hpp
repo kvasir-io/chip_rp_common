@@ -135,7 +135,7 @@ template<unsigned Core_, void (*OnFalling)(), void (*OnRising)(), typename Pin, 
 struct GpioPinEdgesOn {
     static_assert(Core_ < 2,
                   "two cores");
-    static_assert(OnFalling != nullptr || OnRising != nullptr,
+    static_assert(!Nvic::isNullHandler<OnFalling> || !Nvic::isNullHandler<OnRising>,
                   "a GPIO edge interrupt with neither edge");
 
     static constexpr unsigned startupCore = Core_;
@@ -173,16 +173,17 @@ struct GpioPinEdgesOn {
     using Falling = EdgeIrq<detail::EdgeLow, OnFalling>;
     using Rising  = EdgeIrq<detail::EdgeHigh, OnRising>;
 
-    using SubIsrs = brigand::append<
-      std::
-        conditional_t<OnFalling != nullptr, brigand::list<typename Falling::Sub>, brigand::list<>>,
-      std::
-        conditional_t<OnRising != nullptr, brigand::list<typename Rising::Sub>, brigand::list<>>>;
+    using SubIsrs = brigand::append<std::conditional_t<!Nvic::isNullHandler<OnFalling>,
+                                                       brigand::list<typename Falling::Sub>,
+                                                       brigand::list<>>,
+                                    std::conditional_t<!Nvic::isNullHandler<OnRising>,
+                                                       brigand::list<typename Rising::Sub>,
+                                                       brigand::list<>>>;
 
     // stale edges from before boot or before the pad was configured: a plain store of ones
-    static constexpr std::uint32_t edgeBits
-      = (OnFalling != nullptr ? Falling::mask : 0U) | (OnRising != nullptr ? Rising::mask : 0U);
-    static constexpr auto initStepPeripheryConfig
+    static constexpr std::uint32_t edgeBits = (Nvic::isNullHandler<OnFalling> ? 0U : Falling::mask)
+                                            | (Nvic::isNullHandler<OnRising> ? 0U : Rising::mask);
+    static constexpr auto          initStepPeripheryConfig
       = list(Register::write(Regs::Intr::FULLREGISTER, Register::value<std::uint32_t, edgeBits>()));
 };
 
