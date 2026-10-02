@@ -32,15 +32,31 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 get_filename_component(_chip_rp_common "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 get_filename_component(_kvasir_work "${_chip_rp_common}/.." ABSOLUTE)
 
-# pioasm, built for the host from the checkout next to this one, with its pioasm_generate(). It fetches cmake_helpers;
-# the sibling checkout serves, as in the firmware trees.
-if(NOT PIOASM_ROOT)
+# pioasm, built for the host, with its pioasm_generate(): the checkout next to this one (kvasir_work), else fetched, so
+# a lone checkout of this repository (CI) builds the tests too. pioasm fetches cmake_helpers; a sibling checkout serves.
+include(FetchContent)
+if(NOT PIOASM_ROOT AND EXISTS "${_kvasir_work}/pioasm/CMakeLists.txt")
     set(PIOASM_ROOT "${_kvasir_work}/pioasm")
 endif()
 if(NOT FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS AND EXISTS "${_kvasir_work}/cmake_helpers/BuildOptions.cmake")
     set(FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS "${_kvasir_work}/cmake_helpers")
 endif()
-add_subdirectory(${PIOASM_ROOT} pioasm)
+if(PIOASM_ROOT)
+    add_subdirectory(${PIOASM_ROOT} pioasm)
+else()
+    FetchContent_Declare(
+        pioasm
+        GIT_REPOSITORY https://github.com/dominicpoeschko/pioasm.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(pioasm)
+endif()
+# clang 23's [[clang::lifetimebound]] suggestions (-Weverything) on pioasm's verbatim pico-sdk/bison sources: advice,
+# not findings, and not ours to edit. The group takes the intra-/cross-TU (constructor) suggestions alike; clang 22 does
+# not know it, hence -Wno-unknown-warning-option.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(pioasm PRIVATE -Wno-unknown-warning-option -Wno-lifetime-safety-suggestions)
+endif()
 
 set(_warnings -Wall -Wextra -Wpedantic -Werror)
 # clang: the firmware trees' set (cmake_helpers, as in their compile_commands.json), so a warning the chip headers would
@@ -71,7 +87,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         -Wno-braced-scalar-init
         -Wno-unsafe-buffer-usage
         -Wno-nrvo
-        -Wno-unused-macros)
+        -Wno-unused-macros
+        # clang 23: the firmware trees take these out too (Kvasir_SDK arm_clang.cmake)
+        -Wno-lifetime-safety-intra-tu-suggestions
+        -Wno-lifetime-safety-intra-tu-constructor-suggestions)
 endif()
 
 # ---- the encoding test and the test program
@@ -84,9 +103,31 @@ add_test(NAME pio_asm_tests COMMAND pio_asm_tests)
 
 # ---- the cross-check against pioasm
 # -----------------------------------------------------------------------------------
+# pico-sdk and pico-examples: the checkouts in ~/repos, else fetched (shallow, no submodules, nothing of them is built)
+# unless PIO_FETCH_CORPUS is OFF. Only read when PIO_CORPUS_ROOTS is not in the cache yet.
+option(PIO_FETCH_CORPUS "fetch pico-sdk and pico-examples for the cross-check when ~/repos has no checkout" ON)
+set(_corpus_defaults "pio=${CMAKE_CURRENT_LIST_DIR}/pio" "corpus=${_kvasir_work}/plans/constexpr_pio_asm/corpus")
+if(NOT DEFINED CACHE{PIO_CORPUS_ROOTS})
+    foreach(_repo sdk:pico-sdk examples:pico-examples)
+        string(REPLACE ":" ";" _repo ${_repo})
+        list(GET _repo 0 _label)
+        list(GET _repo 1 _name)
+        if(EXISTS "$ENV{HOME}/repos/${_name}")
+            list(APPEND _corpus_defaults "${_label}=$ENV{HOME}/repos/${_name}")
+        elseif(PIO_FETCH_CORPUS)
+            FetchContent_Declare(
+                ${_name}
+                GIT_REPOSITORY https://github.com/raspberrypi/${_name}.git
+                GIT_TAG master
+                GIT_SHALLOW TRUE
+                GIT_SUBMODULES "" SOURCE_SUBDIR no_cmake_here)
+            FetchContent_MakeAvailable(${_name})
+            list(APPEND _corpus_defaults "${_label}=${${_name}_SOURCE_DIR}")
+        endif()
+    endforeach()
+endif()
 set(PIO_CORPUS_ROOTS
-    "pio=${CMAKE_CURRENT_LIST_DIR}/pio" "corpus=${_kvasir_work}/plans/constexpr_pio_asm/corpus"
-    "sdk=$ENV{HOME}/repos/pico-sdk" "examples=$ENV{HOME}/repos/pico-examples"
+    ${_corpus_defaults}
     CACHE STRING "label=root pairs; every .pio below each root is cross-checked")
 
 # Random programs (gen_random_pio.py): every instruction form, side-set shape, directive and operator in combinations
