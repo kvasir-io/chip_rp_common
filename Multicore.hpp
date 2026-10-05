@@ -1,5 +1,6 @@
 #pragma once
 #include "Sio.hpp"
+#include "WaitBounds.hpp"
 #include "chip/Interrupt.hpp"
 #include "core/core.hpp"
 #include "kvasir/Atomic/Atomic.hpp"
@@ -32,7 +33,8 @@ using PSM = Kvasir::Peripheral::PSM::Registers<>;
 // fences the APB write so the clear cannot overtake it.
 inline void resetCore1() {
     apply(set(PSM::FRCE_OFF::proc1));
-    while(get<0>(apply(read(PSM::FRCE_OFF::proc1))) == 0) {}
+    Kvasir::Register::waitUntil<Kvasir::Chip::ReadBackBound>(
+      Kvasir::Register::isSet(PSM::FRCE_OFF::proc1));
     apply(clear(PSM::FRCE_OFF::proc1));
 }
 

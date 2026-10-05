@@ -13,6 +13,7 @@
 // may run from flash meanwhile, on the other core neither.
 #include "bootrom_functions.hpp"
 #include "flash.hpp"
+#include "kvasir/StartUp/LinkerSymbols.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,16 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+
+#if __has_include("chip/rp2040.hpp") && defined(KVASIR_CORE_SCRATCH) && KVASIR_CORE_SCRATCH
+// the scratch banks' load image follows .data's in flash (chip_rp2040/linker/chip.ld; declared as in its StartUp.hpp).
+// Only with SCRATCH_BANKS: a firmware's own linker script (omniscope) may not define these
+extern "C" {
+extern std::byte _LINKER_INTERN_scratch_y_load_;
+extern std::byte _LINKER_INTERN_scratch_y_data_start_;
+extern std::byte _LINKER_INTERN_scratch_y_data_end_;
+}
+#endif
 
 namespace Kvasir { namespace Flash {
 
@@ -29,6 +40,8 @@ namespace Kvasir { namespace Flash {
         static_assert(Offset % SectorSize == 0,
                       "the region must start on a sector");
         static constexpr std::uint32_t SectorBytes = SectorSize;
+        static constexpr std::uint32_t PageBytes   = PageSize;   // what program() pads to
+        static constexpr std::uint32_t Start       = Offset;
         static constexpr std::uint32_t Bytes       = Sectors * SectorBytes;
 
         [[nodiscard]] static constexpr std::uint32_t sectorCount() { return Sectors; }
@@ -62,6 +75,23 @@ namespace Kvasir { namespace Flash {
                 in = in.subspan(n);
             }
             return true;
+        }
+
+        /// The region lies past the end of the firmware's flash image (the load end of .data, on an RP2040 image with
+        /// SCRATCH_BANKS of the scratch banks' image after it). Kvasir::Flash::CellStore refuses to touch a region that does not.
+        [[nodiscard]] static bool outsideImage() {
+            std::uintptr_t end
+              = reinterpret_cast<std::uintptr_t>(std::addressof(_LINKER_data_start_flash_))
+              + reinterpret_cast<std::size_t>(std::addressof(_LINKER_data_size_));
+#if __has_include("chip/rp2040.hpp") && defined(KVASIR_CORE_SCRATCH) && KVASIR_CORE_SCRATCH
+            end = std::max<std::uintptr_t>(
+              end,
+              reinterpret_cast<std::uintptr_t>(std::addressof(_LINKER_INTERN_scratch_y_load_))
+                + static_cast<std::uintptr_t>(
+                  std::addressof(_LINKER_INTERN_scratch_y_data_end_)
+                  - std::addressof(_LINKER_INTERN_scratch_y_data_start_)));
+#endif
+            return XipBase + Offset >= end;
         }
 
         static bool erase(std::uint32_t sector) {

@@ -2,6 +2,7 @@
 
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
+#include "kvasir/Util/ResetKind.hpp"
 
 #if __has_include("peripherals/POWMAN.hpp")
     #include "peripherals/POWMAN.hpp"
@@ -206,5 +207,24 @@ namespace Kvasir { namespace PM {
         if(chip_reset[ChipReset::had_run]) { return ResetCause::run_low; }
 #endif
         return ResetCause::unknown;
+    }
+
+    /// reset_cause() as the SDK's boot guard sees it (kvasir/Util/ResetKind.hpp). On the RP2350 the bootrom's
+    /// reboot is a watchdog timeout too (it arms the watchdog's timer): a deliberate reboot calls the guard's
+    /// plannedReset() first. On the RP2040 a debugger reset leaves REASON as it was (see reset_cause()).
+    inline ResetKind resetKind() {
+        switch(reset_cause()) {
+        case ResetCause::watchdog_force: return ResetKind::watchdogForced;
+        case ResetCause::watchdog_timer: return ResetKind::watchdogTimeout;
+        case ResetCause::rescue:
+        case ResetCause::dp_reset_req:   return ResetKind::debugger;
+        case ResetCause::glitch_detect:
+        case ResetCause::bor:            return ResetKind::brownOut;
+        case ResetCause::por:
+        case ResetCause::swcore_pd:      return ResetKind::powerOn;
+        case ResetCause::run_low:        return ResetKind::external;
+        case ResetCause::unknown:        return ResetKind::unknown;
+        }
+        return ResetKind::unknown;
     }
 }}   // namespace Kvasir::PM

@@ -3,6 +3,7 @@
     #error "the always-on timer (POWMAN) exists on the RP2350 only; the RP2040 has an RTC (Rtc.hpp)"
 #endif
 #include "Clocks.hpp"
+#include "WaitBounds.hpp"
 #include "chip/Interrupt.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Register/Register.hpp"
@@ -71,7 +72,9 @@ namespace Kvasir { namespace Powman {
             }
             detail::pw<typename Regs::TIMER>(Run | (UseCrystal ? UseXosc : UseLposc));
             if constexpr(UseCrystal) {
-                while((get<0>(apply(read(Regs::TIMER::FULLREGISTER))) & UsingXosc) == 0) {}
+                // "may take up to 1 tick cycle (1ms in normal operation)" (RP2350 datasheet 12.10.5.3, md l.58487)
+                Kvasir::Register::waitUntil<Kvasir::Chip::MicrosecondsBound<3'000>>(
+                  [] { return (get<0>(apply(read(Regs::TIMER::FULLREGISTER))) & UsingXosc) != 0; });
             }
         }
 

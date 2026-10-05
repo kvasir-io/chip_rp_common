@@ -56,9 +56,13 @@ namespace Kvasir { namespace DMA {
     // line(s) it answers; a driver claims the channels it starts transfers on. Startup then
     // refuses two instances that overlap, two drivers on one channel, a driver whose
     // instance is in no list, and a driver whose instance is in the other core's list.
-    struct ChannelResourceTag {};
+    struct ChannelResourceTag {
+        static constexpr char const* describeAs = "DMA channel";   // in a compile error
+    };
 
-    struct LineResourceTag {};
+    struct LineResourceTag {
+        static constexpr char const* describeAs = "DMA interrupt line";
+    };
 
     template<unsigned Channel>
     using ChannelResource = Kvasir::Startup::Resource<ChannelResourceTag, Channel>;
@@ -601,42 +605,90 @@ namespace Kvasir { namespace DMA {
             return get<0>(apply(read(CHRegs::TRANS_COUNT::trans_count)));
         }
 
+        /// Restart an idle `Channel` for `count` transfers from where its addresses are now (a ring channel goes on
+        /// where it wrapped), CTRL and callback as they are: one write to AL1_TRANS_COUNT_TRIG, "writing a nonzero
+        /// value will reload the channel counter and start the channel" (RP2040 2.5.7 l.5012, RP2350 12.6.10
+        /// l.54300); un-reprogrammed READ/WRITE_ADDR continue (RP2350 12.6.2.1). On the RP2350 the write also sets
+        /// TRANS_COUNT.MODE (31:28) to 0, NORMAL (12.6.2.2.1): `count` must stay below 2^28 there.
+        template<DMAChannel Channel>
+        static void rearm(std::uint32_t count) {
+            using CHRegs = Regs::CH<static_cast<int>(Channel)>;
+            apply(write(CHRegs::AL1_TRANS_COUNT_TRIG::FULLREGISTER, count));
+        }
+
         // The FIFOs drain in a few cycles; hitting this bound means the channel
         // is wedged beyond what an abort can fix.
         static constexpr int AbortPollLimit = 10000;
 
-        // Terminate the transfer sequence in progress on `Channel` and leave it
-        // safe to restart. Needed by any error, timeout or reset path: dropping
-        // a transfer does not stop the hardware, so without this the sequence
-        // runs on and the next start() re-arms a live channel.
+        // Terminate the transfer sequences in progress on `Cs` and leave them safe to
+        // restart. Needed by any error, timeout or reset path: dropping a transfer does not
+        // stop the hardware, so without this the sequence runs on and the next start()
+        // re-arms a live channel. Channels that chain to one another are aborted together,
+        // in one call (RP2350 datasheet 12.6.8.3).
         //
-        // Per datasheet the abort bit must be polled until it reads back zero -
-        // until then transfers are still draining through the FIFOs and
-        // restarting the channel is unsafe. Returns false if that never
-        // happened, i.e. restarting the channel is still not safe.
-        template<DMAChannel Channel>
+        // The sequence covers both chips' errata:
+        // - RP2040-E13 (RP2040 datasheet 2.5.5.3 and errata, md l.4921, l.29532-29551):
+        //   CHAN_ABORT clears before in-flight transfers land, and their completion then
+        //   asserts the channel's interrupt. So the interrupt enable is cleared first,
+        //   CTRL.BUSY is polled (not only CHAN_ABORT), the spurious flag is cleared, and
+        //   the enable restored.
+        // - RP2350-E5 (RP2350 datasheet 12.6.8.3 and errata, md l.54201, l.66506-66520): an
+        //   aborted channel can fire its CHAIN_TO and be re-triggered on the last cycle of the
+        //   abort. So EN is cleared and CHAIN_TO pointed at the channel itself ("prevents
+        //   chaining", 12.6.3.2, md l.53837) before the abort, and CHAN_ABORT is polled until
+        //   clear.
+        // start() and configure() rewrite the whole CTRL, so nothing has to be put back.
+        //
+        // Returns false if a channel never came to rest, i.e. restarting it is still not safe.
+        template<DMAChannel... Cs>
         static bool abort() {
-            constexpr std::uint32_t bit = 1u << static_cast<int>(Channel);
-            using CHRegs                = Regs::CH<static_cast<int>(Channel)>;
+            static_assert(sizeof...(Cs) > 0);
+            constexpr std::uint32_t bits      = ((1U << static_cast<unsigned>(Cs)) | ...);
+            constexpr auto          inte      = inteField<DMAConfig::interruptInstance>();
+            constexpr std::uint32_t ownedBits = bits & DMAConfig::interruptMask;
 
-            apply(clear(CHRegs::CTRL_TRIG::en));   // pause the channel first
-            apply(write(Regs::CHAN_ABORT::chan_abort, bit));
+            std::uint32_t enabled{};
+            if constexpr(ownedBits != 0) {
+                enabled = get<0>(apply(read(inte)));
+                apply(write(inte, enabled & ~ownedBits));
+            }
+            (pauseUnchained<Cs>(), ...);
+            apply(write(Regs::CHAN_ABORT::chan_abort, bits));
             bool drained = false;
             for(int i = 0; i < AbortPollLimit; ++i) {
-                if((get<0>(apply(read(Regs::CHAN_ABORT::chan_abort))) & bit) == 0) {
+                if((get<0>(apply(read(Regs::CHAN_ABORT::chan_abort))) & bits) == 0
+                   && (idle<Cs>() && ...))
+                {
                     drained = true;
                     break;
                 }
             }
-            // Drop a completion that raced the abort: left pending it would
-            // fire into the callback the next start() installs.
-            apply(write(Regs::INTR::intr, bit));
+            // Drop a completion that raced the abort: left pending it would fire into the
+            // callback the next start() installs.
+            apply(write(Regs::INTR::intr, bits));
+            if constexpr(ownedBits != 0) { apply(write(inte, enabled)); }
             if constexpr(DMAConfig::callbackFunctionSize > 0) {
-                callbackFunctions[static_cast<std::size_t>(Channel)].reset();
+                (callbackFunctions[static_cast<std::size_t>(Cs)].reset(), ...);
             }
             return drained;
         }
 
+    private:
+        // abort()'s first step for one channel: ignore triggers, chain to nothing.
+        template<DMAChannel Channel>
+        static void pauseUnchained() {
+            using ctrl = typename Regs::template CH<static_cast<unsigned>(Channel)>::CTRL_TRIG;
+            apply(clear(ctrl::en),
+                  write(ctrl::chain_to, Register::value<static_cast<unsigned>(Channel)>()));
+        }
+
+        template<DMAChannel Channel>
+        static bool idle() {
+            using ctrl = typename Regs::template CH<static_cast<unsigned>(Channel)>::CTRL_TRIG;
+            return !apply(read(ctrl::busy));
+        }
+
+    public:
         static void onIsr() {
             static constexpr auto ints = intsField<DMAConfig::interruptInstance>();
 

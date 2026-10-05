@@ -6,6 +6,7 @@
 #endif
 
 #include "Clocks.hpp"
+#include "kvasir/Util/HealthKey.hpp"
 #include "peripherals/WATCHDOG.hpp"
 
 #include <algorithm>
@@ -64,6 +65,16 @@ struct Watchdog {
             return static_cast<bool>(Config::pauseOnDebug);
         } else {
             return true;
+        }
+    }();
+
+    /// Only Kvasir::Health::Supervisor feeds (Util/HealthKey.hpp): feed() takes its FeedKey, a plain feed()
+    /// does not compile. Default off.
+    static constexpr bool GatedFeed = [] {
+        if constexpr(requires { Config::gatedFeed; }) {
+            return static_cast<bool>(Config::gatedFeed);
+        } else {
+            return false;
         }
     }();
 
@@ -169,7 +180,18 @@ public:
       write(Regs::CTRL::pause_jtag, Kvasir::Register::value<PauseOnDebug ? 1U : 0U>())));
 
     /// Reload the counter to the full timeout (LOAD, Table 1249: write-only, takes effect at once).
-    static void feed() { apply(write(Regs::LOAD::load, Kvasir::Register::value<ReloadValue>())); }
+    static void feed()
+        requires(!GatedFeed)
+    {
+        apply(write(Regs::LOAD::load, Kvasir::Register::value<ReloadValue>()));
+    }
+
+    /// The gated feed: only the health supervisor holds a key.
+    static void feed(Kvasir::Health::FeedKey)
+        requires(GatedFeed)
+    {
+        apply(write(Regs::LOAD::load, Kvasir::Register::value<ReloadValue>()));
+    }
 
     /// Arm at run time, as the Startup list would: for a watchdog that is not in the list, or one
     /// that was disarmed.

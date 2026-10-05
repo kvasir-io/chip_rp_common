@@ -3,6 +3,7 @@
 #include "Clocks.hpp"
 #include "Io.hpp"
 #include "PinConfig.hpp"
+#include "WaitBounds.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Register/Apply.hpp"
@@ -283,7 +284,8 @@ namespace Kvasir { namespace I2C {
         /// Registers written before RESET_DONE is set are silently dropped, so wait for it.
         template<unsigned Instance>
         inline void waitResetDone() {
-            while(get<0>(apply(read(getResetDoneBit<Instance>()))) == 0) {}
+            Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>(
+              Kvasir::Register::isSet(getResetDoneBit<Instance>()));
         }
     }}   // namespace Traits::I2C
 
@@ -324,6 +326,25 @@ namespace Kvasir { namespace I2C {
                 static constexpr bool countTransfers = [] {
                     if constexpr(requires { I2CConfig_::countTransfers; }) {
                         return static_cast<bool>(I2CConfig_::countTransfers);
+                    } else {
+                        return false;
+                    }
+                }();
+
+                /// Tickets and cancel() (I2CQueued's submitTracked/cancel; kvasir_devices BusTypes.hpp). Off, the
+                /// request and result types are the ones without it.
+                static constexpr bool cancellable = [] {
+                    if constexpr(requires { I2CConfig_::cancellable; }) {
+                        return static_cast<bool>(I2CConfig_::cancellable);
+                    } else {
+                        return false;
+                    }
+                }();
+
+                /// Request::deadline: done by then, queue wait included, else timedOut.
+                static constexpr bool requestDeadlines = [] {
+                    if constexpr(requires { I2CConfig_::requestDeadlines; }) {
+                        return static_cast<bool>(I2CConfig_::requestDeadlines);
                     } else {
                         return false;
                     }
@@ -484,6 +505,14 @@ namespace Kvasir { namespace I2C {
               = list(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled),
                                                        set(Regs::IC_ENABLE::abort)),
                      NoInterrupts);
+
+            // cancelAbortRequest: a cancel of the request on the wire. ABORT is accepted only while ENABLE is set;
+            // the controller "issues a STOP and flushes the Tx FIFO after completing the current transfer, then
+            // sets the TX_ABORT interrupt" (IC_ENABLE.ABORT, RP2350 md l.50588, RP2040 md l.22699). Unlike
+            // softAbortRequest the interrupts stay unmasked: TX_ABRT (ABRT_USER_ABRT) completes the request.
+            static constexpr auto cancelAbortRequest
+              = list(Regs::IC_ENABLE::overrideDefaults(write(Regs::IC_ENABLE::ENABLEValC::enabled),
+                                                       set(Regs::IC_ENABLE::abort)));
 
             using AbrtSrc = typename Regs::IC_TX_ABRT_SOURCE;
 

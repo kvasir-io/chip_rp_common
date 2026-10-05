@@ -1,6 +1,7 @@
 #pragma once
 #include "Clocks.hpp"
 #include "PllSearch.hpp"
+#include "WaitBounds.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/CLOCKS.hpp"
 
@@ -293,12 +294,14 @@ namespace Kvasir { namespace DefaultClockSettings {
 
         apply(write(XOSC::CTRL::ENABLEValC::en), write(detail::getXoscFreqRange<CrystalSpeed>()));
         // wait for XOSC stable
-        while(!apply(read(XOSC::STATUS::stable))) {}
+        Kvasir::Register::waitUntil<Kvasir::Chip::XoscStableBound>(
+          Kvasir::Register::isSet(XOSC::STATUS::stable));
         {   //sys pll
             // reset pll
             apply(set(RST::RESET::pll_sys));
             apply(clear(RST::RESET::pll_sys));
-            while(!apply(read(RST::RESET_DONE::pll_sys))) {}
+            Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>(
+              Kvasir::Register::isSet(RST::RESET_DONE::pll_sys));
 
             apply(PLL::CS::overrideDefaults(clear(PLL::CS::bypass),
                                             write(PLL::CS::refdiv, value<pllSettings.refdiv>())));
@@ -310,7 +313,8 @@ namespace Kvasir { namespace DefaultClockSettings {
                                              set(PLL::PWR::postdivpd)));
 
             // wait for PLL lock
-            while(!apply(read(PLL::CS::lock))) {}
+            Kvasir::Register::waitUntil<Kvasir::Chip::PllLockBound>(
+              Kvasir::Register::isSet(PLL::CS::lock));
 
             apply(
               PLL::PRIM::overrideDefaults(write(PLL::PRIM::postdiv1, value<pllSettings.pd1>()),
@@ -336,7 +340,8 @@ namespace Kvasir { namespace DefaultClockSettings {
             // reset pll
             apply(set(RST::RESET::pll_usb));
             apply(clear(RST::RESET::pll_usb));
-            while(!apply(read(RST::RESET_DONE::pll_usb))) {}
+            Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>(
+              Kvasir::Register::isSet(RST::RESET_DONE::pll_usb));
 
             apply(USBPLL::CS::overrideDefaults(
               clear(USBPLL::CS::bypass),
@@ -349,7 +354,8 @@ namespace Kvasir { namespace DefaultClockSettings {
                                                 set(USBPLL::PWR::postdivpd)));
 
             // wait for PLL lock
-            while(!apply(read(USBPLL::CS::lock))) {}
+            Kvasir::Register::waitUntil<Kvasir::Chip::PllLockBound>(
+              Kvasir::Register::isSet(USBPLL::CS::lock));
 
             apply(USBPLL::PRIM::overrideDefaults(
               write(USBPLL::PRIM::postdiv1, value<usb_pllSettings.pd1>()),

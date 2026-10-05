@@ -2,6 +2,7 @@
 #if !__has_include("chip/rp2350.hpp")
     #error "the SHA-256 block exists on the RP2350 only"
 #endif
+#include "WaitBounds.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/RESETS.hpp"
 #include "peripherals/SHA256.hpp"
@@ -78,7 +79,9 @@ namespace Kvasir { namespace Sha256 {
             feedBlock_();
             pending_ = 0;
 
-            while(!apply(read(Regs::CSR::sum_vld))) {}
+            // the last block's digest: 57 cycles (RP2350 datasheet 12.13, md l.59650)
+            Kvasir::Register::waitUntil<Kvasir::Register::Bound::Polls<1'000>>(
+              Kvasir::Register::isSet(Regs::CSR::sum_vld));
             Digest d{};
             storeWord_(d, 0, get<0>(apply(read(Regs::SUM0::sum0))));
             storeWord_(d, 4, get<0>(apply(read(Regs::SUM1::sum1))));
@@ -142,7 +145,9 @@ namespace Kvasir { namespace Sha256 {
                                       | (static_cast<std::uint32_t>(block_[i + 1]) << 8)
                                       | (static_cast<std::uint32_t>(block_[i + 2]) << 16)
                                       | (static_cast<std::uint32_t>(block_[i + 3]) << 24);
-                while(!apply(read(Regs::CSR::wdata_rdy))) {}
+                // between blocks: the 57-cycle digest (md l.59650)
+                Kvasir::Register::waitUntil<Kvasir::Register::Bound::Polls<1'000>>(
+                  Kvasir::Register::isSet(Regs::CSR::wdata_rdy));
                 apply(write(Regs::WDATA::wdata, w));
             }
         }

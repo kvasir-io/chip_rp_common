@@ -4,6 +4,7 @@
 // CS goes up in the RX DMA completion. Queue, holds, timeouts and watchdog are kvasir_devices'
 // SPI/QueueCore.hpp. SPIBehavior (SPI.hpp) stays for net's W5500 and TC6.
 #include "SPI.hpp"
+#include "WaitBounds.hpp"
 #include "kvasir/Atomic/Atomic.hpp"
 #include "kvasir/Devices/Quantities.hpp"
 #include "kvasir/Devices/SPI/QueueCore.hpp"
@@ -169,7 +170,8 @@ namespace Kvasir { namespace SPI {
                 Dma::template abort<RxChannel>();
                 apply(resetBit_(true));
                 apply(resetBit_(false));
-                while(get<0>(apply(read(resetDoneBit_()))) == 0) {}
+                Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>(
+                  Kvasir::Register::isSet(resetDoneBit_()));
                 apply(base::initStepPeripheryConfig);   // DSS 7 among it
                 apply(base::initStepPeripheryEnable);
                 dss_ = 7;
@@ -277,6 +279,21 @@ namespace Kvasir { namespace SPI {
         using Request = typename Core::RequestT;
 
         static bool submit(Request const& r) { return Core::submit(r); }
+
+        /// QueueCoreFeatures::cancel / ::deadlines (kvasir_devices BusTypes.hpp): a ticket, and cancel(ticket).
+        using Result = typename Core::Result;
+
+        static Bus::Ticket submitTracked(Request const& r)
+            requires(Core::Tracked)
+        {
+            return Core::submitTracked(r);
+        }
+
+        static Bus::Cancel cancel(Bus::Ticket t)
+            requires(Core::Features.cancel)
+        {
+            return Core::cancel(t);
+        }
 
         static void releaseHold(Lines const& l) { Core::releaseHold(l); }
 

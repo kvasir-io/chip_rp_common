@@ -55,11 +55,12 @@ namespace Kvasir { namespace Xip {
     [[nodiscard]] inline bool streamFifoEmpty() { return apply(read(Ctrl::STAT::fifo_empty)); }
 
     /// Drain whatever a previous stream left, then start `words` from `flashAddress`
-    /// (a 4-byte aligned XIP address).
+    /// (a 4-byte aligned XIP address). STREAM_ADDR's field is bits 31:2 (RP2040 Table 160, RP2350
+    /// Table 444): the field value is the word address.
     inline void startStream(std::uint32_t flashAddress,
                             std::uint32_t words) {
         while(!streamFifoEmpty()) { (void)apply(read(Ctrl::STREAM_FIFO::FULLREGISTER)); }
-        apply(write(Ctrl::STREAM_ADDR::stream_addr, flashAddress));
+        apply(write(Ctrl::STREAM_ADDR::stream_addr, flashAddress >> 2U));
         apply(write(Ctrl::STREAM_CTR::stream_ctr, words));
     }
 

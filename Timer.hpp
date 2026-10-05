@@ -1,5 +1,6 @@
 #pragma once
 #include "Clocks.hpp"
+#include "WaitBounds.hpp"
 #include "chip/Interrupt.hpp"
 #include "core/Nvic.hpp"
 #include "core/core.hpp"
@@ -120,10 +121,14 @@ public:
 
     // chrono interface, same shape as SystickClockBase so the two are interchangeable as a
     // `Clock` template argument.
-    using duration   = std::chrono::duration<std::int64_t, std::micro>;
-    using rep        = duration::rep;
-    using period     = duration::period;
-    using time_point = std::chrono::time_point<TimerClockBase, duration>;
+    using duration = std::chrono::duration<std::int64_t, std::micro>;
+    // Counts from the tick generator, not from the core's clock: it runs while the core sleeps in WFE/WFI (SLEEP
+    // gates clocks by SLEEP_EN0/1, all on by default - a firmware that prunes them must keep clk_ref, TICKS and the
+    // TIMER; RP2040 2.11.2). Kvasir::Executor's sleeping loop requires it.
+    static constexpr bool runsAsleep = true;
+    using rep                        = duration::rep;
+    using period                     = duration::period;
+    using time_point                 = std::chrono::time_point<TimerClockBase, duration>;
 
     static constexpr bool is_steady = true;
 
@@ -198,7 +203,8 @@ public:
     static constexpr auto initStepPeripheryConfig = tickConfig();
 
     static void preEnableRuntimeInit() {
-        while(get<0>(apply(read(resetDoneBit()))) == 0) {}
+        Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>(
+          Kvasir::Register::isSet(resetDoneBit()));
     }
 };
 
@@ -235,6 +241,10 @@ struct Alarm {
 
     using duration   = typename TimerClock::duration;
     using time_point = typename TimerClock::time_point;
+
+    // The comparator matches the counter's low 32 bits (RP2040 4.6, md l.25040; RP2350 12.8, md l.57654) and armRaw's
+    // "already behind" test covers half the range: a wake further ahead than this is clamped (Kvasir::Executor).
+    static constexpr auto maxAhead = std::chrono::microseconds{(std::int64_t{1} << 31) - 1'000'000};
 
     using Provides = brigand::list<Startup::Resource<AlarmTag, Instance, N>>;
     using Claims   = brigand::list<Startup::Resource<InstanceTag, Instance>>;

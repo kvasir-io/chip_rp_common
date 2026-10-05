@@ -485,30 +485,49 @@ namespace Kvasir { namespace UART {
                  typename Config::template GetRxPinConfig<
                    std::decay_t<decltype(UartConfig::rxPinLocation)>>::pinConfig{});
 
+        // The init list in pieces: UartStream builds its own from the same format and FIFO parts with a DMA
+        // control and interrupt set of its own.
+        static constexpr auto formatConfig() {
+            return list(clear(Regs::UARTCR::uarten),
+                        Kvasir::Register::SequencePoint{},
+
+                        typename Config::template GetBaudConfig<UartConfig::clockSpeed,
+                                                                UartConfig::baudRate>::config{},
+                        Kvasir::Register::SequencePoint{},
+                        // LCR_H writes below will latch the baud divisors (PL011 requirement)
+                        typename Config::template GetTxPinConfig<
+                          std::decay_t<decltype(UartConfig::txPinLocation)>,
+                          UartConfig::baudRate>::enable{},
+                        typename Config::template GetRxPinConfig<
+                          std::decay_t<decltype(UartConfig::rxPinLocation)>>::enable{},
+                        typename Config::template GetDataBitConfig<UartConfig::dataBits>::config{},
+                        typename Config::template GetStopBitConfig<UartConfig::stopBits>::config{},
+                        typename Config::template GetParityConfig<UartConfig::parity>::config{});
+        }
+
+        static constexpr auto dmaControl() { return list(set(Regs::UARTDMACR::txdmae)); }
+
+        static constexpr auto rxInterrupts() {
+            // qualified: on a TX-only port both parts are brigand::list<>, and ADL finds no list() for them
+            return Kvasir::MPL::list(
+              typename Config::template GetRxPinConfig<
+                std::decay_t<decltype(UartConfig::rxPinLocation)>>::interrupt{},
+              rxTimeoutInterrupt());
+        }
+
+        template<typename DmaControl,
+                 typename Interrupts>
+        static constexpr auto peripheryConfig(DmaControl,
+                                              Interrupts) {
+            return list(formatConfig(),
+                        DmaControl{},
+                        fifoConfig(),
+                        Interrupts{},
+                        UartConfig::userConfigOverride);
+        }
+
         static constexpr auto initStepPeripheryConfig
-          = list(clear(Regs::UARTCR::uarten),
-                 Kvasir::Register::SequencePoint{},
-
-                 typename Config::template GetBaudConfig<UartConfig::clockSpeed,
-                                                         UartConfig::baudRate>::config{},
-                 Kvasir::Register::SequencePoint{},
-                 // LCR_H writes below will latch the baud divisors (PL011 requirement)
-                 typename Config::template GetTxPinConfig<
-                   std::decay_t<decltype(UartConfig::txPinLocation)>,
-                   UartConfig::baudRate>::enable{},
-                 typename Config::template GetRxPinConfig<
-                   std::decay_t<decltype(UartConfig::rxPinLocation)>>::enable{},
-                 typename Config::template GetDataBitConfig<UartConfig::dataBits>::config{},
-                 typename Config::template GetStopBitConfig<UartConfig::stopBits>::config{},
-                 typename Config::template GetParityConfig<UartConfig::parity>::config{},
-
-                 set(Regs::UARTDMACR::txdmae),
-                 fifoConfig(),
-
-                 typename Config::template GetRxPinConfig<
-                   std::decay_t<decltype(UartConfig::rxPinLocation)>>::interrupt{},
-                 rxTimeoutInterrupt(),
-                 UartConfig::userConfigOverride);
+          = peripheryConfig(dmaControl(), rxInterrupts());
 
         static constexpr auto initStepInterruptConfig
           = list(Nvic::makeSetPriority<UartConfig::isrPriority>(InterruptIndexs{}),
@@ -621,6 +640,10 @@ namespace Kvasir { namespace UART {
 
         // An overrun repeats per character on a noisy line; no clock here, so count based.
         inline static Kvasir::CountLimiter<> overrunLog_{};
+        inline static Kvasir::CountLimiter<> characterErrorLog_{};
+
+        // UARTDR's FE (8), PE (9) and BE (10).
+        static constexpr std::uint32_t CharacterErrors = 0x7U << 8;
 
         // How often the receive interrupt ran: with the FIFO on, a fraction of the bytes.
         inline static std::atomic<std::uint32_t> rxInterrupts{0};
@@ -637,9 +660,20 @@ namespace Kvasir { namespace UART {
             if(intflag.template get<2>()) { apply(set(Regs::UARTICR::rtic)); }
             // Everything the FIFO (or the one-deep holding register) has: the receive and
             // timeout interrupts both clear as it empties.
+            // One read per character (it pops the FIFO): the byte in bits 7:0 and its framing,
+            // parity and break errors in bits 8-10 (UARTDR, RP2040 datasheet md l.20107-20135;
+            // the same PL011 on the RP2350). A character with one of them is pushed as empty.
             while(!apply(read(Regs::UARTFR::rxfe))) {
-                std::byte data = std::byte(apply(read(Regs::UARTDR::data)).template get<0>());
-                base::rxbuffer_.push(data);
+                auto const dr = static_cast<std::uint32_t>(apply(read(Regs::UARTDR::FULLREGISTER)));
+                if((dr & CharacterErrors) != 0) {
+                    KVASIR_LOG_LIMITED(characterErrorLog_.allow(),
+                                       UC_LOG_E,
+                                       "uart rx character error: DR {:#06x}",
+                                       dr);
+                    base::rxbuffer_.push(std::nullopt);
+                } else {
+                    base::rxbuffer_.push(std::byte(dr & 0xFFU));
+                }
             }
         }
 

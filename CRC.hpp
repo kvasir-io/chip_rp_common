@@ -1,9 +1,11 @@
 #pragma once
-#include <atomic>
+#include "kvasir/Util/Crc.hpp"
+
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <type_traits>
 
 namespace Kvasir { namespace CRC {
 
@@ -48,6 +50,9 @@ namespace Kvasir { namespace CRC {
         static constexpr Sniff parity() { return {Calc::even, 0U, false, false}; }
 
         constexpr bool is16Bit() const { return calc == Calc::crc16 || calc == Calc::crc16r; }
+
+        friend constexpr bool operator==(Sniff const&,
+                                         Sniff const&) = default;
     };
 
     // The old spelling, kept for SimpleEeprom and its users: crc16 is CRC-16/CCITT-FALSE, crc32
@@ -72,15 +77,27 @@ namespace Kvasir { namespace CRC {
           set(SC::en)));
     }
 
-    /// What the sniffer has accumulated so far, transformed as configured.
+    /// What the sniffer has accumulated so far, transformed as configured: SNIFF_DATA as read.
     template<typename DMA>
     [[nodiscard]] static inline std::uint32_t sniffResult() {
         return get<0>(apply(read(DMA::Regs::SNIFF_DATA::sniff_data)));
     }
 
+    /// The same, as the CRC `S` describes. OUT_REV reverses all 32 bits of SNIFF_DATA also in the
+    /// CRC-16 modes, so a reflected 16-bit result is in the upper half (measured on an RP2350; the
+    /// datasheets do not say).
+    template<Sniff S,
+             typename DMA>
+    [[nodiscard]] static inline std::uint32_t sniffResult() {
+        std::uint32_t const raw = sniffResult<DMA>();
+        return S.is16Bit() && S.reverseResult ? raw >> 16U : raw;
+    }
+
     /// Run `channel` over `data` (one byte at a time into a dummy destination) with the sniffer
     /// armed as `s`, and return the result. Blocks for the transfer, which runs at bus speed:
-    /// a few microseconds per kilobyte.
+    /// a few microseconds per kilobyte. Waits on the channel's BUSY bit, not on its completion
+    /// interrupt, so it works with interrupts masked, inside an ISR, and with a DmaBase without
+    /// callback slots; the completion flag it leaves is cleared by that DmaBase's ISR.
     template<Sniff S,
              typename DMA,
              typename DMA::Channel channel>
@@ -90,12 +107,9 @@ namespace Kvasir { namespace CRC {
         static_assert(DMA::ownsChannel(channel),
                       "the sniffer's DMA channel is not one of this DmaBase's channels");
         armSniffer<S, DMA, channel>();
-        if(data.empty()) { return sniffResult<DMA>(); }
+        if(data.empty()) { return sniffResult<S, DMA>(); }
 
-        std::byte         buffer;
-        std::atomic<bool> running = true;
-
-        std::atomic_signal_fence(std::memory_order_release);
+        std::byte buffer;
 
         DMA::template start<channel,
                             DMA::Priority::low,
@@ -104,12 +118,11 @@ namespace Kvasir { namespace CRC {
                             false,
                             true>(reinterpret_cast<std::uint32_t>(std::addressof(buffer)),
                                   reinterpret_cast<std::uint32_t>(data.data()),
-                                  data.size(),
-                                  [&]() { running = false; });
+                                  data.size());
 
-        while(running) {}
+        while(!DMA::template ready<channel>()) {}
 
-        return sniffResult<DMA>();
+        return sniffResult<S, DMA>();
     }
 
     template<CRC_Type type,
@@ -123,30 +136,61 @@ namespace Kvasir { namespace CRC {
         }
     }
 
-    // Software references, for checking the hardware and for hosts without a sniffer.
+    // Software references, for checking the hardware and for hosts without a sniffer: the SDK's
+    // Kvasir::Crc::Engine, bitwise. `crc` continues an earlier result (zlib's crc32(crc, data))
+    // and a CRC-16 register (the seed) respectively.
     namespace Software {
         constexpr std::uint32_t crc32(std::span<std::byte const> data,
                                       std::uint32_t              crc = 0) {
-            crc = ~crc;
-            for(auto const b : data) {
-                crc ^= static_cast<std::uint32_t>(b);
-                for(int i = 0; i < 8; ++i) { crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB8'8320U : 0U); }
-            }
-            return ~crc;
+            return Kvasir::Crc::Crc32T<0>::resume(crc).update(data).finish();
         }
 
         constexpr std::uint16_t crc16Ccitt(std::span<std::byte const> data,
                                            std::uint16_t              crc = 0xFFFF) {
-            for(auto const b : data) {
-                crc ^= static_cast<std::uint16_t>(static_cast<std::uint16_t>(b) << 8);
-                for(int i = 0; i < 8; ++i) {
-                    std::uint32_t const shifted = static_cast<std::uint32_t>(crc) << 1;
-                    crc
-                      = static_cast<std::uint16_t>((crc & 0x8000U) ? (shifted ^ 0x1021U) : shifted);
-                }
-            }
-            return crc;
+            return Kvasir::Crc::Crc16Ccitt<0>::resume(crc).update(data).finish();
         }
     }   // namespace Software
+
+    /// The sniffer setting that computes the CRC `P` describes (a Kvasir::Crc::Params): CRC-32
+    /// (0x04C11DB7) or CRC-16 (0x1021), each MSB- or LSB-first, seed and xorout 0 or all ones -
+    /// what SNIFF_CTRL.CALC, OUT_REV and OUT_INV can express (RP2040 2.5.5.2 and Table 146,
+    /// RP2350 12.6.8.2 and Table 1179). Anything else does not compile.
+    template<auto P>
+    consteval Sniff sniffFor() {
+        using T                 = std::remove_cvref_t<decltype(P.poly)>;
+        constexpr bool    crc32 = P.width == 32 && P.poly == 0x04C1'1DB7U;
+        constexpr bool    crc16 = P.width == 16 && P.poly == 0x1021U;
+        constexpr T const all   = Kvasir::Crc::Detail::mask<T>(P.width);
+        static_assert(crc32 || crc16,
+                      "the DMA sniffer computes CRC-32 (0x04C11DB7) and CRC-16 (0x1021) only");
+        static_assert(P.refin == P.refout,
+                      "the sniffer reflects input and output together (CALC ...R with OUT_REV)");
+        static_assert(
+          P.init == 0 || P.init == all,
+          "the sniffer takes seed 0 or all ones: how SNIFF_DATA holds any other seed in "
+          "the reflected modes is not documented");
+        static_assert(P.xorout == 0 || P.xorout == all, "xorout 0 or all ones (OUT_INV)");
+        return Sniff{.calc          = crc32 ? (P.refin ? Calc::crc32r : Calc::crc32)
+                                            : (P.refin ? Calc::crc16r : Calc::crc16),
+                     .seed          = static_cast<std::uint32_t>(P.init),
+                     .reverseResult = P.refout,
+                     .invertResult  = P.xorout != 0};
+    }
+
+    static_assert(sniffFor<Kvasir::Crc::Presets::crc32IsoHdlc>() == Sniff::crc32());
+    static_assert(sniffFor<Kvasir::Crc::Presets::crc32Bzip2>() == Sniff::crc32Bzip2());
+    static_assert(sniffFor<Kvasir::Crc::Presets::crc16Ibm3740>() == Sniff::crc16Ccitt());
+    static_assert(sniffFor<Kvasir::Crc::Presets::crc16X25>() == Sniff::crc16X25());
+
+    /// The `type` + `calc(span)` shape (Kvasir::Crc::Calc's) over the DMA sniffer: the same result
+    /// as the software engine for `P`, computed by `channel` of `DMA` at bus speed.
+    template<auto P, typename DMA, typename DMA::Channel channel>
+    struct SnifferCalc {
+        using type = std::remove_cvref_t<decltype(P.poly)>;
+
+        static type calc(std::span<std::byte const> data) {
+            return static_cast<type>(sniff<sniffFor<P>(), DMA, channel>(data));
+        }
+    };
 
 }}   // namespace Kvasir::CRC

@@ -2,6 +2,7 @@
 #include "Clocks.hpp"
 #include "Io.hpp"
 #include "PIO.hpp"
+#include "WaitBounds.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/RESETS.hpp"
 #include "pio/Asm.hpp"
@@ -993,7 +994,7 @@ namespace Kvasir { namespace Pio {
         }
 
         static void preEnableRuntimeInit() {
-            while(!resetDone()) {}
+            Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>([] { return resetDone(); });
             if constexpr(SyncBypassMask != 0) {
                 // the register is the instance's, shared with the other machines: set our bits
                 auto const bypass = get<0>(apply(read(PioRegs::INPUT_SYNC_BYPASS::FULLREGISTER)));

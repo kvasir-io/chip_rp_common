@@ -11,6 +11,7 @@ cmake_minimum_required(VERSION 3.28)
 #   parse(), and gen_crosscheck.py writes one file per .pio that static_asserts both agree. Building is the test; the
 #   test program prints what was compared. A root that does not exist is left out with a note; a file pioasm refuses
 #   fails the build (pioasm's own error), it is never dropped.
+# * uart_stream_cursor_test.cpp: UartStream's RX cursor arithmetic driven by a simulated DMA channel.
 # * bad/*.cpp: programs that must NOT compile, each with the message it must fail with (first line `// expect: ...`).
 #
 # clang++ unless the caller names a compiler (CXX / -DCMAKE_CXX_COMPILER): the firmware's compiler.
@@ -100,6 +101,12 @@ target_include_directories(pio_asm_tests PRIVATE ${_chip_rp_common} ${CMAKE_CURR
                                                  ${CMAKE_CURRENT_BINARY_DIR}/crosscheck)
 target_compile_options(pio_asm_tests PRIVATE ${_warnings})
 add_test(NAME pio_asm_tests COMMAND pio_asm_tests)
+
+# ---- UartStream's RX cursor (UARTStreamCursor.hpp) against a simulated DMA channel
+add_executable(uart_stream_cursor_test uart_stream_cursor_test.cpp)
+target_include_directories(uart_stream_cursor_test PRIVATE ${_chip_rp_common})
+target_compile_options(uart_stream_cursor_test PRIVATE ${_warnings})
+add_test(NAME uart_stream_cursor_test COMMAND uart_stream_cursor_test)
 
 # ---- the cross-check against pioasm
 # -----------------------------------------------------------------------------------

@@ -174,7 +174,16 @@ public:
             }
         }();
 
-        auto const          status    = apply(IsrList);
+        auto const status = apply(IsrList);
+
+        // The controller ACKs a SETUP and clears only EP0's stall arms (RP2040 datasheet 4.1.2.5,
+        // md l.18232-18244): a buffer still AVAILABLE answers the next IN token, which for a host
+        // that abandoned a control read is the new request's first one - a stale DATA1 packet the
+        // host cannot tell from the answer. So EP0 is taken
+        // back first, before anything else this interrupt does; the setup handler's own call
+        // finds nothing armed then. Software only narrows this window, it cannot close it.
+        if(status[Regs::INTS::setup_req]) { beginControlTransfer(); }
+
         std::uint32_t const sieStatus = apply(read(Regs::SIE_STATUS::FULLREGISTER));
 
         constexpr std::uint32_t errorMask
