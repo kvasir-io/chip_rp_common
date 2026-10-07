@@ -1,4 +1,5 @@
 #pragma once
+#include "DMA.hpp"
 #include "kvasir/Util/Crc.hpp"
 
 #include <bit>
@@ -103,7 +104,8 @@ namespace Kvasir { namespace CRC {
              typename DMA::Channel channel>
     [[nodiscard]] static inline std::uint32_t sniff(std::span<std::byte const> data) {
         // Ad hoc use of a channel from a free function: nothing to put in a Startup list,
-        // so only the local check applies. The caller keeps this channel clear of drivers.
+        // so only the local check applies. The caller keeps this channel clear of drivers,
+        // or lists a SnifferCalc on it, whose Claims makes Startup check that.
         static_assert(DMA::ownsChannel(channel),
                       "the sniffer's DMA channel is not one of this DmaBase's channels");
         armSniffer<S, DMA, channel>();
@@ -187,6 +189,9 @@ namespace Kvasir { namespace CRC {
     template<auto P, typename DMA, typename DMA::Channel channel>
     struct SnifferCalc {
         using type = std::remove_cvref_t<decltype(P.poly)>;
+
+        // The channel runs every calc(): listed in a Startup list, this reserves it across the image.
+        using Claims = Kvasir::DMA::Claims<DMA, channel>;
 
         static type calc(std::span<std::byte const> data) {
             return static_cast<type>(sniff<sniffFor<P>(), DMA, channel>(data));

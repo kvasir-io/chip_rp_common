@@ -554,13 +554,28 @@ namespace Kvasir { namespace I2C {
             std::uint32_t isrGapUs{};
         };
 
+        // The interrupt keeps its waits in the clock's own ticks, 32 bits, saturated (2^32 ticks
+        // are 28 s or more: "very long" for a latency). They become microseconds where they
+        // are read: in the handler that was a 64-bit division per interrupt.
+        static constexpr std::uint32_t ticks32_(typename Clock::duration d) {
+            auto const n = static_cast<std::uint64_t>(d.count());
+            return n > 0xFFFF'FFFFU ? 0xFFFF'FFFFU : static_cast<std::uint32_t>(n);
+        }
+
+        static constexpr std::uint32_t usOfTicks_(std::uint32_t ticks) {
+            return static_cast<std::uint32_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(typename Clock::duration{ticks})
+                .count());
+        }
+
         static Latency takeLatency() {
             apply(makeDisable(typename base::InterruptIndexs{}));
-            Latency const l{longestFirstIsrUs_, longestIsrGapUs_};
-            longestFirstIsrUs_ = 0;
-            longestIsrGapUs_   = 0;
+            std::uint32_t const first = longestFirstIsrTicks_;
+            std::uint32_t const gap   = longestIsrGapTicks_;
+            longestFirstIsrTicks_     = 0;
+            longestIsrGapTicks_       = 0;
             apply(makeEnable(typename base::InterruptIndexs{}));
-            return l;
+            return Latency{usOfTicks_(first), usOfTicks_(gap)};
         }
 
     private:
@@ -603,8 +618,8 @@ namespace Kvasir { namespace I2C {
         inline static std::uint32_t isrEntries_{};
         inline static tp            lastIsr_{};
         inline static tp            requestStart_{};
-        inline static std::uint32_t longestFirstIsrUs_{};
-        inline static std::uint32_t longestIsrGapUs_{};
+        inline static std::uint32_t longestFirstIsrTicks_{};
+        inline static std::uint32_t longestIsrGapTicks_{};
 
         inline static std::uint32_t   timeouts_{};
         inline static std::uint32_t   transfers_{};   // countTransfers only: never used without it
@@ -906,12 +921,9 @@ namespace Kvasir { namespace I2C {
                 // How long the request waited for this entry: from its start for the first,
                 // from the entry before for the rest. A byte at 400 kHz is ~25 us, so anything
                 // in milliseconds is the interrupt held off, or a part stretching the clock.
-                auto const now    = Clock::now();
-                auto const waited = static_cast<std::uint32_t>(
-                  std::chrono::duration_cast<std::chrono::microseconds>(
-                    now - (isrEntries_ == 0 ? requestStart_ : lastIsr_))
-                    .count());
-                auto& longest = isrEntries_ == 0 ? longestFirstIsrUs_ : longestIsrGapUs_;
+                auto const now     = Clock::now();
+                auto const waited  = ticks32_(now - (isrEntries_ == 0 ? requestStart_ : lastIsr_));
+                auto&      longest = isrEntries_ == 0 ? longestFirstIsrTicks_ : longestIsrGapTicks_;
                 if(state_ != State::idle && waited > longest) { longest = waited; }
                 ++isrEntries_;
                 lastIsr_ = now;

@@ -234,6 +234,15 @@ namespace Kvasir { namespace Pio {
             }
             return nullptr;
         }
+
+        // The symbol's index, symbolCount when there is none. For a lookup in a program that is a template argument:
+        // gcc's -fsanitize=null cannot constant-evaluate "a pointer into that object != nullptr" (find()'s result).
+        constexpr std::size_t indexOf(std::string_view name) const {
+            for(std::size_t i = 0; i < symbolCount; ++i) {
+                if(symbols[i].name.view() == name) { return i; }
+            }
+            return symbolCount;
+        }
     };
 
     namespace detail {
@@ -1008,16 +1017,20 @@ namespace Kvasir { namespace Pio {
 
         // A label's offset in the program, as pioasm's `offset_<label>`; any label, public or not.
         static consteval std::uint8_t offset(std::string_view label) {
-            auto const* s = A.find(label);
-            if(s == nullptr || !s->isLabel) { return pio_program_has_no_label_of_that_name(label); }
-            return static_cast<std::uint8_t>(s->value);
+            auto const i = A.indexOf(label);
+            if(i == A.symbolCount || !A.symbols[i].isLabel) {
+                return pio_program_has_no_label_of_that_name(label);
+            }
+            return static_cast<std::uint8_t>(A.symbols[i].value);
         }
 
         // A `.define`'s value (or one given from C++ to parse()).
         static consteval int define(std::string_view name) {
-            auto const* s = A.find(name);
-            if(s == nullptr || s->isLabel) { return pio_program_has_no_define_of_that_name(name); }
-            return s->value;
+            auto const i = A.indexOf(name);
+            if(i == A.symbolCount || A.symbols[i].isLabel) {
+                return pio_program_has_no_define_of_that_name(name);
+            }
+            return A.symbols[i].value;
         }
     };
 }}   // namespace Kvasir::Pio

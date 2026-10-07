@@ -60,6 +60,11 @@ struct Watchdog {
 
     /// PAUSE_DBG0/DBG1/JTAG (Table 1248 / RP2040 Table 546): the counter stands while a core is
     /// halted by the debugger or the debugger accesses the bus. Default on (the reset value).
+    /// Keep it on in a product: a panic's or fault's halt under the log printer then stays
+    /// halted until it is reset from there, state intact. Off, the watchdog resets the halted
+    /// core with the probe attached - a reset nobody can announce, which parks an RP2040 in
+    /// the boot ROM (the Rescue-DP park; Kvasir_SDK Util/AnnouncedReset.hpp). Off is for a test
+    /// that lets the watchdog bite under a printer and announces it first (test_examples 89, 98).
     static constexpr bool PauseOnDebug = [] {
         if constexpr(requires { Config::pauseOnDebug; }) {
             return static_cast<bool>(Config::pauseOnDebug);
@@ -68,8 +73,9 @@ struct Watchdog {
         }
     }();
 
-    /// Only Kvasir::Health::Supervisor feeds (Util/HealthKey.hpp): feed() takes its FeedKey, a plain feed()
-    /// does not compile. Default off.
+    /// Only Kvasir::Health::Supervisor feeds, arms and disarms (Util/HealthKey.hpp): feed(), arm() and disarm()
+    /// take its FeedKey, the plain ones do not compile - arm() reloads the counter and disarm() stops it, so
+    /// either would be a way round a gate on feed() alone. Default off.
     static constexpr bool GatedFeed = [] {
         if constexpr(requires { Config::gatedFeed; }) {
             return static_cast<bool>(Config::gatedFeed);
@@ -195,13 +201,34 @@ public:
 
     /// Arm at run time, as the Startup list would: for a watchdog that is not in the list, or one
     /// that was disarmed.
-    static void arm() {
+    static void arm()
+        requires(!GatedFeed)
+    {
+        apply(initStepPeripheryConfig);
+        apply(initStepPeripheryEnable);
+    }
+
+    /// The gated arm: Supervisor::service() does it at its first turn.
+    static void arm(Kvasir::Health::FeedKey)
+        requires(GatedFeed)
+    {
         apply(initStepPeripheryConfig);
         apply(initStepPeripheryEnable);
     }
 
     /// Stop the counter (CTRL.ENABLE = 0: "When not enabled the watchdog timer is paused").
-    static void disarm() { apply(clear(Regs::CTRL::enable)); }
+    static void disarm()
+        requires(!GatedFeed)
+    {
+        apply(clear(Regs::CTRL::enable));
+    }
+
+    /// The gated disarm: Supervisor::holdOff(), before its first turn only.
+    static void disarm(Kvasir::Health::FeedKey)
+        requires(GatedFeed)
+    {
+        apply(clear(Regs::CTRL::enable));
+    }
 
     /// Ticks left before the reset (CTRL.TIME). RP2350 only: on the RP2040 CTRL.TIME does not
     /// follow the counter (a hardware bug the pico-sdk documents at

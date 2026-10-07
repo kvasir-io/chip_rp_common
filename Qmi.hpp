@@ -31,16 +31,16 @@ namespace Kvasir { namespace Qmi {
         // In RAM, interrupts off: the transaction on chip select 0 at clk_sys / clkdiv. The
         // FlashXipDisabler comes from the caller, like flash_erase_impl's: its constructor looks
         // up ROM functions and copies the BOOTRAM setup routine, all code in flash.
+        // Plain pointers and sizes, taken apart by the caller in flash: a span's data() and size() are real
+        // functions in flash in a hardened build (gcc's sanitize variant kept size() out of line, found by
+        // check_ram_funcs.py on 2026-10-06), and a RAM function calls nothing there.
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void transfer(Kvasir::detail::FlashXipDisabler& xip,
-                                                            std::span<std::byte const>        tx,
-                                                            std::span<std::byte>              rx,
-                                                            std::uint32_t clkdiv) {
+                                                            std::byte const* txData,
+                                                            std::size_t      txSize,
+                                                            std::byte*       rxData,
+                                                            std::size_t      rxSize,
+                                                            std::uint32_t    clkdiv) {
             KVASIR_RAM_FUNC_MARK();
-            // Plain pointers, taken before XIP goes off.
-            std::byte const* const   txData = tx.data();
-            std::byte* const         rxData = rx.data();
-            std::size_t const        txSize = tx.size();
-            std::size_t const        rxSize = rx.size();
             Kvasir::detail::XipGuard guard{xip};
             Kvasir::detail::directTransaction(txData, txSize, rxData, rxSize, clkdiv);
         }
@@ -53,7 +53,12 @@ namespace Kvasir { namespace Qmi {
                        std::uint32_t              clkdiv = 6) {
         Kvasir::detail::FlashXipDisabler                   xip{};
         Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
-        detail::transfer(xip, tx, rx, clkdiv < 2 ? 2U : (clkdiv > 255 ? 255U : clkdiv));
+        detail::transfer(xip,
+                         tx.data(),
+                         tx.size(),
+                         rx.data(),
+                         rx.size(),
+                         clkdiv < 2 ? 2U : (clkdiv > 255 ? 255U : clkdiv));
     }
 
     struct JedecId {

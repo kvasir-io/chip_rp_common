@@ -212,13 +212,19 @@ namespace detail {
             return *reinterpret_cast<std::uint32_t const volatile*>(QMI::M0_TIMING::Addr::value);
         }
 
-        [[nodiscard]] static bool isQuadEBh(std::uint32_t rfmt,
-                                            std::uint32_t rcmd) {
+        // Both are called from apply(), a RAM function that runs while the flash is not readable: never out of
+        // line (gcc's debug variant left isContinuous in flash, found by check_ram_funcs.py on 2026-10-06).
+        [[nodiscard,
+          KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] static inline bool
+        isQuadEBh(std::uint32_t rfmt,
+                  std::uint32_t rcmd) {
             return (rfmt | PrefixLenBit) == RfmtQuadEBh && (rcmd & 0xFFU) == CommandEBh;
         }
 
-        [[nodiscard]] static bool isContinuous(std::uint32_t rfmt,
-                                               std::uint32_t rcmd) {
+        [[nodiscard,
+          KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] static inline bool
+        isContinuous(std::uint32_t rfmt,
+                     std::uint32_t rcmd) {
             return isQuadEBh(rfmt, rcmd) && (rfmt & PrefixLenBit) == 0
                 && ((rcmd >> 8) & 0xFFU) == ContinuousModeBits;
         }
@@ -578,49 +584,59 @@ namespace detail {
     }
 
 #if __has_include("chip/rp2040.hpp")
+    // Plain pointers and counts, taken apart by flash_do_cmd() in flash, and the registers by address instead of
+    // through apply(): a RAM function calls nothing in flash, and neither a span's members nor the register DSL are
+    // inline by themselves. With libc++'s hardening (the sanitize variant) span::operator[], empty() and subspan()
+    // are real functions (the sanitize image died in the first read of the serial number, 2026-09-19), and gcc's
+    // debug and sanitize variants kept span::data()/size(), Register::Detail::Apply, get<> and a memset out of
+    // line (check_ram_funcs.py, 2026-10-06). A call into flash with XIP off is a fault whose handler is in flash
+    // too: the core locks up.
+    //
+    // SSI SR (offset 0x28): TFNF bit 1, RFNE bit 3; DR0 at 0x60 (RP2040 datasheet "SSI: SR Register" / "SSI: DR0
+    // Register", md l.28208-28232, l.28490). GPIO_QSPI_SS_CTRL.OUTOVER bits 9:8: 2 drives the pad low, 3 high (md
+    // l.14158-14163).
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
-    flash_do_cmd_impl(FlashXipDisabler&          xipDisabler,
-                      std::span<std::byte const> txBuffer,
-                      std::span<std::byte>       rxBuffer) {
+    flash_do_cmd_impl(FlashXipDisabler& xipDisabler,
+                      std::byte const*  tx,
+                      std::size_t       txLeft,
+                      std::byte*        rx,
+                      std::size_t       rxLeft) {
         KVASIR_RAM_FUNC_MARK();
-        using QSPI_CS  = Kvasir::Peripheral::IO_QSPI::Registers<>::GPIO_QSPI_SS_CTRL::OUTOVERValC;
         using SSI_Regs = Kvasir::Peripheral::XIP_SSI::Registers<>;
-        // Plain pointers and counts, taken while the flash can still be executed from: with
-        // libc++'s hardening (the sanitize variant) span::operator[], empty() and subspan() are
-        // real functions, in flash, and a call to one of them with XIP off is a fault whose
-        // handler is in flash too - the core locks up (seen on the bench, 2026-09-19: the
-        // sanitize image died in the first read of the serial number).
-        std::byte const* tx     = txBuffer.data();
-        std::size_t      txLeft = txBuffer.size();
-        std::byte*       rx     = rxBuffer.data();
-        std::size_t      rxLeft = rxBuffer.size();
-        XipGuard         guard{xipDisabler};
+        using CS_Ctrl  = Kvasir::Peripheral::IO_QSPI::Registers<>::GPIO_QSPI_SS_CTRL;
+        auto* const status
+          = reinterpret_cast<std::uint32_t const volatile*>(SSI_Regs::SR::Addr::value);
+        auto* const data = reinterpret_cast<std::uint32_t volatile*>(SSI_Regs::DR0::Addr::value);
+        auto* const cs   = reinterpret_cast<std::uint32_t volatile*>(CS_Ctrl::Addr::value);
+        static constexpr std::uint32_t TxNotFull   = 1U << 1;
+        static constexpr std::uint32_t RxNotEmpty  = 1U << 3;
+        static constexpr std::uint32_t OutoverMask = 3U << 8;
+        static constexpr std::uint32_t OutoverLow  = 2U << 8;
+        static constexpr std::uint32_t OutoverHigh = 3U << 8;
+        XipGuard                       guard{xipDisabler};
 
-        apply(write(QSPI_CS::low));
+        *cs = (*cs & ~OutoverMask) | OutoverLow;
 
         static constexpr std::size_t maxInFlight = 16 - 2;
 
         std::size_t inFlight{};
         while(txLeft != 0 || rxLeft != 0) {
-            auto const flags   = apply(read(SSI_Regs::SR::tfnf), read(SSI_Regs::SR::rfne));
-            bool const can_put = get<0>(flags);
-            bool const can_get = get<1>(flags);
-            if(can_put && txLeft != 0 && inFlight < maxInFlight) {
-                apply(write(SSI_Regs::DR0::dr, static_cast<std::uint32_t>(*tx)));
+            std::uint32_t const flags = *status;
+            if((flags & TxNotFull) != 0 && txLeft != 0 && inFlight < maxInFlight) {
+                *data = static_cast<std::uint32_t>(*tx);
                 ++tx;   // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
                 --txLeft;
                 ++inFlight;
             }
-            if(can_get && rxLeft != 0) {
-                auto const v = get<0>(apply(read(SSI_Regs::DR0::dr)));
-                *rx          = static_cast<std::byte>(v);
+            if((flags & RxNotEmpty) != 0 && rxLeft != 0) {
+                *rx = static_cast<std::byte>(*data);
                 ++rx;   // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
                 --rxLeft;
                 --inFlight;
             }
         }
 
-        apply(write(QSPI_CS::high));
+        *cs = (*cs & ~OutoverMask) | OutoverHigh;
     }
 
     // Runs from flash like flash_erase(): the FlashXipDisabler's ROM lookups and boot2 copy
@@ -628,7 +644,11 @@ namespace detail {
     static inline void flash_do_cmd(std::span<std::byte const> txBuffer,
                                     std::span<std::byte>       rxBuffer) {
         FlashXipDisabler xipDisabler{};
-        flash_do_cmd_impl(xipDisabler, txBuffer, rxBuffer);
+        flash_do_cmd_impl(xipDisabler,
+                          txBuffer.data(),
+                          txBuffer.size(),
+                          rxBuffer.data(),
+                          rxBuffer.size());
     }
 
 #endif

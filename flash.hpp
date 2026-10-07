@@ -1,5 +1,6 @@
 #pragma once
 #include "bootrom_functions.hpp"
+#include "kvasir/Util/attributes.hpp"
 
 #include <array>
 #include <bit>
@@ -117,7 +118,8 @@ namespace Kvasir { namespace Flash {
         };
 
 #if __has_include("chip/rp2040.hpp")
-        [[gnu::section(".eeprom"), gnu::aligned(4096)]] static inline ValueStruct flashValue{};
+        [[KVASIR_SECTION_MEMBER(".eeprom"),
+          gnu::aligned(4096)]] static inline ValueStruct flashValue{};
 #endif
 
         static_assert(StorageAddress % SectorSize == 0,
