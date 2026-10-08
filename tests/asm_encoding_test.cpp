@@ -698,7 +698,7 @@ static_assert(fails(parse(".program p\n.mov_status irq next 3\n"),
 static_assert(fails(parse(".program p\n.pio_version 1\n.fifo putget\nmov osr, rxfifo 1\n"),
                     "line 4: expected '[', found '1'"));
 
-// ---- the chip package's programs, written with the builder since 2026-09-30 --------------------
+// ---- the chip package's programs, written with the builder -------------------------------------
 // The words are what pioasm (-o kvasir, pico-sdk 2.3.1) made of the .pio files they replaced
 // (clockout.pio, i2s.pio, PioQspi.pio, pico-examples' ws2812.pio), recorded before those were
 // deleted; the firmware images built from both were byte-identical.

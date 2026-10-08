@@ -213,7 +213,7 @@ namespace detail {
         }
 
         // Both are called from apply(), a RAM function that runs while the flash is not readable: never out of
-        // line (gcc's debug variant left isContinuous in flash, found by check_ram_funcs.py on 2026-10-06).
+        // line (gcc's debug variant left isContinuous in flash, found by check_ram_funcs.py).
         [[nodiscard,
           KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] static inline bool
         isQuadEBh(std::uint32_t rfmt,
@@ -587,9 +587,9 @@ namespace detail {
     // Plain pointers and counts, taken apart by flash_do_cmd() in flash, and the registers by address instead of
     // through apply(): a RAM function calls nothing in flash, and neither a span's members nor the register DSL are
     // inline by themselves. With libc++'s hardening (the sanitize variant) span::operator[], empty() and subspan()
-    // are real functions (the sanitize image died in the first read of the serial number, 2026-09-19), and gcc's
+    // are real functions (the sanitize image died in the first read of the serial number), and gcc's
     // debug and sanitize variants kept span::data()/size(), Register::Detail::Apply, get<> and a memset out of
-    // line (check_ram_funcs.py, 2026-10-06). A call into flash with XIP off is a fault whose handler is in flash
+    // line (check_ram_funcs.py). A call into flash with XIP off is a fault whose handler is in flash
     // too: the core locks up.
     //
     // SSI SR (offset 0x28): TFNF bit 1, RFNE bit 3; DR0 at 0x60 (RP2040 datasheet "SSI: SR Register" / "SSI: DR0

@@ -2,9 +2,8 @@ name: CI
 
 # The host tests of the constexpr PIO assembler (tests/CMakeLists.txt): most checks are static_asserts, so building is
 # the test. A lone checkout of this repository is all they need: pioasm (the oracle), cmake_helpers, pico-sdk and
-# pico-examples (the .pio corpus) are fetched by the tests' CMakeLists. The StateMachine checks (firmware_bad/) need a
-# configured firmware tree and are left out here. arm-none-eabi-gcc is installed so the gcc check covers the firmware
-# compiler too.
+# pico-examples (the .pio corpus) are fetched by the tests' CMakeLists. arm-none-eabi-gcc is installed so the gcc check
+# covers the firmware compiler too.
 
 on:
     push:

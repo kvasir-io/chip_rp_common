@@ -33,7 +33,7 @@ namespace Kvasir { namespace Qmi {
         // up ROM functions and copies the BOOTRAM setup routine, all code in flash.
         // Plain pointers and sizes, taken apart by the caller in flash: a span's data() and size() are real
         // functions in flash in a hardened build (gcc's sanitize variant kept size() out of line, found by
-        // check_ram_funcs.py on 2026-10-06), and a RAM function calls nothing there.
+        // check_ram_funcs.py), and a RAM function calls nothing there.
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void transfer(Kvasir::detail::FlashXipDisabler& xip,
                                                             std::byte const* txData,
                                                             std::size_t      txSize,

@@ -290,7 +290,7 @@ public:
     // Without it a host that abandons a control read after its first packet gets the second one
     // as the answer to its next request: the old packet is still the controller's when that
     // request's IN token comes, whatever the register says by then (seen on an RP2040 as a babble
-    // or a timeout on the host, usb_playground RESULTS.md). The wait is for the controller to
+    // or a timeout on the host). The wait is for the controller to
     // say the endpoint is idle, which it is: it has just taken the SETUP. Bounded all the same.
     // (EP_ABORT needs an RP2040 B2 or later, erratum RP2040-E2 - as the bulk endpoints' abort does.)
     static void beginControlTransfer() {

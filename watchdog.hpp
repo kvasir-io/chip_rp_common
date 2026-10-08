@@ -64,7 +64,7 @@ struct Watchdog {
     /// halted until it is reset from there, state intact. Off, the watchdog resets the halted
     /// core with the probe attached - a reset nobody can announce, which parks an RP2040 in
     /// the boot ROM (the Rescue-DP park; Kvasir_SDK Util/AnnouncedReset.hpp). Off is for a test
-    /// that lets the watchdog bite under a printer and announces it first (test_examples 89, 98).
+    /// that lets the watchdog bite under a printer and announces it first.
     static constexpr bool PauseOnDebug = [] {
         if constexpr(requires { Config::pauseOnDebug; }) {
             return static_cast<bool>(Config::pauseOnDebug);

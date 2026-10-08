@@ -7,10 +7,10 @@ cmake_minimum_required(VERSION 3.28)
 # * asm_encoding_test.cpp: every instruction form by hand from the RP2350 datasheet 11.4, side-set and delay packing,
 #   the builder against the parser, and the error messages.
 # * the cross-check against pioasm, the oracle: every .pio file below the roots listed further down (the pico-sdk and
-#   pico-examples checkouts, plans/constexpr_pio_asm/corpus, tests/pio) is assembled by pioasm (-o kvasir -v 0) AND by
-#   parse(), and gen_crosscheck.py writes one file per .pio that static_asserts both agree. Building is the test; the
-#   test program prints what was compared. A root that does not exist is left out with a note; a file pioasm refuses
-#   fails the build (pioasm's own error), it is never dropped.
+#   pico-examples checkouts, tests/pio) is assembled by pioasm (-o kvasir -v 0) AND by parse(), and gen_crosscheck.py
+#   writes one file per .pio that static_asserts both agree. Building is the test; the test program prints what was
+#   compared. A root that does not exist is left out with a note; a file pioasm refuses fails the build (pioasm's own
+#   error), it is never dropped.
 # * uart_stream_cursor_test.cpp: UartStream's RX cursor arithmetic driven by a simulated DMA channel.
 # * bad/*.cpp: programs that must NOT compile, each with the message it must fail with (first line `// expect: ...`).
 #
@@ -31,16 +31,16 @@ enable_testing()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 get_filename_component(_chip_rp_common "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-get_filename_component(_kvasir_work "${_chip_rp_common}/.." ABSOLUTE)
+get_filename_component(_siblings "${_chip_rp_common}/.." ABSOLUTE)
 
-# pioasm, built for the host, with its pioasm_generate(): the checkout next to this one (kvasir_work), else fetched, so
-# a lone checkout of this repository (CI) builds the tests too. pioasm fetches cmake_helpers; a sibling checkout serves.
+# pioasm, built for the host, with its pioasm_generate(): the checkout next to this one, else fetched, so a lone
+# checkout of this repository (CI) builds the tests too. pioasm fetches cmake_helpers; a sibling checkout serves.
 include(FetchContent)
-if(NOT PIOASM_ROOT AND EXISTS "${_kvasir_work}/pioasm/CMakeLists.txt")
-    set(PIOASM_ROOT "${_kvasir_work}/pioasm")
+if(NOT PIOASM_ROOT AND EXISTS "${_siblings}/pioasm/CMakeLists.txt")
+    set(PIOASM_ROOT "${_siblings}/pioasm")
 endif()
-if(NOT FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS AND EXISTS "${_kvasir_work}/cmake_helpers/BuildOptions.cmake")
-    set(FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS "${_kvasir_work}/cmake_helpers")
+if(NOT FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS AND EXISTS "${_siblings}/cmake_helpers/BuildOptions.cmake")
+    set(FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS "${_siblings}/cmake_helpers")
 endif()
 if(PIOASM_ROOT)
     add_subdirectory(${PIOASM_ROOT} pioasm)
@@ -113,7 +113,7 @@ add_test(NAME uart_stream_cursor_test COMMAND uart_stream_cursor_test)
 # pico-sdk and pico-examples: the checkouts in ~/repos, else fetched (shallow, no submodules, nothing of them is built)
 # unless PIO_FETCH_CORPUS is OFF. Only read when PIO_CORPUS_ROOTS is not in the cache yet.
 option(PIO_FETCH_CORPUS "fetch pico-sdk and pico-examples for the cross-check when ~/repos has no checkout" ON)
-set(_corpus_defaults "pio=${CMAKE_CURRENT_LIST_DIR}/pio" "corpus=${_kvasir_work}/plans/constexpr_pio_asm/corpus")
+set(_corpus_defaults "pio=${CMAKE_CURRENT_LIST_DIR}/pio")
 if(NOT DEFINED CACHE{PIO_CORPUS_ROOTS})
     foreach(_repo sdk:pico-sdk examples:pico-examples)
         string(REPLACE ":" ";" _repo ${_repo})
@@ -243,51 +243,4 @@ foreach(_gcc g++ arm-none-eabi-g++)
             ${CMAKE_CURRENT_BINARY_DIR}/pioasm_generated -- ${_abs_sources})
     # the cross-check files include pioasm's headers, which the build makes
     set_tests_properties(gcc_${_id} PROPERTIES DEPENDS pio_asm_tests)
-endforeach()
-
-# -----------------------------------------------------------------------------------
-# ---- StateMachine's checks, compiled the way a firmware tree compiles its code
-# -----------------------------------------------------------------------------------
-# PioStateMachine.hpp needs the chip's generated registers and a board: firmware_check.py compiles each
-# firmware_bad/*.cpp with test_examples' compile command (22_pio_blink, release) of a configured tree, -fsyntax-only.
-# `// expect: <regex>` must fail with that message, `// expect-ok` must compile without a warning; `// chips:` says on
-# which trees. A tree that is not configured is left out with a note.
-set(PIO_FIRMWARE_TREES
-    "rp2350=${_kvasir_work}/test_examples/build" "rp2040=${_kvasir_work}/test_examples/build_pico"
-    CACHE STRING "chip=firmware tree pairs for the StateMachine checks")
-file(GLOB _fw CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/firmware_bad/*.cpp)
-foreach(_pair IN LISTS PIO_FIRMWARE_TREES)
-    string(REPLACE "=" ";" _pair "${_pair}")
-    list(GET _pair 0 _chip)
-    list(GET _pair 1 _tree)
-    if(NOT EXISTS ${_tree}/compile_commands.json)
-        message(STATUS "pio firmware checks: ${_tree} is not configured, the ${_chip} checks are left out")
-        continue()
-    endif()
-    foreach(_file IN LISTS _fw)
-        get_filename_component(_name ${_file} NAME_WE)
-        set_property(
-            DIRECTORY
-            APPEND
-            PROPERTY CMAKE_CONFIGURE_DEPENDS ${_file})
-        file(
-            STRINGS ${_file} _chips
-            REGEX "^// chips: "
-            LIMIT_COUNT 1)
-        if(NOT _chips MATCHES " ${_chip}( |$)")
-            continue()
-        endif()
-        file(
-            STRINGS ${_file} _expect
-            REGEX "^// expect"
-            LIMIT_COUNT 1)
-        if(_expect STREQUAL "// expect-ok")
-            set(_mode --ok)
-        else()
-            string(REPLACE "// expect: " "" _expect "${_expect}")
-            set(_mode --expect "${_expect}")
-        endif()
-        add_test(NAME fw_${_chip}_${_name} COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/firmware_check.py
-                                                   ${_tree}/compile_commands.json ${_file} ${_mode})
-    endforeach()
 endforeach()

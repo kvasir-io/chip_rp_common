@@ -28,7 +28,7 @@
 // skipped. Keywords are case-insensitive, names are not (as in pioasm).
 //
 // The grammar is pioasm's (../pioasm/src/parser.yy, lexer.ll), checked against it by the host
-// tests over every .pio file on the bench. Where pioasm is looser than the RP2350 datasheet the
+// tests over every .pio file at hand. Where pioasm is looser than the RP2350 datasheet the
 // datasheet wins: `in status` (source 101 is reserved, 11.4.4.2) and an rxfifo index above 3
 // (11.4.8.3) are errors here.
 //
