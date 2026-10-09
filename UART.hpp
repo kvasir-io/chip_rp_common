@@ -3,6 +3,7 @@
 #include "Clocks.hpp"
 #include "DMA.hpp"
 #include "PinConfig.hpp"
+#include "WaitBounds.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Atomic/Queue.hpp"
 #include "kvasir/Io/Types.hpp"
@@ -333,6 +334,31 @@ namespace Kvasir { namespace UART {
         }
 
         template<unsigned Instance>
+        static constexpr auto getDisable() {
+            if constexpr(Instance == 0) {
+                return set(Peripheral::RESETS::Registers<>::RESET::uart0);
+            } else {
+                return set(Peripheral::RESETS::Registers<>::RESET::uart1);
+            }
+        }
+
+        template<unsigned Instance>
+        static constexpr auto getResetDoneBit() {
+            if constexpr(Instance == 0) {
+                return Peripheral::RESETS::Registers<>::RESET_DONE::uart0;
+            } else {
+                return Peripheral::RESETS::Registers<>::RESET_DONE::uart1;
+            }
+        }
+
+        /// Registers written before RESET_DONE is set are dropped, so wait for it.
+        template<unsigned Instance>
+        inline void waitResetDone() {
+            Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>(
+              Kvasir::Register::isSet(getResetDoneBit<Instance>()));
+        }
+
+        template<unsigned Instance>
         static constexpr auto DmaRX_Trigger() {
             if constexpr(Instance == 0) {
                 return DMA::TriggerSource::uart0_rx;
@@ -478,12 +504,47 @@ namespace Kvasir { namespace UART {
             }
         }
 
-        static constexpr auto initStepPinConfig
+        /// `UartConfig::startDetached`: the port comes up let go of (UartBehavior::setAttached) --
+        /// pins floating, receive masked -- for a peer that is not powered at startup; the
+        /// application attaches it once it is. Without it, the first break of a dead peer is
+        /// logged before the application's first chance to detach.
+        static constexpr bool StartDetached = [] {
+            if constexpr(requires { UartConfig::startDetached; }) {
+                return static_cast<bool>(UartConfig::startDetached);
+            } else {
+                return false;
+            }
+        }();
+
+        /// The pins as the UART's (what setAttached(true) applies).
+        static constexpr auto uartPinConfig
           = list(typename Config::template GetTxPinConfig<
                    std::decay_t<decltype(UartConfig::txPinLocation)>,
                    UartConfig::baudRate>::pinConfig{},
                  typename Config::template GetRxPinConfig<
                    std::decay_t<decltype(UartConfig::rxPinLocation)>>::pinConfig{});
+
+        template<typename Pin>
+        static constexpr auto floatingPin(Pin) {
+            if constexpr(std::is_same_v<std::remove_cvref_t<Pin>, Io::NotUsed<>>) {
+                return brigand::list<>{};
+            } else {
+                return action(Kvasir::Io::Action::Input<Kvasir::Io::PullConfiguration::PullNone>{},
+                              std::remove_cvref_t<Pin>{});
+            }
+        }
+
+        /// The pins let go of: inputs without pulls, nothing driven and nothing pulled.
+        static constexpr auto floatingPinConfig
+          = list(floatingPin(UartConfig::txPinLocation), floatingPin(UartConfig::rxPinLocation));
+
+        static constexpr auto initStepPinConfig = [] {
+            if constexpr(StartDetached) {
+                return floatingPinConfig;
+            } else {
+                return uartPinConfig;
+            }
+        }();
 
         // The init list in pieces: UartStream builds its own from the same format and FIFO parts with a DMA
         // control and interrupt set of its own.
@@ -526,8 +587,13 @@ namespace Kvasir { namespace UART {
                         UartConfig::userConfigOverride);
         }
 
-        static constexpr auto initStepPeripheryConfig
-          = peripheryConfig(dmaControl(), rxInterrupts());
+        static constexpr auto initStepPeripheryConfig = [] {
+            if constexpr(StartDetached) {
+                return peripheryConfig(dmaControl(), brigand::list<>{});
+            } else {
+                return peripheryConfig(dmaControl(), rxInterrupts());
+            }
+        }();
 
         static constexpr auto initStepInterruptConfig
           = list(Nvic::makeSetPriority<UartConfig::isrPriority>(InterruptIndexs{}),
@@ -626,7 +692,17 @@ namespace Kvasir { namespace UART {
              typename Dma::Priority DmaPriority,
              std::size_t            BufferSize>
     struct UartBehaviorSelector<UartConfig, Dma, DmaChannel, DmaPriority, BufferSize, false>
-      : UartBehaviorImpl<UartConfig, Dma, DmaChannel, DmaPriority, 0> {};
+      : UartBehaviorImpl<UartConfig, Dma, DmaChannel, DmaPriority, 0> {
+        // setAttached() lives with the receive side: a transmit-only port that started detached
+        // could never take its pin back.
+        static_assert(
+          !UartBehaviorImpl<UartConfig,
+                            Dma,
+                            DmaChannel,
+                            DmaPriority,
+                            0>::StartDetached,
+          "startDetached needs a receiving UART (rxPinLocation): only it has setAttached()");
+    };
 
     template<typename UartConfig,
              typename Dma,
@@ -647,6 +723,9 @@ namespace Kvasir { namespace UART {
 
         // How often the receive interrupt ran: with the FIFO on, a fraction of the bytes.
         inline static std::atomic<std::uint32_t> rxInterrupts{0};
+
+        // setAttached(): the pins are the UART's from startup, unless the config starts detached.
+        inline static std::atomic<bool> attached_{!base::StartDetached};
 
         static void onIsr() {
             rxInterrupts.fetch_add(1, std::memory_order_relaxed);
@@ -677,6 +756,63 @@ namespace Kvasir { namespace UART {
             }
         }
 
+        /// Let go of the line, or take it back, for a peer that is not always powered.
+        ///
+        /// Detached, neither pin is the UART's: both are inputs without pulls, so nothing is
+        /// driven into an unpowered module (an idle TX is high, and a high line into a chip
+        /// without supply feeds it through its input) and nothing is taken from it -- its TX,
+        /// pulled low by the dead module, no longer reads as an endless break (a character error
+        /// per frame time). The receive interrupts are masked and a transmit in progress is
+        /// abandoned: its DMA stops, and what the transmitter still holds (up to 32 bytes in the
+        /// FIFO and the character in the shift register) is thrown away by a block reset - the
+        /// PL011 has no FIFO flush (UARTLCR_H.FEN only switches to character mode, RP2040
+        /// datasheet 4.2.8 / RP2350 12.1.8). The block is configured again after it, receive still
+        /// masked; transferInProgress() is false when this returns. Attached, the pins are the UART's again, whatever the FIFO collected
+        /// meanwhile and the error flags it left are dropped, and receiving starts clean.
+        /// Thread context; the interrupt may run once more on what was pending at the switch.
+        static void setAttached(bool on) {
+            if(on == attached_.load(std::memory_order_relaxed)) { return; }
+            if(!on) {
+                apply(clear(Regs::UARTIMSC::rxim),
+                      clear(Regs::UARTIMSC::rtim),
+                      clear(Regs::UARTIMSC::oeim));
+                attached_.store(false, std::memory_order_relaxed);
+                bool const sending = base::transferInProgress();
+                if(sending) { base::abortTransfer(); }
+                apply(base::floatingPinConfig);
+                if(sending) { flushTransmitter_(); }
+                return;
+            }
+            apply(base::uartPinConfig);
+            while(!apply(read(Regs::UARTFR::rxfe))) {
+                static_cast<void>(apply(read(Regs::UARTDR::FULLREGISTER)));
+            }
+            apply(set(Regs::UARTRSR::oe, Regs::UARTRSR::be, Regs::UARTRSR::pe, Regs::UARTRSR::fe));
+            apply(set(Regs::UARTICR::rxic,
+                      Regs::UARTICR::rtic,
+                      Regs::UARTICR::oeic,
+                      Regs::UARTICR::feic,
+                      Regs::UARTICR::peic,
+                      Regs::UARTICR::beic));
+            attached_.store(true, std::memory_order_relaxed);
+            apply(base::rxInterrupts());
+        }
+
+        [[nodiscard]] static bool attached() { return attached_.load(std::memory_order_relaxed); }
+
+    private:
+        // A block reset empties both FIFOs and the shift register; the format, FIFO and DMA
+        // configuration is written again as at startup, without the receive interrupts. The
+        // pins are SIO by now, so the character cut short never reaches the line.
+        static void flushTransmitter_() {
+            apply(Traits::UART::getDisable<base::Instance>());
+            apply(base::powerClockEnable);
+            Traits::UART::waitResetDone<base::Instance>();
+            apply(base::peripheryConfig(base::dmaControl(), brigand::list<>{}));
+            apply(set(Regs::UARTCR::uarten));
+        }
+
+    public:
         template<typename... Ts>
         static constexpr auto makeIsr(brigand::list<Ts...>) {
             return brigand::list<

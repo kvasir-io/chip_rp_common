@@ -107,6 +107,9 @@ namespace Kvasir { namespace UART {
         static constexpr bool HasRx = !std::is_same_v<Rx, RxNone>;
         static_assert(HasTx || HasRx,
                       "a stream with neither side");
+        static_assert(
+          !base::StartDetached,
+          "UartStream has no setAttached(): startDetached would leave its pins floating for good");
         static_assert(!HasRx || base::hasRx,
                       "an RX ring needs rxPinLocation");
         static_assert(!(HasTx && HasRx) || Tx::channel != Rx::channel,

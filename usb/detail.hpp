@@ -9,8 +9,13 @@ namespace Kvasir::USB::detail {
 static inline void device_memory_memcpy(void*       dst,
                                         void const* src,
                                         std::size_t n) {
+    // The memory clobber, here and at the end, keeps the copy between what comes before and
+    // after it: the controller reads an IN packet once AVAILABLE is written and writes an OUT one
+    // before BUFF_STATUS says so, both volatile register accesses that plain DPRAM stores and
+    // loads may otherwise move across. On every core, the M0+'s memcpy path too.
+    asm volatile("" ::: "memory");
 #ifdef __ARM_FEATURE_UNALIGNED
-    // Prevent compiler from optimizing into unaligned accesses
+    // Prevent compiler from optimizing into unaligned accesses.
     asm volatile("" : "+r"(dst), "+r"(src));
 
     std::uint8_t*       dst_byte = static_cast<std::uint8_t*>(dst);
@@ -48,6 +53,7 @@ static inline void device_memory_memcpy(void*       dst,
 #else
     std::memcpy(dst, src, n);
 #endif
+    asm volatile("" : : : "memory");
 }
 
 }   // namespace Kvasir::USB::detail

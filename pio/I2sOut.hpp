@@ -217,7 +217,7 @@ namespace Kvasir { namespace Pio {
         /// Start the clocks and the stream. `f` is called for each buffer as it frees up; it runs
         /// in the DMA interrupt, so it should be a waveform generator and not much else.
         static void start(Fill const& f) {
-            fill = f;
+            fill.publish(f);
             if constexpr(Statistics) {
                 Stats::underruns   = 0;
                 Stats::buffersSent = 0;

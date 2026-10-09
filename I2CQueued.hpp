@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <limits>
@@ -217,8 +218,34 @@ namespace Kvasir { namespace I2C {
         // address NAKs (debug): apart, so a scan does not spend the faults' budget and summary
         inline static Kvasir::LogRateLimiter<Clock> nakLog_{};
         // Set while reset() / requestRecovery() run the failure callbacks: a callback that
-        // submits only queues, and leaves the interrupt masked.
+        // submits only queues (and maskDepth_ keeps the interrupt masked).
         inline static bool resetting_{};
+
+        // How deep the masked sections are nested: a callback run inside one (expireDeadlines_,
+        // a timeout's completion, reset()'s failures) may submit(), and its unmask must not open
+        // the outer section to the interrupt. Only the outermost unmask enables it.
+        inline static std::uint8_t maskDepth_{};
+
+        // The bus interrupt masked around thread code that shares state with it. The ICER/ISER
+        // writes alone are volatile stores that order nothing else: the section's plain loads could
+        // move above the mask and its stores below the unmask, into reach of the interrupt. dsb;
+        // isb after the mask so one already on its way is not taken after it either. Every
+        // maskIsr_() has its unmaskIsr_().
+        static void maskIsr_() {
+            apply(makeDisable(typename base::InterruptIndexs{}));
+            asm volatile(
+              "dsb\n"
+              "isb\n"
+              :
+              :
+              : "memory");
+            ++maskDepth_;
+        }
+
+        static void unmaskIsr_() {
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+            if(--maskDepth_ == 0) { apply(makeEnable(typename base::InterruptIndexs{})); }
+        }
 
         // -- Public API -----------------------------------------------------------
 
@@ -227,7 +254,7 @@ namespace Kvasir { namespace I2C {
         /// on a request the reset threw away. A callback that submits from here only queues:
         /// nothing starts on the block before it is back.
         static void reset() {
-            apply(makeDisable(typename base::InterruptIndexs{}));
+            maskIsr_();
             auto const outer = resetting_;
             resetting_       = true;
             failActive_();
@@ -242,20 +269,24 @@ namespace Kvasir { namespace I2C {
             if constexpr(PerDeviceClock) { timingValid_ = false; }
             apply(base::initStepInterruptConfig);
             resetting_ = outer;
-            apply(base::initStepPeripheryEnable);
+            // initStepPeripheryEnable's NVIC enable, unless reset() runs inside a masked section
+            unmaskIsr_();
         }
 
         static bool submit(Request const& req) {
-            if(requestQueue_.size() >= requestQueue_.max_size()) { return false; }
+            maskIsr_();
+            // inside the masked window, the push too: submit() also runs from completion callbacks
+            // in the ISR, and the queue has one producer only if the two cannot interleave
+            if(requestQueue_.size() >= requestQueue_.max_size()) {
+                unmaskIsr_();
+                return false;
+            }
             requestQueue_.push(req);
-
-            apply(makeDisable(typename base::InterruptIndexs{}));
-            // inside the masked window: submit() also runs from completion callbacks in the ISR
             if constexpr(CountTransfers) { ++transfers_; }
             tryStart_(Clock::now());
             // From a callback reset() or requestRecovery() runs, the interrupt stays masked:
             // they unmask it when they are done.
-            if(!resetting_) { apply(makeEnable(typename base::InterruptIndexs{})); }
+            unmaskIsr_();
             return true;
         }
 
@@ -263,9 +294,9 @@ namespace Kvasir { namespace I2C {
         static Bus::Ticket submitTracked(Request req)
             requires(Tracked)
         {
-            apply(makeDisable(typename base::InterruptIndexs{}));
+            maskIsr_();
             req.ticket = Bus::nextTicket(ticketCounter_);
-            if(!resetting_) { apply(makeEnable(typename base::InterruptIndexs{})); }
+            unmaskIsr_();
             return submit(req) ? Bus::Ticket{req.ticket} : Bus::Ticket{};
         }
 
@@ -276,7 +307,7 @@ namespace Kvasir { namespace I2C {
             requires(Cancellable)
         {
             if(!t.valid()) { return Bus::Cancel::tooLate; }
-            apply(makeDisable(typename base::InterruptIndexs{}));
+            maskIsr_();
             auto r = Bus::Cancel::tooLate;
             if(active_ && state_ != State::idle && currentRequest_.ticket == t.id) {
                 if(!cancelPending_) {
@@ -294,7 +325,7 @@ namespace Kvasir { namespace I2C {
                     }
                 });
             }
-            if(!resetting_) { apply(makeEnable(typename base::InterruptIndexs{})); }
+            unmaskIsr_();
             return r;
         }
 
@@ -309,10 +340,10 @@ namespace Kvasir { namespace I2C {
                 reset();
                 // The limiter is shared with the ISR's fault lines, and reset() has just
                 // unmasked the interrupt: the decision is taken with it masked again.
-                apply(makeDisable(typename base::InterruptIndexs{}));
+                maskIsr_();
                 [[maybe_unused]] auto const recoveredLine
                   = faultLog_.allow(faultKey(Fault::recovered), now);
-                apply(makeEnable(typename base::InterruptIndexs{}));
+                unmaskIsr_();
                 // The line states right after the sequence are the diagnosis: both high
                 // and the bus is back, SDA low means a slave still holds data, SCL low
                 // means no master can help.
@@ -334,13 +365,13 @@ namespace Kvasir { namespace I2C {
             // log rate limiter dropped (reported now that the bus is quiet), the failure streak,
             // and the post-abort settle gate -- a 64-bit time, which an unmasked read could see
             // half-written. The ISR can land between any two of these.
-            apply(makeDisable(typename base::InterruptIndexs{}));
+            maskIsr_();
             auto const droppedFaults = faultLog_.takeSummary(now);
             auto const droppedNaks   = nakLog_.takeSummary(now);
             bool const deadBus       = consecutiveFailures_ >= kDeadBusFailures;
             if(deadBus) { consecutiveFailures_ = 0; }
             bool const settled = Recovery::isPastSettle(now);
-            apply(makeEnable(typename base::InterruptIndexs{}));
+            unmaskIsr_();
             if(droppedFaults != 0) {
                 UC_LOG_W("i2c{} +{} faults not logged", base::Instance, droppedFaults);
             }
@@ -380,22 +411,30 @@ namespace Kvasir { namespace I2C {
             // leaves the queue empty for seconds. Then whatever waits may start, on the same
             // terms submit() starts it (tryStart_).
             if constexpr(Deadlines) {
-                apply(makeDisable(typename base::InterruptIndexs{}));
+                maskIsr_();
                 expireDeadlines_(now);
-                apply(makeEnable(typename base::InterruptIndexs{}));
+                unmaskIsr_();
             }
 
             if(!active_) {
                 if(Recovery::checkBusStuck(now)) { return; }
-                apply(makeDisable(typename base::InterruptIndexs{}));
+                maskIsr_();
                 tryStart_(now);
-                apply(makeEnable(typename base::InterruptIndexs{}));
+                unmaskIsr_();
                 return;
             }
 
             // Active transaction: check for timeout
             if(now > timeoutTime_) {
-                apply(makeDisable(typename base::InterruptIndexs{}));
+                maskIsr_();
+                // Read again, masked: the interrupt may have finished the request (and started
+                // the next, with a later deadline) since the check above, which also read the
+                // 64-bit timeoutTime_ unmasked. Failing it now would fail the wrong request or
+                // complete the finished one twice.
+                if(!active_ || now <= timeoutTime_) {
+                    unmaskIsr_();
+                    return;
+                }
                 ++timeouts_;
                 lastTimeout_ = snapshot_();
                 KVASIR_LOG_LIMITED(
@@ -408,7 +447,7 @@ namespace Kvasir { namespace I2C {
                 apply(base::softAbortRequest);
                 // a stop the caller asked for (cancel, deadline) whose TX_ABRT never came: still that outcome
                 completeCurrentRequest(stoppingResult_(Result::failed));
-                apply(makeEnable(typename base::InterruptIndexs{}));
+                unmaskIsr_();
             }
         }
 
@@ -420,14 +459,14 @@ namespace Kvasir { namespace I2C {
         // Request a full bus recovery sequence non-blocking.
         // Safe to call at any time. Any active transaction is immediately failed.
         static void requestRecovery() {
-            apply(makeDisable(typename base::InterruptIndexs{}));
+            maskIsr_();
             auto const outer = resetting_;
             resetting_       = true;
             failActive_();
             drainQueueWithFailure();
             Recovery::begin();
             resetting_ = outer;
-            if(!outer) { apply(makeEnable(typename base::InterruptIndexs{})); }
+            unmaskIsr_();
         }
 
         static bool isRecovering() { return Recovery::isActive(); }
@@ -569,12 +608,12 @@ namespace Kvasir { namespace I2C {
         }
 
         static Latency takeLatency() {
-            apply(makeDisable(typename base::InterruptIndexs{}));
+            maskIsr_();
             std::uint32_t const first = longestFirstIsrTicks_;
             std::uint32_t const gap   = longestIsrGapTicks_;
             longestFirstIsrTicks_     = 0;
             longestIsrGapTicks_       = 0;
-            apply(makeEnable(typename base::InterruptIndexs{}));
+            unmaskIsr_();
             return Latency{usOfTicks_(first), usOfTicks_(gap)};
         }
 

@@ -414,7 +414,7 @@ namespace Kvasir { namespace ADC {
         template<typename F>
         static void start(F&& callback) {
             assert(!running_.load(std::memory_order_relaxed));
-            userCallback_ = std::forward<F>(callback);
+            userCallback_.publish(std::forward<F>(callback));
             arm();
         }
 
@@ -525,7 +525,7 @@ namespace Kvasir { namespace ADC {
         template<typename F>
         static void start(F&& callback) {
             channelIndex_ = 0;
-            userCallback_ = std::forward<F>(callback);
+            userCallback_.publish(std::forward<F>(callback));
 
             apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<1u>()),
                                               write(Regs::FCS::thresh, Register::value<1u>())));
@@ -533,6 +533,10 @@ namespace Kvasir { namespace ADC {
             base::drainFifo();
 
             apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(base::firstChannel_)));
+
+            // channelIndex_ and userCallback_ are plain memory the ISR reads: keep their stores
+            // before the volatile writes that let it run
+            std::atomic_signal_fence(std::memory_order_seq_cst);
 
             // Enable FIFO interrupt
             apply(set(Regs::INTE::fifo));

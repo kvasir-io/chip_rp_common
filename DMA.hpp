@@ -9,6 +9,7 @@
 #include "peripherals/RESETS.hpp"
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <optional>
 #include <span>
@@ -339,6 +340,14 @@ namespace Kvasir { namespace DMA {
         };
 
     private:
+        // Called right before every register write that can start a channel. The callback slot
+        // and the buffers a transfer reads are plain memory, the trigger a volatile store, and
+        // the compiler may move plain stores after a volatile one: clang put the invoker's store
+        // after CTRL_TRIG in start(). A short transfer (a UART frame into an empty FIFO) completes
+        // within those few cycles, onIsr() found the slot still empty, and the completion was
+        // lost for good. One core: ordering the compiler is all it takes.
+        static void beforeTrigger() { std::atomic_signal_fence(std::memory_order_seq_cst); }
+
         // Register writes only, no callback state: shared tail of start() and retrigger().
         template<DMAChannel      Channel,
                  DMAPriority     Priority,
@@ -351,6 +360,7 @@ namespace Kvasir { namespace DMA {
                                         std::size_t   count) {
             using CHRegs = Regs::CH<static_cast<int>(Channel)>;
 
+            beforeTrigger();
             apply(write(CHRegs::READ_ADDR::read_addr, source));
             apply(write(CHRegs::WRITE_ADDR::write_addr, dest));
             apply(write(CHRegs::TRANS_COUNT::trans_count, count));
@@ -386,7 +396,8 @@ namespace Kvasir { namespace DMA {
                           F&&           f) {
             if constexpr(!std::is_same_v<std::remove_cvref_t<F>, std::nullopt_t>) {
                 if constexpr(DMAConfig::callbackFunctionSize > 0) {
-                    callbackFunctions[static_cast<std::size_t>(Channel)] = std::forward<F>(f);
+                    callbackFunctions[static_cast<std::size_t>(Channel)].publish(
+                      std::forward<F>(f));
                 } else {
                     Fail<void>{};
                 }
@@ -509,10 +520,11 @@ namespace Kvasir { namespace DMA {
             using CHRegs = typename Regs::template CH<static_cast<unsigned>(Channel)>;
             if constexpr(!std::is_same_v<std::remove_cvref_t<F>, std::nullopt_t>) {
                 static_assert(DMAConfig::callbackFunctionSize > 0, "DMA callback not configured");
-                callbackFunctions[static_cast<std::size_t>(Channel)] = std::forward<F>(f);
+                callbackFunctions[static_cast<std::size_t>(Channel)].publish(std::forward<F>(f));
             } else if constexpr(DMAConfig::callbackFunctionSize > 0) {
                 callbackFunctions[static_cast<std::size_t>(Channel)].reset();
             }
+            beforeTrigger();   // AL1_CTRL enables it: a running channel may chain to it at once
             apply(write(CHRegs::READ_ADDR::read_addr, source));
             apply(write(CHRegs::WRITE_ADDR::write_addr, dest));
             apply(write(CHRegs::TRANS_COUNT::trans_count, static_cast<std::uint32_t>(count)));
@@ -532,6 +544,7 @@ namespace Kvasir { namespace DMA {
         static void trigger() {
             static_assert(sizeof...(Cs) > 0);
             constexpr std::uint32_t mask = ((1U << static_cast<unsigned>(Cs)) | ...);
+            beforeTrigger();
             apply(write(Regs::MULTI_CHAN_TRIGGER::multi_chan_trigger, Register::value<mask>()));
         }
 
@@ -613,6 +626,7 @@ namespace Kvasir { namespace DMA {
         template<DMAChannel Channel>
         static void rearm(std::uint32_t count) {
             using CHRegs = Regs::CH<static_cast<int>(Channel)>;
+            beforeTrigger();
             apply(write(CHRegs::AL1_TRANS_COUNT_TRIG::FULLREGISTER, count));
         }
 

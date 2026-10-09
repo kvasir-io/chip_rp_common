@@ -114,33 +114,45 @@ private:
 
     static constexpr std::uint32_t EPBitMask = (1U << ((EP * 2) + (IsIn ? 0 : 1)));
 
+    // At least `cycles` clk_sys cycles: a counted loop, since a Cortex-M may drop a nop from the
+    // pipeline (Armv8-M: "NOP ... not guaranteed to be time consuming"). One turn is a subs and a
+    // taken branch, at least one cycle each.
+    static void waitCycles(std::uint32_t cycles) {
+        asm volatile(
+          ".syntax unified\n"   // gcc assembles Thumb-1 inline asm in divided syntax otherwise
+          "1: subs %0, %0, #1\n"
+          "   bne 1b\n"
+          : "+l"(cycles)
+          :
+          : "cc", "memory");
+    }
+
+    // The controller reads a buffer control on clk_usb, the core writes it on clk_sys. Written
+    // in one store, LENGTH, PID and AVAILABLE can reach the controller in different clk_usb
+    // cycles: it sees AVAILABLE with the last packet's PID or length and sends that -- a stale
+    // PID is a data toggle error, and the host drops the packet as a repeat. So the fields go
+    // first, then at least one clk_usb cycle, then the same value with AVAILABLE (RP2350
+    // datasheet 12.7.3.7.1 and the warning after it; RP2040 4.1.2.7.1). The dsb makes the
+    // wait count from when the first store has reached the DPRAM, not from when it was issued.
     template<std::size_t Buffer,
              bool        Last>
     static void writeBufferControl(bool          pid,
                                    std::uint16_t length) {
         using BC = BufferControlReg<Buffer>;
 
-        static constexpr bool delayAvailable =
-#if __has_include("chip/rp2350.hpp")
-          false;
-#else
-          true;
-#endif
-        BC::overrideDefaultsRuntime(
-          write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
-          write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
-          write(BC::pid, pid ? 1 : 0),
-          write(BC::length, length),
-          write(BC::available, Kvasir::Register::value<std::uint16_t, delayAvailable ? 0 : 1>()));
+        BC::overrideDefaultsRuntime(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
+                                    write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
+                                    write(BC::pid, pid ? 1 : 0),
+                                    write(BC::length, length));
 
-        if constexpr(delayAvailable) {
-            BC::overrideDefaultsRuntime(
-              write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
-              write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
-              write(BC::pid, pid ? 1 : 0),
-              write(BC::length, length),
-              set(BC::available));
-        }
+        asm volatile("dsb" : : : "memory");
+        waitCycles(Base::AvailableDelayCycles);
+
+        BC::overrideDefaultsRuntime(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
+                                    write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
+                                    write(BC::pid, pid ? 1 : 0),
+                                    write(BC::length, length),
+                                    set(BC::available));
     }
 
     static void clearBufferControl() {

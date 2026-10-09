@@ -20,6 +20,7 @@
 #include "kvasir/Register/RegisterFmt.hpp"
 #include "kvasir/Util/RateLimiter.hpp"
 
+#include <atomic>
 #include <bit>
 #include <chip/chip.hpp>
 #include <cstddef>
@@ -60,6 +61,27 @@ private:
             return true;
         }
     }();
+
+    // clk_sys, for the gap between a buffer control's fields and its AVAILABLE bit
+    // (EndpointOps::writeBufferControl). A config that does not say gets the fastest clk_sys
+    // anybody runs these chips at, which only makes the gap longer than it has to be.
+    static constexpr std::uint64_t UsbClockHz = 48'000'000;
+    static constexpr std::uint64_t SysClockHz = [] {
+        if constexpr(requires { ConfigT::sysClockHz; }) {
+            return static_cast<std::uint64_t>(ConfigT::sysClockHz);
+        } else {
+            return std::uint64_t{300'000'000};
+        }
+    }();
+    // RP2350-E12 and RP2040-E16: clk_usb-to-clk_sys events are not synchronised, and get lost
+    // unless clk_sys runs at least 10 % faster than clk_usb. Only a config that states its
+    // sysClockHz is checked: the 300 MHz default passes by construction.
+    static_assert(SysClockHz * 10 >= UsbClockHz * 11,
+                  "USB: clk_sys must run at least 10 % faster than clk_usb (RP2350-E12)");
+    // At least one clk_usb cycle in clk_sys cycles, plus one for the edge the first write
+    // lands on (RP2350 datasheet 12.7.3.7.1: 125 / 48 MHz -> 3 nops).
+    static constexpr std::uint32_t AvailableDelayCycles
+      = static_cast<std::uint32_t>((SysClockHz + UsbClockHz - 1) / UsbClockHz) + 1;
 
     enum class Fault : std::uint8_t {
         epTxError = 1,
@@ -317,9 +339,23 @@ public:
         EP0_OUT::state.setDataPhase();
     }
 
-    static void maskInterrupt() { apply(Kvasir::Nvic::makeDisable(InterruptIndexes)); }
+    // The ICER/ISER writes are volatile stores and order nothing else: the masked section's plain
+    // loads could move above the mask, its stores below the unmask, into reach of the interrupt.
+    // dsb; isb after the mask so an interrupt already on its way is not taken after it either.
+    static void maskInterrupt() {
+        apply(Kvasir::Nvic::makeDisable(InterruptIndexes));
+        asm volatile(
+          "dsb\n"
+          "isb\n"
+          :
+          :
+          : "memory");
+    }
 
-    static void unmaskInterrupt() { apply(Kvasir::Nvic::makeEnable(InterruptIndexes)); }
+    static void unmaskInterrupt() {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        apply(Kvasir::Nvic::makeEnable(InterruptIndexes));
+    }
 
     static void prepare() {
         //can use std::memset here since it should always make alligned access.
