@@ -25,6 +25,10 @@ using XoscStableBound = MicrosecondsBound<100'000>;
 using PllLockBound = MicrosecondsBound<10'000>;
 // RESETS.RESET_DONE: "set once the peripheral is out of reset", no time given; a few clocks of the block.
 using ResetDoneBound = Kvasir::Register::Bound::Polls<1'000>;
+// CLK_SYS_SELECTED / CLK_REF_SELECTED after a glitchless switch, CLK_PERI_CTRL.ENABLED (RP2350) after a disable:
+// two cycles of the old and new clock (RP2040 datasheet 2.15.3.2, RP2350 8.1.3.2). Slowest: clk_ref on the ROSC,
+// >= 1.8 MHz (RP2040 2.17) / 4.6 MHz (RP2350 8.3), possibly divided by a leftover CLK_REF_DIV - 100 us covers /64.
+using ClkSelectedBound = MicrosecondsBound<100>;
 // A read back of a register just written (PSM.FRCE_OFF): a bus round trip.
 using ReadBackBound = Kvasir::Register::Bound::Polls<100>;
 }   // namespace Kvasir::Chip

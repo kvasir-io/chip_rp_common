@@ -23,6 +23,8 @@ namespace Kvasir { namespace PM {
         // Debug/rescue resets
         rescue,         // Rescue reset from debugger
         dp_reset_req,   // Reset request from ARM debugger
+        core_reset,     // RP2040: a reset of core 0 alone (AIRCR.SYSRESETREQ), reported only by
+                        // chip_rp2040 CoreResetGuard.hpp
 
         // Power-related resets
         glitch_detect,   // Power supply glitch
@@ -159,6 +161,26 @@ namespace Kvasir { namespace PM {
         return sources;
     }
 
+#if !__has_include("peripherals/POWMAN.hpp")
+    namespace detail {
+        // CoreResetGuard's word in WATCHDOG SCRATCH3 (RP2040 datasheet 4.7.6): this value after a reset of core 0
+        // alone, else 0. Read once and cleared so a later reset that skips the routine does not inherit it.
+        inline constexpr std::uint32_t CoreResetCarried = 0x4B43'5253U;   // "KCRS"
+        inline std::uint8_t            coreResetCarry{};   // .bss: 0 unread, 1 no, 2 yes
+
+        inline bool coreResetCarried() {
+            if(coreResetCarry == 0) {
+                using WD = Kvasir::Peripheral::WATCHDOG::Registers<>;
+                auto const carried
+                  = get<0>(apply(read(WD::SCRATCH3::FULLREGISTER))) == CoreResetCarried;
+                if(carried) { apply(write(WD::SCRATCH3::FULLREGISTER, Register::value<0>())); }
+                coreResetCarry = carried ? 2 : 1;
+            }
+            return coreResetCarry == 2;
+        }
+    }   // namespace detail
+#endif
+
     inline ResetCause reset_cause() {
 #if __has_include("peripherals/POWMAN.hpp")
         using ChipReset = Kvasir::Peripheral::POWMAN::Registers<>::CHIP_RESET;
@@ -195,6 +217,9 @@ namespace Kvasir { namespace PM {
         using ChipReset = Kvasir::Peripheral::VREG_AND_CHIP_RESET::Registers<>::CHIP_RESET;
         using WdReason  = Kvasir::Peripheral::WATCHDOG::Registers<>::REASON;
 
+        // a reset of core 0 alone leaves REASON and CHIP_RESET as they were: only CoreResetGuard can tell it
+        if(detail::coreResetCarried()) { return ResetCause::core_reset; }
+
         auto wd_reasons = apply(read(WdReason::force), read(WdReason::timer));
         auto chip_reset = apply(read(ChipReset::had_psm_restart),
                                 read(ChipReset::had_run),
@@ -218,6 +243,7 @@ namespace Kvasir { namespace PM {
         case ResetCause::watchdog_timer: return ResetKind::watchdogTimeout;
         case ResetCause::rescue:
         case ResetCause::dp_reset_req:   return ResetKind::debugger;
+        case ResetCause::core_reset:     return ResetKind::softwareRequest;
         case ResetCause::glitch_detect:
         case ResetCause::bor:            return ResetKind::brownOut;
         case ResetCause::por:

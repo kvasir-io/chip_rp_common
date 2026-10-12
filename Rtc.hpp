@@ -106,17 +106,23 @@ namespace Kvasir { namespace Rtc {
         using Provides = brigand::list<Startup::Resource<TimerTag, 0>>;
         using Claims   = Clocks::Claim<Clocks::ClkRef, CrystalHz>;   // clk_ref is the crystal
 
-        static constexpr auto powerClockEnable = list(clear(Resets::RESET::rtc));
+        // clk_rtc from the crystal through /256, set up while the RTC is still in reset. No glitchless mux:
+        // disable, source, enable as separate writes (RP2040 datasheet 2.15.3.2, Table 234); divider before the
+        // enable, as the datasheet asks when the ratio grows. A previous image may have left clk_rtc running.
+        static constexpr auto powerClockEnable = list(
+          clear(Clk::CLK_RTC_CTRL::enable),
+          Register::sequencePoint,
+          write(Clk::CLK_RTC_DIV::_int, Register::value<ClkRtcDiv>()),
+          write(Clk::CLK_RTC_DIV::frac, Register::value<0>()),
+          Clk::CLK_RTC_CTRL::overrideDefaults(write(Clk::CLK_RTC_CTRL::AUXSRCValC::xosc_clksrc)),
+          Register::sequencePoint,
+          set(Clk::CLK_RTC_CTRL::enable),
+          Register::sequencePoint,
+          clear(Resets::RESET::rtc));
 
-        // clk_rtc from the crystal through /256 (the divider first, as the datasheet asks
-        // when the ratio grows), then the block's 1 Hz divider.
+        // the block's 1 Hz divider
         static constexpr auto initStepPeripheryConfig
-          = list(write(Clk::CLK_RTC_DIV::_int, Register::value<ClkRtcDiv>()),
-                 write(Clk::CLK_RTC_DIV::frac, Register::value<0>()),
-                 Clk::CLK_RTC_CTRL::overrideDefaults(
-                   write(Clk::CLK_RTC_CTRL::AUXSRCValC::xosc_clksrc),
-                   write(Clk::CLK_RTC_CTRL::enable, Register::value<1>())),
-                 write(Regs::CLKDIV_M1::clkdiv_m1, Register::value<ClkRtcHz - 1>()));
+          = list(write(Regs::CLKDIV_M1::clkdiv_m1, Register::value<ClkRtcHz - 1>()));
 
         [[nodiscard]] static bool running() { return apply(read(Regs::CTRL::active)); }
 

@@ -7,6 +7,7 @@
 #include "core/Nvic.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/StartUp/RamVectorTable.hpp"
+#include "kvasir/Util/Panic.hpp"
 #include "kvasir/Util/attributes.hpp"
 #include "peripherals/CLOCKS.hpp"
 
@@ -120,6 +121,11 @@ namespace Kvasir { namespace Clocks {
                              std::conditional_t<Gpout == 2,
                                                 typename Clk::CLK_GPOUT2_DIV,
                                                 typename Clk::CLK_GPOUT3_DIV>>>;
+
+        // GPOUT has no glitchless mux: disable, wait two cycles of the old source, change AUXSRC, enable (RP2040
+        // datasheet 2.15.3.2, RP2350 8.1.3.2). A previous image may have left it running; the pin step between this
+        // disable and the AUXSRC write in PeripheryConfig is the wait.
+        static constexpr auto powerClockEnable = list(clear(Ctrl::enable));
 
         // The clock-output GPIO function: F9 on the RP2350, F8 on the RP2040.
         static constexpr auto initStepPinConfig = list(action(
@@ -353,7 +359,10 @@ namespace Kvasir { namespace Clocks {
     //      back; otherwise the slow one stays and `report().repaired` is false,
     //   6. counts the event and calls Config::onResus(bool repaired) if there is one - from
     //      the interrupt, which preempts lower-priority ones, so keep it short: a flag, or a
-    //      log line (written with interrupts masked, see uc_log's IsrRecordGuard).
+    //      log line (written with interrupts masked, see uc_log's IsrRecordGuard),
+    //   7. with Config::panicOnFailure and a failed repair: Panic::raiseAt(clockFailure, 0,
+    //      kHz after), so the reset brings the clocks up again. Without it clk_sys stays on
+    //      clk_ref and every peripheral clocked from it runs at the wrong rate.
     //
     // Steps 1-5 run with interrupts masked (PRIMASK): until step 1 no handler may run from
     // flash, and SysTick at priority 0 would preempt this one; the QMI timing writes also
@@ -377,6 +386,7 @@ namespace Kvasir { namespace Clocks {
     //         static constexpr auto timeout     = 255;   // clk_ref cycles, 21 us at 12 MHz
     //         static constexpr auto isrPriority = 1;
     //         static void onResus(bool repaired) { ... }   // optional
+    //         static constexpr bool panicOnFailure = true;  // optional, default false
     //     };
     //     using Resus = Kvasir::Clocks::Resus<HW::ClockSettings, ResusConfig>;
     struct ResusTag {};
@@ -412,6 +422,13 @@ namespace Kvasir { namespace Clocks {
                     return static_cast<int>(Config_::isrPriority);
                 } else {
                     return 2;
+                }
+            }();
+            static constexpr bool panicOnFailure = [] {
+                if constexpr(requires { Config_::panicOnFailure; }) {
+                    return static_cast<bool>(Config_::panicOnFailure);
+                } else {
+                    return false;
                 }
             }();
         };
@@ -534,6 +551,11 @@ namespace Kvasir { namespace Clocks {
             events_.fetch_add(1, std::memory_order_relaxed);
             if constexpr(requires { Config_::onResus(true); }) { Config_::onResus(ok); }
             stage_.store(6, std::memory_order_relaxed);
+
+            // 7. a clock that did not come back is not run on
+            if constexpr(Config::panicOnFailure) {
+                if(!ok) { Kvasir::Panic::raiseAt(Kvasir::Panic::Cause::clockFailure, 0, after); }
+            }
         }
 
         static constexpr Nvic::Isr<std::addressof(onIsr), NvicIndex> isr{};

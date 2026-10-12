@@ -12,6 +12,20 @@
 #include <kvasir/Util/StaticString.hpp>
 #include <kvasir/Util/attributes.hpp>
 #include <string_view>
+
+// Microsecond counter for Kvasir::AnnouncedReset: TIMERAWL, side-effect-free (RP2040 datasheet 4.6.5, TIMER_BASE
+// 0x40054000 + 0x28; RP2350 datasheet 12.8, TIMER0_BASE 0x400b0000 + 0x28), safe from a fault handler; it stands still
+// until the clock set-up starts the tick (AnnouncedReset then counts polls). Weak, not inline (gcc refuses weak
+// inline): the linker keeps one copy.
+extern "C" [[gnu::weak,
+             gnu::used]] std::uint32_t
+kvasir_announced_reset_time_us() {
+#if __has_include("chip/rp2350.hpp")
+    return *reinterpret_cast<std::uint32_t const volatile*>(0x400b'0028U);
+#else
+    return *reinterpret_cast<std::uint32_t const volatile*>(0x4005'4028U);
+#endif
+}
 #if __has_include("peripherals/QMI.hpp")
     #include "peripherals/QMI.hpp"
 #endif
@@ -272,11 +286,16 @@ namespace detail {
         using RomFlashFlushCache      = void (*)(void);
         using XipEnableFunction       = void (*)(void);
 
-        RomConnectInternalFlash const       connectInternalFlash;
-        RomFlashExitXip const               flashExitXip;
-        RomFlashFlushCache const            flushCache;
-        std::array<std::uint32_t, 64> const xipEnableRamCopy;
-        XipEnableFunction const             xipEnable;
+        RomConnectInternalFlash const connectInternalFlash;
+        RomFlashExitXip const         flashExitXip;
+        RomFlashFlushCache const      flushCache;
+        XipEnableFunction const       xipEnable;
+
+        // The XIP setup function, copied out of BOOTRAM (never executable) into .ramExec, the
+        // image's writable and executable range (chip Mpu.hpp; the stack is never executed).
+        [[KVASIR_SECTION_MEMBER(".ramExec")]] alignas(
+          4) static inline std::array<std::uint32_t,
+                                      64> xipEnableRamCopy{};
 
 #if __has_include("peripherals/QMI.hpp")
         std::uint32_t flashTiming;
@@ -304,9 +323,10 @@ namespace detail {
           , flushCache{Kvasir::RomFunctions::getRomFunctionPointer<'F',
                                                                    'C',
                                                                    RomFlashFlushCache>()}
-          , xipEnableRamCopy{getXipEnable()}
           , xipEnable{reinterpret_cast<XipEnableFunction>(
               const_cast<std::byte*>(std::as_bytes(std::span{xipEnableRamCopy}).data() + 1))} {
+            xipEnableRamCopy = getXipEnable();
+            asm volatile("dsb\n isb" ::: "memory");   // the copy is code from here on
 #if __has_include("peripherals/QMI.hpp")
             using namespace Kvasir::Peripheral::QMI;
             using QMI   = Registers<0>;

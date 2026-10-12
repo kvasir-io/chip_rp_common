@@ -23,6 +23,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace Kvasir { namespace Clocks {
     // The two PLLs by name: the system PLL feeds clk_sys, the USB PLL clk_usb and clk_adc.
@@ -38,6 +39,22 @@ namespace Kvasir { namespace DefaultClockSettings {
     using Provides = Clocks::DefaultProvides<ClockSpeed, CrystalSpeed>;
 
     namespace detail {
+        // CLK_x_SELECTED == 1 << src, one decoded bit per CTRL SRC value (RP2040 datasheet Tables 222/225, RP2350
+        // Tables 558/561), as a whole-register wait condition (the RP2040 SVD has no field); may read 0 mid-switch.
+        template<typename Selected, unsigned Src>
+        inline constexpr auto selectedIs = Kvasir::Register::FieldValue<
+          typename std::remove_cvref_t<decltype(Selected::FULLREGISTER)>::type,
+          (std::uint32_t{1} << Src)>{};
+
+        // At least N cycles of clk_sys, for a wait no status bit reports
+        template<unsigned N>
+        [[gnu::always_inline]] inline void spinCycles() {
+            for(unsigned i = 0; i != (N + 1) / 2; ++i) {
+                asm volatile("nop" ::
+                               : "memory");   // + the loop's own instructions: >= 2 cycles a pass
+            }
+        }
+
         namespace impl {
             template<auto CrystalSpeed,
                      typename Reg>
@@ -257,6 +274,9 @@ namespace Kvasir { namespace DefaultClockSettings {
         using REF_CLOCK_DIV = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_DIV;
         using USB_CLOCK     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_USB_CTRL;
         using ADC_CLOCK     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_ADC_CTRL;
+        using SYS_DIV       = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_DIV;
+        using SYS_SELECTED  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_SELECTED;
+        using REF_SELECTED  = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_SELECTED;
         using XOSC          = Kvasir::Peripheral::XOSC::Registers<>;
         using RST           = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL           = Kvasir::Peripheral::PLL::Registers<0>;
@@ -268,21 +288,46 @@ namespace Kvasir { namespace DefaultClockSettings {
         vregInit<ClockSpeed>();
         flashInit<ClockSpeed, MaxFlashFreq>();
 
-        // disable periphery clocks
-        apply(PERI_CLOCK::overrideDefaults(clear(PERI_CLOCK::enable)));
+        // After a core-only reset (RP2040 datasheet 2.4.2.9, RP2350 7.3.1) clk_sys may still run on PLL_SYS via its
+        // aux mux. So: glitchless muxes to safe sources first (polling CLK_x_SELECTED), aux muxes changed only while
+        // deselected, generators without a glitchless mux disabled for two source cycles first (RP2040 2.15.3.2,
+        // RP2350 8.1.3.2). Field writes on purpose: overrideDefaults would also reset AUXSRC (RP2350 Table 559).
+        apply(write(REF_CLOCK::SRCValC::rosc_clksrc_ph));
+        Kvasir::Register::waitUntil<Kvasir::Chip::ClkSelectedBound>(
+          detail::selectedIs<REF_SELECTED, 0>);
+        apply(write(SYS_CLOCK::SRCValC::clk_ref));
+        Kvasir::Register::waitUntil<Kvasir::Chip::ClkSelectedBound>(
+          detail::selectedIs<SYS_SELECTED, 0>);
+        // a previous image's divider would stay: INT 1, FRAC 0 (RP2040 Table 224, RP2350 Table 560); changing
+        // it on the fly is allowed (RP2040 2.15.3.3, RP2350 8.1.3.3)
+        apply(write(SYS_DIV::_int, value<std::uint32_t{1}>()),
+              write(SYS_DIV::frac, value<std::uint32_t{0}>()));
 
-        // set ref clock to default
-        apply(REF_CLOCK::overrideDefaults(write(REF_CLOCK::SRCValC::rosc_clksrc_ph)));
+        // clk_peri has no glitchless mux: disable, let it stop, aux to clk_sys; enabled again after the PLL. Its
+        // destinations (UART, SPI) are held in reset by FirstInitStep as well.
+        apply(clear(PERI_CLOCK::enable));
+#if __has_include("peripherals/POWMAN.hpp")
+        // CTRL.ENABLED follows ENABLE once the generator has stopped (RP2350 Table 562, 8.1.3.2)
+        Kvasir::Register::waitUntil<Kvasir::Chip::ClkSelectedBound>(
+          Kvasir::Register::isClear(PERI_CLOCK::enabled));
+        // never written before: INT 1 (Table 563, reset 1)
+        apply(write(Kvasir::Peripheral::CLOCKS::Registers<>::CLK_PERI_DIV::_int,
+                    value<std::uint32_t{1}>()));
+#else
+        // the RP2040 has no ENABLED bit: two cycles of the old source (clk_sys or slower) pass in these
+        detail::spinCycles<64>();
+#endif
+        apply(write(PERI_CLOCK::AUXSRCValC::clk_sys));
 
-        // set sysclock to default
-        apply(SYS_CLOCK::overrideDefaults(write(SYS_CLOCK::SRCValC::clk_ref)));
+        // clk_usb / clk_adc off before PLL_USB is reset below (their destinations are in reset already)
+        apply(clear(USB_CLOCK::enable), clear(ADC_CLOCK::enable));
 
         // A clk_sys resus (Clocks::Resus) survives a core reset: the clocks block is not
         // reset by SYSRESETREQ, so after an unhandled event every debugger reset boots with
         // clk_sys forced to clk_ref, the PLL switch below has no effect, and the flash
         // timing peripheryClockInit() applies for ClockSpeed reads garbage at 12 MHz - a
         // HardFault before main, on every reset, until the resus is released.
-        // clk_sys is explicitly on clk_ref now, so releasing it changes nothing here.
+        // clk_sys is on clk_ref now (CLK_SYS_SELECTED said so), so releasing it changes nothing here.
         {
             using RESUS_CTRL   = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_RESUS_CTRL;
             using RESUS_STATUS = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_RESUS_STATUS;
@@ -324,16 +369,20 @@ namespace Kvasir { namespace DefaultClockSettings {
                                              clear(PLL::PWR::pd),
                                              clear(PLL::PWR::postdivpd)));
 
-            // set sysclock to pll
-            apply(SYS_CLOCK::overrideDefaults(write(SYS_CLOCK::SRCValC::clksrc_clk_sys_aux),
-                                              write(SYS_CLOCK::AUXSRCValC::clksrc_pll_sys)));
+            // clk_sys to the PLL: the aux mux first, while the glitchless mux is still on clk_ref, then the switch
+            apply(write(SYS_CLOCK::AUXSRCValC::clksrc_pll_sys));
+            apply(write(SYS_CLOCK::SRCValC::clksrc_clk_sys_aux));
+            Kvasir::Register::waitUntil<Kvasir::Chip::ClkSelectedBound>(
+              detail::selectedIs<SYS_SELECTED, 1>);
 
             // set ref clock to xosc, undivided (boot may leave CLK_REF_DIV != 1)
             apply(write(REF_CLOCK_DIV::_int, value<std::uint32_t{1}>()));
-            apply(REF_CLOCK::overrideDefaults(write(REF_CLOCK::SRCValC::xosc_clksrc)));
+            apply(write(REF_CLOCK::SRCValC::xosc_clksrc));
+            Kvasir::Register::waitUntil<Kvasir::Chip::ClkSelectedBound>(
+              detail::selectedIs<REF_SELECTED, 2>);
 
-            // enable periphery clock
-            apply(PERI_CLOCK::overrideDefaults(set(PERI_CLOCK::enable)));
+            // enable periphery clock (its AUXSRC is clk_sys since above)
+            apply(set(PERI_CLOCK::enable));
         }
 
         {   //usb pll
@@ -365,11 +414,10 @@ namespace Kvasir { namespace DefaultClockSettings {
                                                 clear(USBPLL::PWR::pd),
                                                 clear(USBPLL::PWR::postdivpd)));
 
-            // enable periphery clock
-            apply(USB_CLOCK::overrideDefaults(set(USB_CLOCK::enable),
-                                              write(USB_CLOCK::AUXSRCValC::clksrc_pll_usb)));
-            apply(ADC_CLOCK::overrideDefaults(set(ADC_CLOCK::enable),
-                                              write(ADC_CLOCK::AUXSRCValC::clksrc_pll_usb)));
+            // clk_usb / clk_adc: no glitchless mux - the source while disabled, then the enable
+            apply(write(USB_CLOCK::AUXSRCValC::clksrc_pll_usb),
+                  write(ADC_CLOCK::AUXSRCValC::clksrc_pll_usb));
+            apply(set(USB_CLOCK::enable), set(ADC_CLOCK::enable));
         }
     }
 
