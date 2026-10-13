@@ -112,7 +112,13 @@ private:
                            typename BufferRegs::template EP<EP>::IN_BUFFER_CONTROL,
                            typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL>;
 
-    static constexpr std::uint32_t EPBitMask = (1U << ((EP * 2) + (IsIn ? 0 : 1)));
+    // This endpoint's bit in the per-endpoint registers (EP_ABORT, EP_ABORT_DONE,
+    // BUFF_CPU_SHOULD_HANDLE, ...): ep0_in, ep0_out, ep1_in, ... The SVD names each bit as a field
+    // of its own, so the bit is picked out of FULLREGISTER by index.
+    static constexpr unsigned EPBit    = (EP * 2) + (IsIn ? 0 : 1);
+    static constexpr auto     abortBit = Kvasir::Register::bit<EPBit>(Regs::EP_ABORT::FULLREGISTER);
+    static constexpr auto     cpuShouldHandleBit
+      = Kvasir::Register::bit<EPBit>(Regs::BUFF_CPU_SHOULD_HANDLE::FULLREGISTER);
 
     // At least `cycles` clk_sys cycles: a counted loop, since a Cortex-M may drop a nop from the
     // pipeline (Armv8-M: "NOP ... not guaranteed to be time consuming"). One turn is a subs and a
@@ -339,9 +345,7 @@ public:
         static_assert(!IsIn, "read only on OUT endpoint");
 
         if constexpr(DoubleBuffered) {
-            std::uint32_t const buffers = apply(read(Regs::BUFF_CPU_SHOULD_HANDLE::FULLREGISTER));
-
-            bool const buffer0 = (buffers & EPBitMask) == 0;
+            bool const buffer0 = apply(read(cpuShouldHandleBit)) == 0;
 
             // The cursor has moved on to the other buffer when this one was armed.
             if(buffer0) {
@@ -395,14 +399,12 @@ public:
         }
     }
 
-    static void abort() {
-        std::uint32_t const aborts = apply(read(Regs::EP_ABORT::FULLREGISTER));
-        apply(write(Regs::EP_ABORT::FULLREGISTER, aborts | EPBitMask));
-    }
+    // EP_ABORT is shared by every endpoint and written from the USB interrupt too: one store to its
+    // SET / CLR alias (RP2040 datasheet 2.1.2, RP2350 2.1.3), no read-modify-write to race with.
+    static void abort() { apply(Kvasir::Register::atomic(set(abortBit))); }
 
     static void abortDone() {
-        std::uint32_t const aborts = apply(read(Regs::EP_ABORT::FULLREGISTER));
-        apply(write(Regs::EP_ABORT::FULLREGISTER, aborts & ~EPBitMask));
+        apply(Kvasir::Register::atomic(clear(abortBit)));
         clearBufferControl();
     }
 

@@ -6,6 +6,7 @@
 #endif
 
 #include "Clocks.hpp"
+#include "WatchdogTick.hpp"
 #include "kvasir/Util/HealthKey.hpp"
 #include "peripherals/WATCHDOG.hpp"
 
@@ -244,6 +245,7 @@ public:
     /// counts on its 1 ms timer for that; a trigger has no such delay).
     [[noreturn]] static void trigger() {
 #if __has_include("peripherals/TICKS.hpp")
+        detail::keepWatchdogTickRunning();   // or the reset does not keep SRAM (WatchdogTick.hpp)
         powmanOffClkRef();
         for(std::uint32_t volatile i = 0; i != 1000; i = i + 1) {}
 #endif

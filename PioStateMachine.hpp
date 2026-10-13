@@ -1004,11 +1004,10 @@ namespace Kvasir { namespace Pio {
             // base below counts from this window.
             Kvasir::Pio::applyGpioBase<Instance, GpioBase>();
 
-            auto* addr = reinterpret_cast<std::uint16_t volatile*>(
-              PioRegs::template INSTR_MEM<Offset>::Addr::value);
-            for(auto const v : RelocatedInstructions) {
-                *addr = v;
-                addr += 2;   // one 32-bit register per instruction slot
+            // one 32-bit register per instruction slot, the instruction in bits 15:0
+            using InstrMem = Kvasir::Register::Array<PioRegs::template INSTR_MEM, 32>;
+            for(unsigned i = 0; i < RelocatedInstructions.size(); ++i) {
+                InstrMem::writeWhole(Offset + i, RelocatedInstructions[i]);
             }
 
             setPinLevels(std::remove_cvref_t<decltype(Config::pinsInitialHigh)>{}, true);

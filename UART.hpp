@@ -718,8 +718,8 @@ namespace Kvasir { namespace UART {
         inline static Kvasir::CountLimiter<> overrunLog_{};
         inline static Kvasir::CountLimiter<> characterErrorLog_{};
 
-        // UARTDR's FE (8), PE (9) and BE (10).
-        static constexpr std::uint32_t CharacterErrors = 0x7U << 8;
+        static constexpr std::uint32_t CharacterErrors
+          = Regs::UARTDR::fe.Mask | Regs::UARTDR::pe.Mask | Regs::UARTDR::be.Mask;
 
         // How often the receive interrupt ran: with the FIFO on, a fraction of the bytes.
         inline static std::atomic<std::uint32_t> rxInterrupts{0};

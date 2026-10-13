@@ -208,15 +208,18 @@ namespace Kvasir { namespace Clocks {
         /// The fraction as hundredths of a kHz, for a "{}.{:02} kHz" log line.
         [[nodiscard]] constexpr std::uint32_t hundredths() const { return (frac32 * 100U) / 32U; }
 
-        [[nodiscard]] constexpr bool pass() const { return (status & 1U) != 0; }
+        [[nodiscard]] constexpr bool pass() const { return (status & Status::pass.Mask) != 0; }
 
-        [[nodiscard]] constexpr bool fail() const { return (status & (1U << 16)) != 0; }
+        [[nodiscard]] constexpr bool fail() const { return (status & Status::fail.Mask) != 0; }
 
-        [[nodiscard]] constexpr bool slow() const { return (status & (1U << 20)) != 0; }
+        [[nodiscard]] constexpr bool slow() const { return (status & Status::slow.Mask) != 0; }
 
-        [[nodiscard]] constexpr bool fast() const { return (status & (1U << 24)) != 0; }
+        [[nodiscard]] constexpr bool fast() const { return (status & Status::fast.Mask) != 0; }
 
-        [[nodiscard]] constexpr bool died() const { return (status & (1U << 28)) != 0; }
+        [[nodiscard]] constexpr bool died() const { return (status & Status::died.Mask) != 0; }
+
+    private:
+        using Status = Kvasir::Peripheral::CLOCKS::Registers<>::FC0_STATUS;
     };
 
     namespace detail {
@@ -279,39 +282,30 @@ namespace Kvasir { namespace Clocks {
                                                                    std::uint32_t minKhz,
                                                                    std::uint32_t maxKhz) {
             KVASIR_RAM_FUNC_MARK();
-            auto* const ref
-              = reinterpret_cast<std::uint32_t volatile*>(Clk::FC0_REF_KHZ::Addr::value);
-            auto* const min
-              = reinterpret_cast<std::uint32_t volatile*>(Clk::FC0_MIN_KHZ::Addr::value);
-            auto* const max
-              = reinterpret_cast<std::uint32_t volatile*>(Clk::FC0_MAX_KHZ::Addr::value);
-            auto* const delay
-              = reinterpret_cast<std::uint32_t volatile*>(Clk::FC0_DELAY::Addr::value);
-            auto* const ival
-              = reinterpret_cast<std::uint32_t volatile*>(Clk::FC0_INTERVAL::Addr::value);
-            auto* const srcR = reinterpret_cast<std::uint32_t volatile*>(Clk::FC0_SRC::Addr::value);
-            auto* const stat
-              = reinterpret_cast<std::uint32_t const volatile*>(Clk::FC0_STATUS::Addr::value);
-            auto* const res
-              = reinterpret_cast<std::uint32_t const volatile*>(Clk::FC0_RESULT::Addr::value);
+            // the register layer is always inlined: nothing here calls into flash. The FC0 value registers are
+            // written whole (one field each), the status polled by field.
+            using namespace Kvasir::Register;
+            using Status
+              = Clk::FC0_STATUS;   // no lambda for the reads: gcc at -Og leaves one in flash
 
             // running: it runs even for source null
             std::uint32_t polls = PollLimit;
-            while((*stat & (1U << 8)) != 0) {
-                if(--polls == 0) { return Frequency{0, 0, *stat, true}; }
+            while(get<0>(apply(read(Status::running))) != 0) {
+                if(--polls == 0) { return Frequency{0, 0, readWhole(Status::FULLREGISTER), true}; }
             }
-            *ref   = RefKhz;
-            *min   = minKhz;
-            *max   = maxKhz;
-            *delay = 1;
-            *ival  = interval & 0xFU;
-            *srcR  = src;   // starts the count
-            polls  = PollLimit;
-            while((*stat & (1U << 4)) == 0) {   // done
-                if(--polls == 0) { return Frequency{0, 0, *stat, true}; }
+            writeWhole(Clk::FC0_REF_KHZ::FULLREGISTER, RefKhz);
+            writeWhole(Clk::FC0_MIN_KHZ::FULLREGISTER, minKhz);
+            writeWhole(Clk::FC0_MAX_KHZ::FULLREGISTER, maxKhz);
+            writeWhole(Clk::FC0_DELAY::FULLREGISTER, 1U);
+            apply(write(Clk::FC0_INTERVAL::fc0_interval, interval));
+            writeWhole(Clk::FC0_SRC::FULLREGISTER, src);   // starts the count
+            polls = PollLimit;
+            while(get<0>(apply(read(Status::done))) == 0) {
+                if(--polls == 0) { return Frequency{0, 0, readWhole(Status::FULLREGISTER), true}; }
             }
-            auto const r = *res;
-            return Frequency{r >> 5, r & 31U, *stat, false};
+            auto const r
+              = apply(read(Clk::FC0_RESULT::khz), read(Clk::FC0_RESULT::frac));   // one load
+            return Frequency{get<0>(r), get<1>(r), readWhole(Status::FULLREGISTER), false};
         }
 
         static Frequency measure(Source        s,
@@ -482,20 +476,17 @@ namespace Kvasir { namespace Clocks {
             // in RAM for steps 1-3 (the flash may not be readable when it is entered); step 4
             // calls coreClockInit() in flash on purpose, after step 1 made it readable again
             KVASIR_RAM_FUNC_MARK_CALLS_FLASH();
-            auto* const ints
-              = reinterpret_cast<std::uint32_t const volatile*>(Clk::INTS::Addr::value);
-            auto* const resusCtrl
-              = reinterpret_cast<std::uint32_t volatile*>(Clk::CLK_SYS_RESUS_CTRL::Addr::value);
-            auto* const sysCtrl
-              = reinterpret_cast<std::uint32_t volatile*>(Clk::CLK_SYS_CTRL::Addr::value);
-            auto* const sysSelected
-              = reinterpret_cast<std::uint32_t const volatile*>(Clk::CLK_SYS_SELECTED::Addr::value);
-            constexpr std::uint32_t ClearBit  = 1U << 16;
-            constexpr std::uint32_t SrcMask   = 0x3U;   // CLK_SYS_CTRL.SRC: 0 clk_ref, 1 aux
+            // the register layer is always inlined (fields and readWhole alike): nothing here calls into flash
+            // until step 4
+            using namespace Kvasir::Register;
+            using Selected
+              = Clk::CLK_SYS_SELECTED;   // no lambda for the reads: gcc at -Og leaves one in flash
+            // CLK_SYS_SELECTED is one-hot over CLK_SYS_CTRL.SRC (RP2040 datasheet Table 225, RP2350 datasheet
+            // Table 561; the RP2040 SVD names no field): bit 0 clk_ref, bit 1 the aux source
             constexpr std::uint32_t SelClkRef = 1U << 0;
             constexpr std::uint32_t SelAux    = 1U << 1;
 
-            if((*ints & 1U) == 0) { return; }
+            if(get<0>(apply(read(Clk::INTS::clk_sys_resus))) == 0) { return; }
 
             std::uint32_t primask{};
             asm volatile("mrs %0, primask\n cpsid i" : "=r"(primask)::"memory");
@@ -523,10 +514,11 @@ namespace Kvasir { namespace Clocks {
                              std::memory_order_relaxed);
 
             // 3. clk_sys explicitly on clk_ref, then release the resus
-            *sysCtrl = *sysCtrl & ~SrcMask;
-            while((*sysSelected & SelClkRef) == 0) {}
-            *resusCtrl = *resusCtrl | ClearBit;
-            *resusCtrl = *resusCtrl & ~ClearBit;
+            apply(write(Clk::CLK_SYS_CTRL::SRCValC::clk_ref));
+            while((readWhole(Selected::FULLREGISTER) & SelClkRef) == 0) {}
+            using ResusCtrl = Clk::CLK_SYS_RESUS_CTRL;
+            apply(set(ResusCtrl::clear));
+            apply(Kvasir::Register::clear(ResusCtrl::clear));
             stage_.store(3, std::memory_order_relaxed);
 
             // 4. the boot's clock init
@@ -537,8 +529,8 @@ namespace Kvasir { namespace Clocks {
             auto const after = Fc::measureRaw(srcClkSys, 8, Fc::NoMin, Fc::NoMax).khz;
             khzAfter_.store(after, std::memory_order_relaxed);
             constexpr std::uint32_t want = static_cast<std::uint32_t>(ClkSysHz / 1000);
-            bool const              ok = (*sysSelected & SelAux) != 0 && after > want - want / 100U
-                                      && after < want + want / 100U;
+            bool const              ok   = (readWhole(Selected::FULLREGISTER) & SelAux) != 0
+                                        && after > want - want / 100U && after < want + want / 100U;
 #if __has_include("peripherals/QMI.hpp")
             if(ok) { Kvasir::detail::XipReadMode::apply(timing); }
 #endif

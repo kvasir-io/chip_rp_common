@@ -83,7 +83,7 @@ struct ExecuteSeam<
     static constexpr unsigned clrBits = Mask & ~Data;   // bits to end up 0
 
     template<unsigned Alias>
-    static void store(unsigned v) {
+    [[gnu::always_inline]] static void store(unsigned v) {
 #ifdef KVASIR_REGISTER_MOCK
         ::Kvasir::Test::write<T, A + Alias>(static_cast<T>(v));
 #else
@@ -91,7 +91,7 @@ struct ExecuteSeam<
 #endif
     }
 
-    unsigned operator()(unsigned = 0) {
+    [[gnu::always_inline]] unsigned operator()(unsigned = 0) {
         if constexpr(clrBits == 0) {
             store<Rp::aliasSet>(setBits);   // one store, no read
         } else if constexpr(setBits == 0) {

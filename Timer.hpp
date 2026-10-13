@@ -276,6 +276,18 @@ private:
         }
     }
 
+    static constexpr auto intrField() {
+        if constexpr(N == 0) {
+            return Regs::INTR::alarm_0;
+        } else if constexpr(N == 1) {
+            return Regs::INTR::alarm_1;
+        } else if constexpr(N == 2) {
+            return Regs::INTR::alarm_2;
+        } else {
+            return Regs::INTR::alarm_3;
+        }
+    }
+
     static constexpr auto intfField() {
         if constexpr(N == 0) {
             return Regs::INTF::alarm_0;
@@ -294,10 +306,9 @@ private:
 
 public:
     // Startup: enable this alarm's interrupt in the block and in the NVIC. INTR is
-    // write-one-to-clear, so the whole-register write below touches only this bit.
+    // write-one-to-clear: the reset() writes this alarm's bit alone, one store.
     static constexpr auto initStepPeripheryConfig
-      = list(Register::write(Regs::INTR::FULLREGISTER, Register::value<std::uint32_t, bit>()),
-             set(inteField()));
+      = list(Register::reset(intrField()), set(inteField()));
 
     static constexpr auto initStepInterruptConfig
       = list(Nvic::makeSetPriority<Priority>(Irq{}), Nvic::makeClearPending(Irq{}));
@@ -334,7 +345,7 @@ public:
 
     /// Cancel a pending alarm (ARMED is write-one-to-clear).
     static void disarm() {
-        apply(Register::write(Regs::ARMED::FULLREGISTER, Register::value<std::uint32_t, bit>()));
+        apply(Register::write(Regs::ARMED::armed, Register::value<std::uint32_t, bit>()));
     }
 
     [[nodiscard]] static bool armed() {
@@ -343,7 +354,7 @@ public:
 
     static void onIsr() {
         apply(clear(intfField()));
-        apply(Register::write(Regs::INTR::FULLREGISTER, Register::value<std::uint32_t, bit>()));
+        apply(Register::reset(intrField()));
         F();
     }
 

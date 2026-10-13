@@ -259,10 +259,10 @@ public:
         // DEV_SUSPEND: "set when the device suspend state changes. Cleared by writing to
         // SIE_STATUS.SUSPENDED"; DEV_RESUME_FROM_HOST: "cleared by writing to SIE_STATUS.RESUME"
         // (RP2040 datasheet 4.1.4, RP2350 datasheet 12.6.10: the INTR register). Which way it changed is what
-        // SUSPENDED said when the interrupt was taken. Written through the whole register: the
-        // RP2350's SVD has SUSPENDED as read-only.
+        // SUSPENDED said when the interrupt was taken. Both bits are write-one-to-clear in
+        // both chips' SVDs: reset() writes the one bit.
         if(status[Regs::INTS::dev_suspend]) {
-            apply(write(Regs::SIE_STATUS::FULLREGISTER, Regs::SIE_STATUS::suspended.Mask));
+            apply(reset(Regs::SIE_STATUS::suspended));
             if(sieStatus & Regs::SIE_STATUS::suspended.Mask) {
                 Sink::suspend();
             } else {
@@ -270,7 +270,7 @@ public:
             }
         }
         if(status[Regs::INTS::dev_resume_from_host]) {
-            apply(write(Regs::SIE_STATUS::FULLREGISTER, Regs::SIE_STATUS::resume.Mask));
+            apply(reset(Regs::SIE_STATUS::resume));
             Sink::resume();
         }
 

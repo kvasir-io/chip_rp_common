@@ -1,13 +1,18 @@
 #pragma once
 #include "peripherals/PSM.hpp"
+#include "peripherals/TIMER.hpp"
 #include "peripherals/WATCHDOG.hpp"
-#if __has_include("peripherals/TICKS.hpp")   // the RP2350: SYSCFG.AUXCTRL for watchdogReboot()
+#if __has_include(                                                                           \
+  "peripherals/TICKS.hpp")   // the RP2350: SYSCFG.AUXCTRL and the tick for watchdogReboot()
+    #include "WatchdogTick.hpp"
     #include "peripherals/SYSCFG.hpp"
 #endif
 
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <kvasir/Register/Register.hpp>
+#include <kvasir/StartUp/LinkerSymbols.hpp>
 #include <kvasir/Util/AnnouncedReset.hpp>
 #include <kvasir/Util/StaticString.hpp>
 #include <kvasir/Util/attributes.hpp>
@@ -16,18 +21,17 @@
 // Microsecond counter for Kvasir::AnnouncedReset: TIMERAWL, side-effect-free (RP2040 datasheet 4.6.5, TIMER_BASE
 // 0x40054000 + 0x28; RP2350 datasheet 12.8, TIMER0_BASE 0x400b0000 + 0x28), safe from a fault handler; it stands still
 // until the clock set-up starts the tick (AnnouncedReset then counts polls). Weak, not inline (gcc refuses weak
-// inline): the linker keeps one copy.
+// inline): the linker keeps one copy. TIMER instance 0 is TIMER0 on the RP2350, the one TIMER on the RP2040.
 extern "C" [[gnu::weak,
              gnu::used]] std::uint32_t
 kvasir_announced_reset_time_us() {
-#if __has_include("chip/rp2350.hpp")
-    return *reinterpret_cast<std::uint32_t const volatile*>(0x400b'0028U);
-#else
-    return *reinterpret_cast<std::uint32_t const volatile*>(0x4005'4028U);
-#endif
+    return get<0>(apply(read(Kvasir::Peripheral::TIMER::Registers<0>::TIMERAWL::FULLREGISTER)));
 }
 #if __has_include("peripherals/QMI.hpp")
     #include "peripherals/QMI.hpp"
+#endif
+#if __has_include("peripherals/BOOTRAM.hpp")   // the RP2350
+    #include "peripherals/BOOTRAM.hpp"
 #endif
 
 namespace Kvasir {
@@ -132,27 +136,31 @@ namespace detail {
                                                                  std::size_t      rxSize,
                                                                  std::uint32_t    clkdiv) {
         KVASIR_RAM_FUNC_MARK();
-        using QMI        = Kvasir::Peripheral::QMI::Registers<0>;
-        auto* const csr  = reinterpret_cast<std::uint32_t volatile*>(QMI::DIRECT_CSR::Addr::value);
-        auto* const txr  = reinterpret_cast<std::uint32_t volatile*>(QMI::DIRECT_TX::Addr::value);
-        auto* const rxr  = reinterpret_cast<std::uint32_t volatile*>(QMI::DIRECT_RX::Addr::value);
-        *csr             = (clkdiv << 22) | (1U << 2) | 1U;   // clkdiv, assert_cs0n, en
+        using QMI = Kvasir::Peripheral::QMI::Registers<0>;
+        using Csr = QMI::DIRECT_CSR;
+        using Kvasir::Register::deposit;
+        using Kvasir::Register::readWhole;
+        using Kvasir::Register::writeWhole;
+        writeWhole(Csr::FULLREGISTER,
+                   deposit(Csr::clkdiv, clkdiv) | Csr::assert_cs0n.Mask | Csr::en.Mask);
         std::size_t sent = 0;
         std::size_t got  = 0;
         while(got < n) {
-            auto const s = *csr;
-            if(sent < n && (s & (1U << 10)) == 0 && sent - got < 4) {       // not txfull
-                *txr = (1U << 19) | static_cast<std::uint32_t>(tx[sent]);   // 8-bit, oe
+            auto const s = readWhole(Csr::FULLREGISTER);
+            if(sent < n && (s & Csr::txfull.Mask) == 0 && sent - got < 4) {
+                // 8 bits (DWIDTH 0), single width, output enabled
+                writeWhole(QMI::DIRECT_TX::FULLREGISTER,
+                           QMI::DIRECT_TX::oe.Mask | static_cast<std::uint32_t>(tx[sent]));
                 ++sent;
             }
-            if((s & (1U << 16)) == 0) {   // not rxempty
-                auto const v = *rxr;
+            if((s & Csr::rxempty.Mask) == 0) {
+                auto const v = readWhole(QMI::DIRECT_RX::FULLREGISTER);
                 if(got < rxSize) { rx[got] = static_cast<std::byte>(v & 0xFFU); }
                 ++got;
             }
         }
-        while((*csr & (1U << 1)) != 0) {}   // busy
-        *csr = 0U;                          // CS up, direct mode off
+        while((readWhole(Csr::FULLREGISTER) & Csr::busy.Mask) != 0) {}
+        writeWhole(Csr::FULLREGISTER, 0U);   // CS up, direct mode off
     }
 
     // A command of N bytes packed into a word, first byte lowest; returns the reply packed the
@@ -223,7 +231,7 @@ namespace detail {
         [[nodiscard,
           gnu::always_inline]] static inline std::uint32_t
         currentTiming() {
-            return *reinterpret_cast<std::uint32_t const volatile*>(QMI::M0_TIMING::Addr::value);
+            return Kvasir::Register::readWhole(QMI::M0_TIMING::FULLREGISTER);
         }
 
         // Both are called from apply(), a RAM function that runs while the flash is not readable: never out of
@@ -245,36 +253,33 @@ namespace detail {
 
         [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void apply(std::uint32_t timing) {
             KVASIR_RAM_FUNC_MARK();
-            auto* const timingReg
-              = reinterpret_cast<std::uint32_t volatile*>(QMI::M0_TIMING::Addr::value);
-            auto* const rfmtReg
-              = reinterpret_cast<std::uint32_t volatile*>(QMI::M0_RFMT::Addr::value);
-            auto* const rcmdReg
-              = reinterpret_cast<std::uint32_t volatile*>(QMI::M0_RCMD::Addr::value);
+            using Kvasir::Register::readWhole;
+            using Kvasir::Register::writeWhole;
 
             // The fetch that brought us here may still hold the chip select (cooldown,
             // 64 x COOLDOWN clk_sys cycles): let it expire, then the QMI is idle.
             for(std::uint32_t i = 0; i < 256; ++i) { asm volatile("" ::: "memory"); }
-            *timingReg = timing;
+            writeWhole(QMI::M0_TIMING::FULLREGISTER, timing);
             asm volatile("dsb" ::: "memory");
 
-            auto const rfmt = *rfmtReg;
-            auto const rcmd = *rcmdReg;
+            auto const rfmt = readWhole(QMI::M0_RFMT::FULLREGISTER);
+            auto const rcmd = readWhole(QMI::M0_RCMD::FULLREGISTER);
             bool const upgrade
               = isQuadEBh(rfmt, rcmd) || (quadEnableSr2 != 0 && (rcmd & 0xFFU) == CommandBBh);
             if(!upgrade || isContinuous(rfmt, rcmd)) { return; }
 
             // The one transfer with the command byte and the continuous mode bits: the
             // flash is in continuous mode after it.
-            *rcmdReg = CommandEBh | (ContinuousModeBits << 8);
-            *rfmtReg = RfmtQuadEBh;
+            writeWhole(QMI::M0_RCMD::FULLREGISTER, CommandEBh | (ContinuousModeBits << 8));
+            writeWhole(QMI::M0_RFMT::FULLREGISTER, RfmtQuadEBh);
             asm volatile("dsb" ::: "memory");
             (void)*reinterpret_cast<std::uint32_t const volatile*>(XipNoCacheBase);
             asm volatile("dsb" ::: "memory");
             // Let the chip select cooldown (64 x COOLDOWN clk_sys cycles) run out so the
             // format is changed with the QMI idle.
             for(std::uint32_t i = 0; i < 256; ++i) { asm volatile("" ::: "memory"); }
-            *rfmtReg = RfmtQuadEBh & ~PrefixLenBit;   // no command byte from now on
+            writeWhole(QMI::M0_RFMT::FULLREGISTER,
+                       RfmtQuadEBh & ~PrefixLenBit);   // no command byte from now on
             asm volatile("dsb\n isb" ::: "memory");
         }
     };
@@ -290,6 +295,19 @@ namespace detail {
         RomFlashExitXip const         flashExitXip;
         RomFlashFlushCache const      flushCache;
         XipEnableFunction const       xipEnable;
+
+#if __has_include("peripherals/BOOTRAM.hpp")
+        // Where the RP2350's boot ROM leaves the XIP setup function (boot2's successor) on a flash boot: the base of
+        // boot RAM, at most 256 bytes, position-independent, never executable there (RP2350 datasheet 5.2.7
+        // "Flash boot", md l.19373-19379; BOOTRAM_BASE 0x400e0000, l.1551 - the SVD's BOOTRAM block). Memory, not a
+        // register: read as a 64-word array.
+        static constexpr std::uintptr_t XipSetupFunctionAddress
+          = Kvasir::Peripheral::BOOTRAM::Registers<>::baseAddr;
+        static_assert(sizeof(std::array<std::uint32_t,
+                                        64>)
+                        == 256,
+                      "the XIP setup function's 256 bytes");
+#endif
 
         // The XIP setup function, copied out of BOOTRAM (never executable) into .ramExec, the
         // image's writable and executable range (chip Mpu.hpp; the stack is never executed).
@@ -308,7 +326,10 @@ namespace detail {
                 return Kvasir::Startup::second_stage_bootloader;
 #endif
             } else {
-                return *reinterpret_cast<std::array<std::uint32_t, 64> const*>(0x400E0000UL);
+#if __has_include("peripherals/BOOTRAM.hpp")
+                return *reinterpret_cast<std::array<std::uint32_t, 64> const*>(
+                  XipSetupFunctionAddress);
+#endif
             }
         }
 
@@ -407,9 +428,7 @@ namespace detail {
     // At boot, after initMemory(): FlashQuadEnable if the bootrom settled on BBh.
     inline void enableQuadIo() {
         using QMI = Kvasir::Peripheral::QMI::Registers<0>;
-        auto const rcmd
-          = *reinterpret_cast<std::uint32_t const volatile*>(QMI::M0_RCMD::Addr::value);
-        if((rcmd & 0xFFU) != XipReadMode::CommandBBh) { return; }
+        if(get<0>(apply(read(QMI::M0_RCMD::prefix))) != XipReadMode::CommandBBh) { return; }
         FlashXipDisabler xip{};
         std::uint32_t    primask{};
         asm volatile("mrs %0, primask\n cpsid i" : "=r"(primask)::"memory");
@@ -614,7 +633,7 @@ namespace detail {
     //
     // SSI SR (offset 0x28): TFNF bit 1, RFNE bit 3; DR0 at 0x60 (RP2040 datasheet "SSI: SR Register" / "SSI: DR0
     // Register", md l.28208-28232, l.28490). GPIO_QSPI_SS_CTRL.OUTOVER bits 9:8: 2 drives the pad low, 3 high (md
-    // l.14158-14163).
+    // l.14158-14163). Whole-register loads and stores (Register::readWhole / writeWhole): always inlined.
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
     flash_do_cmd_impl(FlashXipDisabler& xipDisabler,
                       std::byte const*  tx,
@@ -624,39 +643,33 @@ namespace detail {
         KVASIR_RAM_FUNC_MARK();
         using SSI_Regs = Kvasir::Peripheral::XIP_SSI::Registers<>;
         using CS_Ctrl  = Kvasir::Peripheral::IO_QSPI::Registers<>::GPIO_QSPI_SS_CTRL;
-        auto* const status
-          = reinterpret_cast<std::uint32_t const volatile*>(SSI_Regs::SR::Addr::value);
-        auto* const data = reinterpret_cast<std::uint32_t volatile*>(SSI_Regs::DR0::Addr::value);
-        auto* const cs   = reinterpret_cast<std::uint32_t volatile*>(CS_Ctrl::Addr::value);
-        static constexpr std::uint32_t TxNotFull   = 1U << 1;
-        static constexpr std::uint32_t RxNotEmpty  = 1U << 3;
-        static constexpr std::uint32_t OutoverMask = 3U << 8;
-        static constexpr std::uint32_t OutoverLow  = 2U << 8;
-        static constexpr std::uint32_t OutoverHigh = 3U << 8;
-        XipGuard                       guard{xipDisabler};
+        using namespace Kvasir::
+          Register;   // always inlined, fields included: nothing here calls into flash
+        XipGuard guard{xipDisabler};
 
-        *cs = (*cs & ~OutoverMask) | OutoverLow;
+        // no lambda here: gcc at -Og would leave it out of line, in flash
+        apply(write(CS_Ctrl::OUTOVERValC::low));
 
         static constexpr std::size_t maxInFlight = 16 - 2;
 
         std::size_t inFlight{};
         while(txLeft != 0 || rxLeft != 0) {
-            std::uint32_t const flags = *status;
-            if((flags & TxNotFull) != 0 && txLeft != 0 && inFlight < maxInFlight) {
-                *data = static_cast<std::uint32_t>(*tx);
+            std::uint32_t const flags = readWhole(SSI_Regs::SR::FULLREGISTER);
+            if((flags & SSI_Regs::SR::tfnf.Mask) != 0 && txLeft != 0 && inFlight < maxInFlight) {
+                writeWhole(SSI_Regs::DR0::FULLREGISTER, static_cast<std::uint32_t>(*tx));
                 ++tx;   // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
                 --txLeft;
                 ++inFlight;
             }
-            if((flags & RxNotEmpty) != 0 && rxLeft != 0) {
-                *rx = static_cast<std::byte>(*data);
+            if((flags & SSI_Regs::SR::rfne.Mask) != 0 && rxLeft != 0) {
+                *rx = static_cast<std::byte>(readWhole(SSI_Regs::DR0::FULLREGISTER));
                 ++rx;   // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
                 --rxLeft;
                 --inFlight;
             }
         }
 
-        *cs = (*cs & ~OutoverMask) | OutoverHigh;
+        apply(write(CS_Ctrl::OUTOVERValC::high));
     }
 
     // Runs from flash like flash_erase(): the FlashXipDisabler's ROM lookups and boot2 copy
@@ -840,6 +853,7 @@ namespace detail {
               set(PSM::WDSEL::rosc),
               set(PSM::WDSEL::otp),
               clear(PSM::WDSEL::proc_cold));
+        detail::keepWatchdogTickRunning();   // or the reset does not keep SRAM (WatchdogTick.hpp)
         // SYSCFG.AUXCTRL bit 0 before a watchdog reset of a stage that includes CLOCKS while POWMAN
         // runs from clk_ref, its default (RP2350 datasheet Table 1317, POWMAN SEQ_CFG Table 491) -
         // as the boot ROM's reboot() and Watchdog::trigger() do; WDSEL above includes CLOCKS.
@@ -1043,10 +1057,10 @@ inline std::string_view serialNumberView() {
 }
 
 inline bool isFlashBinary() {
-    // Read SCB->VTOR (0xE000ED08): the vector table base address tells us where
-    // the binary lives. On RP2350: flash = 0x10000000, RAM = 0x20000000.
-    auto const vtor = *reinterpret_cast<std::uint32_t const volatile*>(0xE000ED08U);
-    return vtor < 0x20000000U;
+    // Where the image's own vector table is linked: flash 0x10000000, RAM 0x20000000 (RP2040 and
+    // RP2350). Not VTOR: a flash image with Startup::RamVectorTable (Clocks::Resus needs one) runs
+    // with VTOR on its RAM copy and would call itself a RAM image.
+    return Kvasir::Startup::linkerAddress<_LINKER_vectors_start_>() < 0x20000000U;
 }
 
 // The bootrom's flash, partition table and OTP entry points under their public names; the

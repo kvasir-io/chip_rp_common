@@ -48,16 +48,15 @@ namespace Kvasir { namespace Powman {
 
         using Provides = brigand::list<Startup::Resource<TimerTag, 0>>;
 
-        // The TIMER register bits (the password goes in the upper half of every write).
-        static constexpr std::uint32_t Run            = 1U << 1;
-        static constexpr std::uint32_t Clear          = 1U << 2;
-        static constexpr std::uint32_t AlarmEnable    = 1U << 4;
-        static constexpr std::uint32_t PowerUpOnAlarm = 1U << 5;
-        static constexpr std::uint32_t AlarmFlag      = 1U << 6;
-        static constexpr std::uint32_t UseLposc       = 1U << 8;
-        static constexpr std::uint32_t UseXosc        = 1U << 9;
-        static constexpr std::uint32_t UsingXosc      = 1U << 16;
-        static constexpr std::uint32_t UsingLposc     = 1U << 17;
+        // The TIMER register bits for its whole-word writes: TIMER has no PASSWORD field in the
+        // SVD (USING_* are read-only up there), so the password goes in the upper half by hand.
+        static constexpr std::uint32_t Run            = Regs::TIMER::run.Mask;
+        static constexpr std::uint32_t Clear          = Regs::TIMER::clear.Mask;
+        static constexpr std::uint32_t AlarmEnable    = Regs::TIMER::alarm_enab.Mask;
+        static constexpr std::uint32_t PowerUpOnAlarm = Regs::TIMER::pwrup_on_alarm.Mask;
+        static constexpr std::uint32_t AlarmFlag      = Regs::TIMER::alarm.Mask;
+        static constexpr std::uint32_t UseLposc       = Regs::TIMER::use_lposc.Mask;
+        static constexpr std::uint32_t UseXosc        = Regs::TIMER::use_xosc.Mask;
 
         // Stop, pick the tick source, start. The 1 kHz tick from the crystal needs its
         // frequency in kHz (16.16); the LPOSC's is whatever the oscillator does.
@@ -74,13 +73,11 @@ namespace Kvasir { namespace Powman {
             if constexpr(UseCrystal) {
                 // "may take up to 1 tick cycle (1ms in normal operation)" (RP2350 datasheet 12.10.5.3, md l.58487)
                 Kvasir::Register::waitUntil<Kvasir::Chip::MicrosecondsBound<3'000>>(
-                  [] { return (get<0>(apply(read(Regs::TIMER::FULLREGISTER))) & UsingXosc) != 0; });
+                  [] { return get<0>(apply(read(Regs::TIMER::using_xosc))) != 0; });
             }
         }
 
-        [[nodiscard]] static bool running() {
-            return (get<0>(apply(read(Regs::TIMER::FULLREGISTER))) & Run) != 0;
-        }
+        [[nodiscard]] static bool running() { return get<0>(apply(read(Regs::TIMER::run))) != 0; }
 
         /// The counter, in milliseconds since whatever set() made zero.
         [[nodiscard]] static std::chrono::milliseconds now() {
@@ -138,7 +135,7 @@ namespace Kvasir { namespace Powman {
         }
 
         [[nodiscard]] static bool alarmFlag() {
-            return (get<0>(apply(read(Regs::TIMER::FULLREGISTER))) & AlarmFlag) != 0;
+            return get<0>(apply(read(Regs::TIMER::alarm))) != 0;
         }
     };
 
@@ -160,9 +157,22 @@ namespace Kvasir { namespace Powman {
 
         static constexpr auto initStepPeripheryEnable = list(Nvic::makeEnable(NvicIndex{}));
 
+        // Only POR, BOR, the RUN pin and a few debugger/watchdog sources reset POWMAN (RP2350
+        // datasheet 7.3.1 Table 528); a system reset - SYSRESETREQ, as after a flash - keeps the
+        // timer, its alarm and INTE as the image before left them. That alarm may still be
+        // armed, or have fired, with INTE.TIMER on: the interrupt would call Callback the moment
+        // the NVIC enables it, before this image armed anything (a periodic user re-arming from
+        // its own deadline then counts the whole wall time as missed periods). Disarmed, flag
+        // and latched NVIC pending bit dropped, before the enable.
+        static void preEnableRuntimeInit() {
+            disarm();
+            apply(Nvic::makeClearPending(NvicIndex{}));
+        }
+
         static void runtimeInit() {
-            // INTE.TIMER: the alarm's interrupt; the flag itself is enabled per arm.
-            apply(write(Regs::INTE::FULLREGISTER, detail::Password | (1U << 1)));
+            // INTE.TIMER: the alarm's interrupt; the flag itself is enabled per arm. INTE (0xE4)
+            // is outside the password-protected registers (offset <= 0xAC, RP2350 datasheet 6.4).
+            apply(set(Regs::INTE::timer));
         }
 
         static void armAt(std::chrono::milliseconds when) {
@@ -180,7 +190,7 @@ namespace Kvasir { namespace Powman {
         }
 
         [[nodiscard]] static bool armed() {
-            return (get<0>(apply(read(Regs::TIMER::FULLREGISTER))) & Timer::AlarmEnable) != 0;
+            return get<0>(apply(read(Regs::TIMER::alarm_enab))) != 0;
         }
 
         static void onIsr() {

@@ -88,8 +88,8 @@ namespace Kvasir { namespace DefaultClockSettings {
     // before the PLL switch. 1.15 V covers up to ~266 MHz - extend the range
     // only together with hardware validation.
     //
-    // POWMAN writes are ignored unless bits 31:16 carry the 0x5AFE password,
-    // hence the full-register write instead of a field write.
+    // POWMAN writes are ignored unless bits 31:16 carry the 0x5AFE password: the SVD's
+    // PASSWORD key field, which every write of VREG names (a compile error otherwise).
     template<auto ClockSpeed>
     void vregInit() {
 #if __has_include("peripherals/POWMAN.hpp")
@@ -99,14 +99,14 @@ namespace Kvasir { namespace DefaultClockSettings {
                           "vregInit together with hardware validation");
             using VREG = Kvasir::Peripheral::POWMAN::Registers<>::VREG;
             using Kvasir::Register::value;
-            constexpr std::uint32_t passwd    = 0x5AFEU << 16;
             constexpr std::uint32_t vsel_1v15 = 0b01100;
             // The regulator ignores writes while an update is in flight; the
             // update takes microseconds, so the polls are bounded.
             for(int i = 0; i < 100000; ++i) {
                 if(!apply(read(VREG::update_in_progress))) { break; }
             }
-            apply(write(VREG::FULLREGISTER, value<std::uint32_t, passwd | (vsel_1v15 << 4)>()));
+            apply(write(VREG::PASSWORDValC::password),
+                  write(VREG::vsel, value<std::uint32_t, vsel_1v15>()));
             for(int i = 0; i < 100000; ++i) {
                 if(!apply(read(VREG::update_in_progress))) { break; }
             }

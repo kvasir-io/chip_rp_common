@@ -180,11 +180,16 @@ struct GpioPinEdgesOn {
                                                        brigand::list<typename Rising::Sub>,
                                                        brigand::list<>>>;
 
-    // stale edges from before boot or before the pad was configured: a plain store of ones
+    // Stale edges from before boot or before the pad was configured. INTR's register type marks
+    // every bit write-ignored-if-zero (edges WC, levels RO: RP2040 datasheet Table 286, RP2350
+    // Table 758), so the reset is one plain store of the pin's edge bits: no read, no other pin's
+    // pending edge written back.
     static constexpr std::uint32_t edgeBits = (Nvic::isNullHandler<OnFalling> ? 0U : Falling::mask)
                                             | (Nvic::isNullHandler<OnRising> ? 0U : Rising::mask);
-    static constexpr auto          initStepPeripheryConfig
-      = list(Register::write(Regs::Intr::FULLREGISTER, Register::value<std::uint32_t, edgeBits>()));
+    static constexpr Register::
+      FieldLocation<typename Regs::Intr::Addr, edgeBits, Register::ROneToClearAccess, std::uint32_t>
+                          staleEdges{};
+    static constexpr auto initStepPeripheryConfig = list(Kvasir::Register::reset(staleEdges));
 };
 
 template<void (*OnFalling)(), void (*OnRising)(), typename Pin, int Priority = 3>

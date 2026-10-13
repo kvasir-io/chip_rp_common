@@ -122,12 +122,8 @@ struct Fifo {
         return get<0>(apply(Register::read(Regs::FIFO_ST::wof))) != 0;
     }
 
-    // Both flags are write-one-to-clear; the whole-register write avoids a read-modify-write
-    // that would also re-clear whichever flag happened to be set.
-    static void clearErrors() {
-        apply(
-          Register::write(Regs::FIFO_ST::FULLREGISTER, Register::value<(1U << 3U) | (1U << 2U)>()));
-    }
+    // Both flags are write-one-to-clear and every other bit is read-only: one store, no read.
+    static void clearErrors() { apply(Register::reset(Regs::FIFO_ST::roe, Regs::FIFO_ST::wof)); }
 };
 
 // One of the eight doorbells (RP2350). ring() sets the bell in the *other* core's inbox,

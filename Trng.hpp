@@ -18,11 +18,20 @@
 //   std::uint64_t const s = Trng::next64();
 //
 // Config (all optional):
-//   rawSamples (true)   bypass the block's statistical checks (von Neumann, continuous,
-//                       autocorrelation) as pico_rand does: fast, meant to be conditioned by
-//                       a hash or a PRNG seed. false keeps the checks; a rejected fill is
-//                       discarded and next32() waits for the next.
-//   sampleCount (0)     oscillator cycles between samples (SAMPLE_CNT1); 0 is every cycle.
+//   rawSamples (false)  true: bypass the block's statistical checks (von Neumann, continuous,
+//                       autocorrelation) as pico_rand does: fast, but the bits are raw ring-
+//                       oscillator samples - neighbouring bits correlate, a word is not uniform.
+//                       Only for a cryptographic hash. false (the default) keeps the checks:
+//                       uniform words, a fill in about 1.3 ms; a rejected run is restarted (it
+//                       stops the generator).
+//   sampleCount         rng_clk (= clk_sys) cycles between two ring-oscillator samples (SAMPLE_CNT1).
+//                       Checked (rawSamples false): 250. The data sheet suggests 20-25 for about 2 ms a
+//                       generation (12.12.2), but measured on an RP2350A at 150 MHz the words that pass
+//                       the checks are not uniform there: the low 5 bits of 65536 words fell 36..208 % into
+//                       32 bins at 25 (and nearly every run failed a check), 87..122 % at 100, 94..106 % at
+//                       250 (a fill ~1.3 ms, 1 failed run) - as even as at 500 and 1000. Raw: 25; the
+//                       data sheet forbids less than 17 while the von Neumann decorrelator is bypassed
+//                       (12.12.5, SAMPLE_CNT1), which rawSamples does.
 //   chainLength (0)     which of the four ring-oscillator lengths (CONFIG.RND_SRC_SEL).
 namespace Kvasir { namespace Trng {
 
@@ -33,14 +42,14 @@ namespace Kvasir { namespace Trng {
                 if constexpr(requires { Config_::rawSamples; }) {
                     return static_cast<bool>(Config_::rawSamples);
                 } else {
-                    return true;
+                    return false;
                 }
             }();
             static constexpr std::uint32_t sampleCount = [] {
                 if constexpr(requires { Config_::sampleCount; }) {
                     return static_cast<std::uint32_t>(Config_::sampleCount);
                 } else {
-                    return 0U;
+                    return rawSamples ? 25U : 250U;
                 }
             }();
             static constexpr std::uint32_t chainLength = [] {
@@ -54,6 +63,10 @@ namespace Kvasir { namespace Trng {
 
         static_assert(Config::chainLength < 4,
                       "the TRNG has four ring-oscillator chain lengths");
+        static_assert(!Config::rawSamples || Config::sampleCount >= 17,
+                      "with the von Neumann decorrelator bypassed (rawSamples) the sample count "
+                      "must not be less "
+                      "than 17 (RP2350 datasheet 12.12.5, SAMPLE_CNT1)");
 
         using Regs = Kvasir::Peripheral::TRNG::Registers<>;
 
@@ -73,8 +86,35 @@ namespace Kvasir { namespace Trng {
 
         static constexpr std::size_t WordsPerFill = 6;
 
+        static inline std::uint32_t restarts_{};
+
         /// Whether the EHR holds a complete fill.
         [[nodiscard]] static bool ready() { return apply(read(Regs::VALID::ehr_valid)); }
+
+        /// RNG_ICR: a 1 clears the bit in RNG_ISR (RP2350 datasheet 12.12.5, Table 1264;
+        /// AUTOCORR_ERR only by an RNG reset). Every field named, the rest reserved: one store.
+        static void clearFindings() {
+            apply(set(Regs::RNG_ICR::vn_err,
+                      Regs::RNG_ICR::crngt_err,
+                      Regs::RNG_ICR::autocorr_err,
+                      Regs::RNG_ICR::ehr_valid));
+        }
+
+        /// A run that failed an entropy check stops the generator, and AUTOCORR_ERR clears only with
+        /// an RNG reset (RP2350 datasheet 12.12.3, 12.12.5 RNG_ICR): soft reset - the two reads after
+        /// it are the bootrom's fixed delay (12.12.4.1) - then the configuration again and a new run.
+        static void restart() {
+            ++restarts_;
+            apply(set(Regs::SW_RESET::sw_reset));
+            static_cast<void>(apply(read(Regs::SW_RESET::sw_reset)));
+            static_cast<void>(apply(read(Regs::SW_RESET::sw_reset)));
+            apply(initStepPeripheryConfig);
+            clearFindings();
+            apply(set(Regs::RND_SOURCE_ENABLE::rnd_src_en));
+        }
+
+        /// How many runs failed an entropy check and were restarted.
+        [[nodiscard]] static std::uint32_t restarts() { return restarts_; }
 
         /// One fill of the EHR: six words, 192 bits. Blocks until the fill is complete; with
         /// the checks on, a fill the block rejected is discarded and the wait starts over.
@@ -87,12 +127,7 @@ namespace Kvasir { namespace Trng {
                         auto const errors = apply(read(Regs::RNG_ISR::autocorr_err,
                                                        Regs::RNG_ISR::crngt_err,
                                                        Regs::RNG_ISR::vn_err));
-                        if(get<0>(errors) || get<1>(errors) || get<2>(errors)) {
-                            // Clear the finding and restart the bit counter; the source keeps
-                            // running.
-                            apply(write(Regs::RNG_ICR::FULLREGISTER, Register::value<0xFU>()));
-                            apply(set(Regs::RST_BITS_COUNTER::rst_bits_counter));
-                        }
+                        if(get<0>(errors) || get<1>(errors) || get<2>(errors)) { restart(); }
                     }
                 }
                 std::array<std::uint32_t, WordsPerFill> words{
@@ -101,9 +136,12 @@ namespace Kvasir { namespace Trng {
                   get<0>(apply(read(Regs::EHR_DATA2::ehr_data2))),
                   get<0>(apply(read(Regs::EHR_DATA3::ehr_data3))),
                   get<0>(apply(read(Regs::EHR_DATA4::ehr_data4))),
-                  get<0>(
-                    apply(read(Regs::EHR_DATA5::ehr_data5)))};   // this read starts the next fill
-                apply(write(Regs::RNG_ICR::FULLREGISTER, Register::value<0xFU>()));
+                  get<0>(apply(read(Regs::EHR_DATA5::ehr_data5)))};   // this read clears the EHR
+                clearFindings();
+                if constexpr(!Config::rawSamples) {
+                    // with the checks on, a completed run stops the generator (12.12.3): start the next
+                    apply(set(Regs::RND_SOURCE_ENABLE::rnd_src_en));
+                }
                 return words;
             }
         }

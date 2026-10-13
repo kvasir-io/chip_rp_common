@@ -268,13 +268,13 @@ namespace Kvasir { namespace Pio {
         [[nodiscard]] static std::uint32_t programCounter() {
             using PioRegs = Kvasir::Peripheral::PIO::Registers<Config_::PioInstance>;
             using SmRegs  = typename PioRegs::template SM<Config_::SmInstance>;
-            return *reinterpret_cast<std::uint32_t volatile*>(SmRegs::ADDR::Addr::value);
+            return static_cast<std::uint32_t>(get<0>(apply(read(SmRegs::ADDR::addr))));
         }
 
-        /// Which state machines of this instance are enabled (CTRL bits 3:0).
+        /// Which state machines of this instance are enabled (CTRL.SM_ENABLE).
         [[nodiscard]] static std::uint32_t enabledMask() {
             using PioRegs = Kvasir::Peripheral::PIO::Registers<Config_::PioInstance>;
-            return *reinterpret_cast<std::uint32_t volatile*>(PioRegs::CTRL::Addr::value) & 0xFU;
+            return static_cast<std::uint32_t>(get<0>(apply(read(PioRegs::CTRL::sm_enable))));
         }
 
         static constexpr std::uint32_t Offset = SmConfig::ProgramOffset;
@@ -282,7 +282,7 @@ namespace Kvasir { namespace Pio {
         [[nodiscard]] static std::uint32_t pinCtrl() {
             using PioRegs = Kvasir::Peripheral::PIO::Registers<Config_::PioInstance>;
             using SmRegs  = typename PioRegs::template SM<Config_::SmInstance>;
-            return *reinterpret_cast<std::uint32_t volatile*>(SmRegs::PINCTRL::Addr::value);
+            return Kvasir::Register::readWhole(SmRegs::PINCTRL::FULLREGISTER);
         }
 
     private:

@@ -42,9 +42,10 @@ namespace Kvasir { namespace Sha256 {
 
         /// A new message.
         static void start() {
-            apply(
-              write(Regs::CSR::FULLREGISTER,
-                    Register::value<(1U << 12) | (2U << 8) | 1U>()));   // bswap, 32-bit DMA, START
+            // every writable field named (ERR_WDATA_NOT_RDY is write-one-to-clear): one store, no read
+            apply(write(Regs::CSR::bswap, Register::value<1>()),
+                  write(Regs::CSR::DMA_SIZEValC::_32bit),
+                  set(Regs::CSR::start));
             pending_ = 0;
             total_   = 0;
         }
