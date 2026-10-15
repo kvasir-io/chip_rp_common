@@ -7,7 +7,10 @@
 //   are 0xFF, which programs nothing. A page is so programmed once per record that touches it.
 //   How often that is allowed between erases neither chip states: PY25Q128HA V2.2 10.30 defers
 //   to an application note that is not on disk, W25Q128JV 8.2.13 only allows partial pages.
-// - read: straight from XIP; the wrappers flush the XIP cache after every erase and program.
+// - read: from XIP, through the untranslated, uncached window (XipUntranslatedBase): a region is
+//   addressed in flash bytes, like erase and program, so it must not move with the address
+//   translation the boot ROM sets up for an image launched from a partition - through 0x10000000
+//   such an image sees its own partition only, and a region in a data partition is a bus fault.
 //
 // Both mask interrupts and stop XIP for the whole operation (an erase takes tens of ms): nothing
 // may run from flash meanwhile, on the other core neither.
@@ -50,7 +53,7 @@ namespace Kvasir { namespace Flash {
                          std::span<std::byte> out) {
             if(std::uint64_t{addr} + out.size() > Bytes) { return false; }
             std::memcpy(out.data(),
-                        reinterpret_cast<std::byte const*>(XipBase + Offset + addr),
+                        reinterpret_cast<std::byte const*>(XipUntranslatedBase + Offset + addr),
                         out.size());
             return true;
         }
@@ -90,6 +93,19 @@ namespace Kvasir { namespace Flash {
                 + static_cast<std::uintptr_t>(
                   std::addressof(_LINKER_INTERN_scratch_y_data_end_)
                   - std::addressof(_LINKER_INTERN_scratch_y_data_start_)));
+#endif
+#if __has_include("chip/rp2350.hpp")
+            // `end` is a runtime address, Offset a flash byte: an image launched from a partition is linked at
+            // 0x10000000 but lies at the partition's base, so compare in flash bytes (flash_runtime_to_storage_addr,
+            // RP2350 data sheet 5.4.8.13; it answers in the XIP space, 0x10000000 for flash byte 0 - measured). Its
+            // last byte, since `end` may lie past the mapped window. A region in front of the image (the other A/B
+            // partition) is refused too. Not mapped (a RAM image): as before.
+            if(auto const last = Kvasir::detail::flash_runtime_to_storage_addr(
+                 static_cast<std::uint32_t>(end - 1U));
+               last >= 0)
+            {
+                return XipBase + Offset > static_cast<std::uint32_t>(last);
+            }
 #endif
             return XipBase + Offset >= end;
         }

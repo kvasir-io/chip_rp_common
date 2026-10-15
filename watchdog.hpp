@@ -169,7 +169,8 @@ public:
     // includes CLOCKS, if POWMAN is running from clk_ref" - which it does by default
     // (SEQ_CFG.USING_FAST_POWCK, Table 491), and PSM.WDSEL includes CLOCKS. Set only right before
     // a reset this code makes itself, as the boot ROM's reboot() does: while the bit is set POWMAN
-    // runs from the 32 kHz LPOSC and the AON timer's tick is far off. The watchdog reset clears it.
+    // runs from the 32 kHz LPOSC and the AON timer's tick is far off. The reset does not clear it (found
+    // still set in the image the boot ROM's reboot() started): clock_config.hpp vregInit clears it at boot.
     static void powmanOffClkRef() {
         using AuxCtrl    = Kvasir::Peripheral::SYSCFG::Registers<>::AUXCTRL;
         auto const value = get<0>(apply(read(AuxCtrl::auxctrl)));

@@ -8,7 +8,9 @@
     #include "peripherals/SYSCFG.hpp"
 #endif
 
+#include <array>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <kvasir/Register/Register.hpp>
@@ -16,6 +18,7 @@
 #include <kvasir/Util/AnnouncedReset.hpp>
 #include <kvasir/Util/StaticString.hpp>
 #include <kvasir/Util/attributes.hpp>
+#include <span>
 #include <string_view>
 
 // Microsecond counter for Kvasir::AnnouncedReset: TIMERAWL, side-effect-free (RP2040 datasheet 4.6.5, TIMER_BASE
@@ -466,6 +469,13 @@ namespace detail {
         using rom_flash_runtime_to_storage_addr = int (*)(std::uint32_t addr);
 
         return RomFunctions::call<'F', 'A', rom_flash_runtime_to_storage_addr>(addr);
+    }
+
+    static inline int explicit_buy(std::uint8_t* buffer,
+                                   std::uint32_t buffer_size) {
+        using rom_explicit_buy = int (*)(std::uint8_t* buffer, std::uint32_t buffer_size);
+
+        return RomFunctions::call<'E', 'B', rom_explicit_buy>(buffer, buffer_size);
     }
 
     // flash_op flags
@@ -1097,8 +1107,10 @@ namespace Bootrom {
                                                 partition_and_flags);
     }
 
-    /// flash_runtime_to_storage_addr (5.4.8.15): the QMI's address translation of a runtime
-    /// (XIP window) address; negative when the address is not mapped.
+    /// flash_runtime_to_storage_addr (5.4.8.13): the QMI's address translation of a runtime
+    /// (XIP window) address; negative when the address is not mapped. The answer is in the XIP
+    /// space too, not a byte offset: flash byte 0 is 0x10000000, chip select 1 0x11000000
+    /// (measured on an RP2350 without a partition table; the data sheet does not say).
     [[nodiscard]] inline int flashRuntimeToStorageAddr(std::uint32_t addr) {
         return detail::flash_runtime_to_storage_addr(addr);
     }
@@ -1118,6 +1130,79 @@ namespace Bootrom {
         constexpr std::uint32_t ChipId   = 0x000;
         constexpr std::uint32_t UserBase = 0x400;
     }   // namespace Otp::Rows
+
+    /// How the boot ROM booted this run: get_sys_info BOOT_INFO (RP2350 datasheet 5.4.8.17, flag
+    /// 0x0040, word 0 = 0xttppbbdd). The flag and boot type values are pico-sdk's
+    /// boot/bootrom_constants.h (BOOT_TBYB_AND_UPDATE_FLAG_*, BOOT_TYPE_*); the data sheet names
+    /// the fields only.
+    struct BootInfo {
+        static constexpr std::uint8_t BuyPending = 0x1;   // a TBYB image launched, not bought yet
+        static constexpr std::uint8_t OtpVersionApplied = 0x2;
+        static constexpr std::uint8_t OtherErased       = 0x4;
+        static constexpr std::uint8_t NoPartition       = 0xff;   // pp -1: none (a board without a
+                                                                  // partition table reads 0xfe, -2)
+
+        static constexpr std::uint8_t TypeNormal      = 0;
+        static constexpr std::uint8_t TypeBootsel     = 2;
+        static constexpr std::uint8_t TypeRamImage    = 3;
+        static constexpr std::uint8_t TypeFlashUpdate = 4;
+        static constexpr std::uint8_t TypeChainedFlag
+          = 0x80;   // or'ed in when an image chained another
+
+        bool          valid{};   // the boot ROM answered
+        std::uint8_t  tbybAndUpdate{};
+        std::uint8_t  partition{NoPartition};
+        std::uint8_t  bootType{};
+        std::uint32_t diagnostic{};
+
+        /// tt's BUY_PENDING alone. tt is "updated on regular non BOOTSEL boots" only, so after a
+        /// boot through BOOTSEL it is the flag of an earlier boot - an image bought since still reads it
+        /// (seen on hardware). trialBoot() is the check to act on.
+        [[nodiscard]] constexpr bool buyPending() const {
+            return valid && (tbybAndUpdate & BuyPending) != 0;
+        }
+
+        /// This run is a TBYB image on trial: BUY_PENDING on a FLASH_UPDATE boot (chained or not), the
+        /// only boot type that launches an unbought TBYB image over the other partition (5.1.17 step
+        /// 4). pico-sdk's rom_pick_ab_partition_during_update makes the same two checks.
+        [[nodiscard]] constexpr bool trialBoot() const {
+            return buyPending() && (bootType & ~TypeChainedFlag) == TypeFlashUpdate;
+        }
+    };
+
+    /// BOOT_INFO of this boot. Read it early: tt and pp are "updated on regular non BOOTSEL
+    /// boots", and the boot ROM's later calls do not change them. A boot ROM call: on an image a
+    /// debugger started in RAM only once the RCP salt is valid (chip_rp2350 StartUp.hpp).
+    [[nodiscard]] inline BootInfo bootInfo() {
+        constexpr std::uint32_t      Flag = 0x0040;   // SYS_INFO_BOOT_INFO
+        std::array<std::uint32_t, 5> buffer{};        // the supported-flags word, then the 4
+        auto const words = detail::get_sys_info(buffer.data(), buffer.size(), Flag);
+        if(words < 5 || (buffer[0] & Flag) == 0) { return BootInfo{}; }
+        return BootInfo{.valid         = true,
+                        .tbybAndUpdate = static_cast<std::uint8_t>(buffer[1] >> 24),
+                        .partition     = static_cast<std::uint8_t>(buffer[1] >> 16),
+                        .bootType      = static_cast<std::uint8_t>(buffer[1] >> 8),
+                        .diagnostic    = buffer[2]};
+    }
+
+    /// The scratch explicit_buy needs to rewrite the sector holding the TBYB flag (5.4.8.4: "at
+    /// least 4 kB", word aligned).
+    inline constexpr std::size_t ExplicitBuyScratchBytes = 4096;
+
+    /// explicit_buy (RP2350 datasheet 5.4.8.4, 5.1.17): make the image a flash update boot
+    /// launched on trial (an IMAGE_DEF with the TBYB flag) the one that boots from now on. It
+    /// clears the flag in flash and, if the image is a version downgrade, erases the first sector
+    /// of the other A/B partition; until then any reset that is not that flash update boot
+    /// starts the other partition again. On a secured chip it may also write the rollback
+    /// version to OTP, and may reboot doing so (5.4.8.4). Erases and programs flash: interrupts
+    /// masked and core 1 off flash around it, as for flashErase() (pico-sdk runs it under
+    /// flash_safe_execute). 0 (BOOTROM_OK) or a negative boot ROM error; a call on a bought image
+    /// does nothing and returns 0.
+    [[nodiscard]] inline int explicitBuy(std::span<std::uint32_t,
+                                                   ExplicitBuyScratchBytes / 4> scratch) {
+        return detail::explicit_buy(reinterpret_cast<std::uint8_t*>(scratch.data()),
+                                    static_cast<std::uint32_t>(scratch.size_bytes()));
+    }
 #endif
 }   // namespace Bootrom
 

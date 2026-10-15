@@ -16,6 +16,7 @@
 
 #if __has_include("peripherals/POWMAN.hpp")
     #include "peripherals/POWMAN.hpp"
+    #include "peripherals/SYSCFG.hpp"
 #endif
 #if __has_include("peripherals/VREG_AND_CHIP_RESET.hpp")
     #include "peripherals/VREG_AND_CHIP_RESET.hpp"
@@ -83,6 +84,23 @@ namespace Kvasir { namespace DefaultClockSettings {
         }
     }   // namespace detail
 
+    namespace detail {
+        // A counted wait for code that runs before any timer is set up (vregInit): `turns` times a
+        // loop of at least one cycle, registers only.
+        inline void spinTurns(std::uint32_t turns) {
+            // gcc assembles Thumb-1 inline asm in divided syntax, where `subs` with three operands
+            // does not exist; clang is always unified. The directive emits nothing.
+            asm volatile(
+              ".syntax unified\n"
+              "1:\n"
+              "subs %0, %0, #1\n"
+              "bne 1b\n"
+              : "+l"(turns)
+              :
+              : "cc");
+        }
+    }   // namespace detail
+
     // Core voltage for the requested clock. Reset value is 1.10 V, the
     // datasheet setting for 150 MHz; above that the regulator must be raised
     // before the PLL switch. 1.15 V covers up to ~266 MHz - extend the range
@@ -90,25 +108,69 @@ namespace Kvasir { namespace DefaultClockSettings {
     //
     // POWMAN writes are ignored unless bits 31:16 carry the 0x5AFE password: the SVD's
     // PASSWORD key field, which every write of VREG names (a compile error otherwise).
+    //
+    // The sequence is pico-sdk's vreg_set_voltage (hardware_vreg/vreg.c) on the RP2350, and every
+    // step of it is load-bearing:
+    //   - VREG_CTRL.UNLOCK first: "The regulator can be directly controlled by software, but must
+    //     first be unlocked by writing a 1 to the UNLOCK field in the VREG_CTRL register" (RP2350
+    //     datasheet 6.3.2). Locked, the VSEL write sets UPDATE_IN_PROGRESS and nothing else: the bit
+    //     stays set for good, the voltage stays at 1.10 V and the PLL switch below runs the core at
+    //     ClockSpeed on it. Seen at 200 MHz: VREG 0x80C0 -- VSEL 1.15 V, UPDATE_IN_PROGRESS -- for
+    //     as long as the image ran. It cannot be relocked; pico-sdk leaves it unlocked too.
+    //   - Then time for the output to get there before the PLL switch: UPDATE_IN_PROGRESS covers the
+    //     register update only, and VOUT_OK cannot tell 1.10 V from 1.15 V (it asserts at 90 % of the
+    //     selected voltage, 6.3.4). pico-sdk waits SYS_CLK_VREG_VOLTAGE_AUTO_ADJUST_DELAY_US, 1 ms
+    //     (pico_runtime_init/runtime_init_clocks.c); the data sheet gives no settling time.
+    //   - SYSCFG.AUXCTRL bit 0 cleared before that (for every image): it forces POWMAN onto the 32 kHz LPOSC, which
+    //     the boot ROM's reboot() and Watchdog::trigger set before a reset (watchdog.hpp
+    //     powmanOffClkRef) and which survives the boot ROM's reboot (found set, 1, in a running
+    //     image). On the LPOSC every POWMAN access takes ~100 us: the two bounded polls below were
+    //     10 s of every boot. Nothing in this image needs it set; the next reset that needs it sets
+    //     it again.
     template<auto ClockSpeed>
     void vregInit() {
 #if __has_include("peripherals/POWMAN.hpp")
+        {   // every image, whatever its clock: POWMAN (and the AON timer) back on their own clock
+            using AuxCtrl = Kvasir::Peripheral::SYSCFG::Registers<>::AUXCTRL;
+            if(auto const aux = get<0>(apply(read(AuxCtrl::auxctrl))); (aux & 1U) != 0) {
+                apply(write(AuxCtrl::auxctrl, aux & ~1U));
+            }
+        }
         if constexpr(ClockSpeed > 150'000'000) {
             static_assert(ClockSpeed <= 266'000'000,
                           "no validated core voltage for this clock - extend "
                           "vregInit together with hardware validation");
-            using VREG = Kvasir::Peripheral::POWMAN::Registers<>::VREG;
+            using VREG      = Kvasir::Peripheral::POWMAN::Registers<>::VREG;
+            using VREG_CTRL = Kvasir::Peripheral::POWMAN::Registers<>::VREG_CTRL;
             using Kvasir::Register::value;
             constexpr std::uint32_t vsel_1v15 = 0b01100;
-            // The regulator ignores writes while an update is in flight; the
-            // update takes microseconds, so the polls are bounded.
+
+            apply(write(VREG_CTRL::PASSWORDValC::password), set(VREG_CTRL::unlock));
+
+            // The regulator ignores writes while an update is in flight; an update takes
+            // microseconds, so the polls are bounded (at clk_ref speed a few ms each).
+            bool idle = false;
             for(int i = 0; i < 100000; ++i) {
-                if(!apply(read(VREG::update_in_progress))) { break; }
+                if(!apply(read(VREG::update_in_progress))) {
+                    idle = true;
+                    break;
+                }
             }
-            apply(write(VREG::PASSWORDValC::password),
-                  write(VREG::vsel, value<std::uint32_t, vsel_1v15>()));
-            for(int i = 0; i < 100000; ++i) {
-                if(!apply(read(VREG::update_in_progress))) { break; }
+            // Only a change needs the write and the settling time. The voltage is back at 1.10 V "at
+            // initial power-on or after a reset event" (6.3.2), which events the data sheet does not
+            // list; a core-0-only reset keeps it, and may even find clk_sys still on the PLL here. A VSEL
+            // that reads right proves nothing while an update hangs: one written locked reads 1.15 V for good.
+            if(!idle || get<0>(apply(read(VREG::vsel))) != vsel_1v15) {
+                apply(write(VREG::PASSWORDValC::password),
+                      write(VREG::vsel, value<std::uint32_t, vsel_1v15>()));
+                for(int i = 0; i < 100000; ++i) {
+                    if(!apply(read(VREG::update_in_progress))) { break; }
+                }
+                // Still before the PLL switch: clk_sys on the ROSC, which the boot ROM of an A3 runs at
+                // up to 96 MHz (8.3, md l.27989). 96 000 turns of a loop of at least one cycle are at
+                // least 1 ms at that; on a slow ROSC (4.6 MHz before A3) some tens of ms, once, on the
+                // boot that changes the voltage.
+                detail::spinTurns(96'000);
             }
         }
 #elif __has_include("peripherals/VREG_AND_CHIP_RESET.hpp")
@@ -127,17 +189,7 @@ namespace Kvasir { namespace DefaultClockSettings {
             // This runs before the crystal is up, on the ring oscillator at up to ~12 MHz,
             // so the wait is a counted loop: 12 000 turns of a 1-cycle-ish loop is at
             // least 1 ms at any ROSC speed, and only a few ms at the slowest.
-            std::uint32_t turns = 12'000;
-            // gcc assembles Thumb-1 inline asm in divided syntax, where `subs` with three operands
-            // does not exist; clang is always unified. The directive emits nothing.
-            asm volatile(
-              ".syntax unified\n"
-              "1:\n"
-              "subs %0, %0, #1\n"
-              "bne 1b\n"
-              : "+l"(turns)
-              :
-              : "cc");
+            detail::spinTurns(12'000);
         }
 #else
         static_assert(ClockSpeed <= 150'000'000,

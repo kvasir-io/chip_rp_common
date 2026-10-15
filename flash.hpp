@@ -31,8 +31,28 @@ namespace Kvasir { namespace Flash {
     inline constexpr std::uint32_t XipUncachedBase = 0x1400'0000U;
 #endif
 
+    /// Flash byte 0 regardless of the QMI's address translation. An image the boot ROM launched from a partition
+    /// runs with ATRANS0 mapping 0x10000000 onto that partition alone (RP2350 data sheet 5.1.19, 12.14.4) and the
+    /// other three windows at size 0, so a read of anything outside the image partition through 0x10000000 or
+    /// 0x14000000 - a data partition, say - is a bus fault. RP2350: 0x1c000000 "XIP, uncached, untranslated"
+    /// (address map md l.14753, 4.4.1 l.17872), for Secure code only by default: XIP CTRL.NO_UNTRANSLATED_SEC
+    /// resets to 0, NO_UNTRANSLATED_NONSEC to 1 (md l.18125-18126) - a Non-secure image would need flash_op
+    /// ASPACE_STORAGE instead. Uncached as well, so a read never sees a line the boot ROM's erase/program left
+    /// stale. RP2040: no translation exists; XIP_NOCACHE_NOALLOC_BASE (md l.1249) for the same uncached read.
+#if __has_include("chip/rp2040.hpp")
+    inline constexpr std::uint32_t XipUntranslatedBase = 0x1300'0000U;
+#else
+    inline constexpr std::uint32_t XipUntranslatedBase = 0x1c00'0000U;
+#endif
+
     [[nodiscard]] constexpr std::uint32_t uncached(std::uint32_t xipAddress) {
         return xipAddress - XipBase + XipUncachedBase;
+    }
+
+    /// An XIP window address that names a flash byte (as eraseAndWrite() and the boot ROM's flash functions take
+    /// it, `address - XipBase`), moved to XipUntranslatedBase: where that byte is read in any image.
+    [[nodiscard]] constexpr std::uint32_t untranslated(std::uint32_t xipAddress) {
+        return xipAddress - XipBase + XipUntranslatedBase;
     }
 
     /// A reader for Kvasir::ImageCheck::Software: flash read through the uncached window.
@@ -87,7 +107,9 @@ namespace Kvasir { namespace Flash {
         };
 
         static bool read(T& out) {
-            auto const*        at = reinterpret_cast<std::byte const*>(XipAddress);
+            // untranslated: XipAddress is a flash byte (erase and program take it so), and through 0x10000000 an
+            // image launched from a partition sees that partition only (XipUntranslatedBase)
+            auto const*        at = reinterpret_cast<std::byte const*>(untranslated(XipAddress));
             typename Crc::type stored{};
             std::memcpy(&stored, at + offsetof(Layout, crc), sizeof stored);
             if(stored != Crc::calc(std::span<std::byte const>{at, sizeof(T)})) { return false; }
