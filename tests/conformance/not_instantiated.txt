@@ -1,0 +1,8 @@
+# Driver templates instantiate.cpp does not instantiate, one reason per line. Everything else of chip/ and rp_common/
+# is instantiated there once, or has no dependent register write (non-template code compiles in the header TUs).
+rp_common/Multicore.hpp      core 1's launch is a Startup list with a core 1 main (SecondaryCore), not a driver alone
+rp_common/usb.hpp            the device backend is driven by kvasir_devices' USB stack and its descriptors
+rp_common/ClockOutput.hpp    Clocks::Resus needs a Startup list with a RAM vector table (Startup::RamVectorTable)
+rp_common/pio/*.hpp          the PIO programs (ws2812, PioQspi, I2sOut, ClockOut) take board pins; StateMachine itself is instantiated
+rp_common/Qmi.hpp            (RP2350) RAM functions with XIP off, no template; compiled in the header TU
+rp_common/Xip.hpp            stream() is a function template taking a callback; RpStream instantiates it

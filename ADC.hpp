@@ -1,15 +1,20 @@
 #pragma once
 
+#include "AdcMath.hpp"
 #include "Clocks.hpp"
 #include "DMA.hpp"
 #include "Io.hpp"
 #include "PinConfig.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "core/Nvic.hpp"
+#include "kvasir/Hal/Owns.hpp"
+#include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 #include "peripherals/ADC.hpp"
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <optional>
@@ -18,21 +23,16 @@
 
 namespace Kvasir { namespace ADC {
 
-    // Startup resource: the one ADC (kvasir/StartUp/Resources.hpp).
-    struct InstanceTag {};
-
     namespace Detail {
         template<int Pin>
         constexpr int pinToAdcChannel() {
-            if constexpr(PinConfig::CurrentChip == PinConfig::ChipVariant::RP2040
-                         || PinConfig::CurrentChip == PinConfig::ChipVariant::RP2350A)
-            {
+            if constexpr(Chip::part == Chip::Part::rp2040 || Chip::part == Chip::Part::rp2350a) {
                 if constexpr(Pin >= 26 && Pin <= 29) {
                     return Pin - 26;
                 } else {
                     return -1;
                 }
-            } else if constexpr(PinConfig::CurrentChip == PinConfig::ChipVariant::RP2350B) {
+            } else if constexpr(Chip::part == Chip::Part::rp2350b) {
                 if constexpr(Pin >= 40 && Pin <= 47) {
                     return Pin - 40;
                 } else {
@@ -44,9 +44,7 @@ namespace Kvasir { namespace ADC {
         }
 
         constexpr int tempSensorChannel() {
-            if constexpr(PinConfig::CurrentChip == PinConfig::ChipVariant::RP2040
-                         || PinConfig::CurrentChip == PinConfig::ChipVariant::RP2350A)
-            {
+            if constexpr(Chip::part == Chip::Part::rp2040 || Chip::part == Chip::Part::rp2350a) {
                 return 4;
             } else {
                 return 8;
@@ -55,8 +53,8 @@ namespace Kvasir { namespace ADC {
 
         template<int Port,
                  int Pin>
-        constexpr bool isValidAdcPin(Register::PinLocation<Port,
-                                                           Pin>) {
+        constexpr bool isValidAdcPin(Io::PinLocation<Port,
+                                                     Pin>) {
             return Port == 0 && pinToAdcChannel<Pin>() >= 0;
         }
 
@@ -69,12 +67,12 @@ namespace Kvasir { namespace ADC {
 
         template<int Port,
                  int Pin>
-        constexpr auto makeAdcPinConfig(Register::PinLocation<Port,
-                                                              Pin>) {
+        constexpr auto makeAdcPinConfig(Io::PinLocation<Port,
+                                                        Pin>) {
             using Pad  = typename Kvasir::Peripheral::PADS_BANK0::Registers<>::GPIO<Pin>::PAD;
             using Ctrl = typename Kvasir::Peripheral::IO_BANK0::Registers<>::GPIO<Pin>::CTRL;
             return list(clear(Pad::ie),
-#if __has_include("chip/rp2350.hpp")
+#ifdef KVASIR_CHIP_RP2350
                         clear(Pad::iso),
 #endif
                         set(Pad::od),
@@ -92,16 +90,16 @@ namespace Kvasir { namespace ADC {
 
         template<int Port,
                  int Pin>
-        constexpr std::uint32_t pinToChannelBit(Register::PinLocation<Port,
-                                                                      Pin>) {
-            return 1u << pinToAdcChannel<Pin>();
+        constexpr std::uint32_t pinToChannelBit(Io::PinLocation<Port,
+                                                                Pin>) {
+            return 1U << pinToAdcChannel<Pin>();
         }
 
         template<bool EnableTemp,
                  typename... PinLocs>
         constexpr std::uint32_t computeChannelMask(brigand::list<PinLocs...>) {
-            std::uint32_t mask = (0u | ... | pinToChannelBit(PinLocs{}));
-            if constexpr(EnableTemp) { mask |= (1u << tempSensorChannel()); }
+            std::uint32_t mask = (0U | ... | pinToChannelBit(PinLocs{}));
+            if constexpr(EnableTemp) { mask |= (1U << tempSensorChannel()); }
             return mask;
         }
 
@@ -113,86 +111,9 @@ namespace Kvasir { namespace ADC {
 
         constexpr std::uint8_t firstSetBit(std::uint32_t mask) {
             for(std::uint8_t i = 0; i < 32; ++i) {
-                if(mask & (1u << i)) { return i; }
+                if(mask & (1U << i)) { return i; }
             }
             return 0;
-        }
-
-        template<std::size_t N>
-        struct ChannelTable {
-            std::array<std::uint8_t, N> channels{};
-        };
-
-        template<std::size_t N>
-        constexpr ChannelTable<N> buildChannelTable(std::uint32_t mask) {
-            ChannelTable<N> t{};
-            std::size_t     idx = 0;
-            for(std::uint8_t i = 0; i < 9 && idx < N; ++i) {
-                if(mask & (1u << i)) { t.channels[idx++] = i; }
-            }
-            return t;
-        }
-
-        // ADC sample rate divider calculation
-        // Total period in ADC clocks = max(96, 1 + INT + FRAC/256)
-        // sample_rate = clockSpeed / period
-        // When DIV register is 0 the ADC runs at its maximum rate (96 cycles per conversion).
-
-        struct DivRegs {
-            std::uint16_t int_;
-            std::uint8_t  frac;
-        };
-
-        static constexpr DivRegs calcDivRegs(std::uint32_t clockSpeed,
-                                             std::uint32_t sampleRate) {
-            // target period in ADC clocks (fixed-point: 8 fractional bits)
-            // period_fp = clockSpeed * 256 / sampleRate
-            std::uint64_t period_fp = (static_cast<std::uint64_t>(clockSpeed) * 256u) / sampleRate;
-
-            // subtract 1 (in fixed-point: 256) to get the divider value
-            // DIV register encodes: period = 1 + INT + FRAC/256
-            if(period_fp <= 256u) {
-                // sampleRate >= clockSpeed, use DIV=0 (max rate)
-                return {0, 0};
-            }
-            std::uint64_t div_fp = period_fp - 256u;
-
-            std::uint32_t int_part  = static_cast<std::uint32_t>(div_fp >> 8);
-            std::uint8_t  frac_part = static_cast<std::uint8_t>(div_fp & 0xFFu);
-
-            // clamp INT to 16-bit max
-            if(int_part > 0xFFFFu) {
-                int_part  = 0xFFFFu;
-                frac_part = 0xFFu;
-            }
-
-            return {static_cast<std::uint16_t>(int_part), frac_part};
-        }
-
-        static constexpr double calcActualSampleRate(std::uint32_t clockSpeed,
-                                                     DivRegs       div) {
-            if(div.int_ == 0 && div.frac == 0) {
-                // DIV=0: 96 cycles per conversion
-                return double(clockSpeed) / 96.0;
-            }
-            double period = 1.0 + double(div.int_) + double(div.frac) / 256.0;
-            // actual period is max(96, period)
-            if(period < 96.0) { period = 96.0; }
-            return double(clockSpeed) / period;
-        }
-
-        template<std::uint32_t ClockSpeed,
-                 std::uint32_t SampleRate,
-                 std::intmax_t Num,
-                 std::intmax_t Denom>
-        static constexpr bool isValidSampleRateConfig(std::ratio<Num,
-                                                                 Denom>) {
-            constexpr auto div    = calcDivRegs(ClockSpeed, SampleRate);
-            constexpr auto actual = calcActualSampleRate(ClockSpeed, div);
-            constexpr auto err    = actual - double(SampleRate);
-            constexpr auto absErr = err > 0.0 ? err : -err;
-            constexpr auto maxErr = double(SampleRate) * (double(Num) / double(Denom));
-            return absErr <= maxErr;
         }
 
     }   // namespace Detail
@@ -201,8 +122,8 @@ namespace Kvasir { namespace ADC {
     /// has no channel on this chip variant is a build error.
     template<int Port,
              int Pin>
-    constexpr std::uint8_t channelOf(Register::PinLocation<Port,
-                                                           Pin>) {
+    constexpr std::uint8_t channelOf(Io::PinLocation<Port,
+                                                     Pin>) {
         static_assert(Port == 0 && Detail::pinToAdcChannel<Pin>() >= 0,
                       "not an ADC pin on this chip variant");
         return static_cast<std::uint8_t>(Detail::pinToAdcChannel<Pin>());
@@ -210,61 +131,29 @@ namespace Kvasir { namespace ADC {
 
     /// The on-die temperature sensor's channel: 4 on the RP2040 and the RP2350A, 8 on the
     /// RP2350B (whose GPIO40..47 take channels 0..7).
-    inline constexpr std::uint8_t TempSensorChannel
+    inline constexpr std::uint8_t tempSensorChannel
       = static_cast<std::uint8_t>(Detail::tempSensorChannel());
-
-    namespace Traits { namespace ADC {
-        static constexpr auto getIsrIndexs() {
-            return brigand::list<decltype(Kvasir::Interrupt::adc_fifo)>{};
-        }
-
-        static constexpr auto getEnable() {
-            return clear(Peripheral::RESETS::Registers<>::RESET::adc);
-        }
-
-        static constexpr auto DmaTrigger() { return DMA::TriggerSource::adc; }
-    }}   // namespace Traits::ADC
 
     template<typename ADCConfig_>
     struct ADCBase {
         struct ADCConfig : ADCConfig_ {
-            static constexpr auto userConfigOverride = [] {
-                if constexpr(requires { ADCConfig_::userConfigOverride; }) {
-                    return ADCConfig_::userConfigOverride;
-                } else {
-                    return brigand::list<>{};
-                }
-            }();
+            static constexpr auto userConfigOverride
+              = KVASIR_CONFIG_OR(ADCConfig_, userConfigOverride, brigand::list<>{});
 
-            static constexpr bool enableTempSensor = [] {
-                if constexpr(requires { ADCConfig_::enableTempSensor; }) {
-                    return ADCConfig_::enableTempSensor;
-                } else {
-                    return false;
-                }
-            }();
+            static constexpr bool enableTempSensor
+              = KVASIR_CONFIG_OR(ADCConfig_, enableTempSensor, false);
 
-            static constexpr auto callbackFunctionSize = [] {
-                if constexpr(requires { ADCConfig_::callbackFunctionSize; }) {
-                    return ADCConfig_::callbackFunctionSize;
-                } else {
-                    return 0;
-                }
-            }();
+            static constexpr auto callbackFunctionSize
+              = KVASIR_CONFIG_OR(ADCConfig_, callbackFunctionSize, 0);
 
-            static constexpr auto maxSampleRateError = [] {
-                if constexpr(requires { ADCConfig_::maxSampleRateError; }) {
-                    return ADCConfig_::maxSampleRateError;
-                } else {
-                    return std::ratio<5, 1000>{};
-                }
-            }();
+            static constexpr auto maxSampleRateError
+              = KVASIR_CONFIG_OR(ADCConfig_, maxSampleRateError, std::ratio<5, 1000>{});
 
             static constexpr auto pins = ADCConfig_::pins;
         };
 
         // needed config:
-        // pins                 - brigand::list<Register::PinLocation<0, Pin>...>
+        // pins                 - brigand::list<Io::PinLocation<0, Pin>...>
         // clockSpeed           - ADC clock frequency in Hz (typically 48000000)
         // sampleRate           - desired sample rate in Hz
         // enableTempSensor     - bool (optional, default false)
@@ -274,14 +163,14 @@ namespace Kvasir { namespace ADC {
         // userConfigOverride   - (optional)
 
         using Regs            = Kvasir::Peripheral::ADC::Registers<0>;
-        using InterruptIndexs = decltype(Traits::ADC::getIsrIndexs());
+        using InterruptIndexs = typename Rp::Block<Regs>::Irqs;
 
         // Startup: the ADC, and the clock the sample divider is computed from (clk_adc,
         // 48 MHz from the USB PLL).
-        using Provides = brigand::list<Startup::Resource<InstanceTag, 0>>;
-        using Claims   = Clocks::Claim<Clocks::ClkAdc, ADCConfig::clockSpeed>;
+        using Provides = brigand::list<Hal::Owns<Regs>>;
+        using Claims   = Hal::Claim<Clocks::ClkAdc, ADCConfig::clockSpeed>;
 
-        static constexpr auto DmaTrigger = Traits::ADC::DmaTrigger();
+        static constexpr auto dmaTrigger = Rp::Block<Regs>::dreqRx;
 
         static_assert(Detail::allValidAdcPins(ADCConfig::pins),
                       "one or more pins are not valid ADC pins for this chip variant");
@@ -306,15 +195,56 @@ namespace Kvasir { namespace ADC {
 
         static constexpr auto channelTable_ = Detail::buildChannelTable<numChannels_>(channelMask_);
 
-        static constexpr auto powerClockEnable  = list(Traits::ADC::getEnable());
+        /// What a free-running mode's channel-attribution check found (AdcMath.hpp).
+        using Alignment = Detail::Alignment;
+
+        /// The AINSEL channel of sample `i` of a stream whose sample 0 is in channel-table slot
+        /// `firstSlot`.
+        [[nodiscard]] static constexpr std::uint8_t channelAt(std::size_t firstSlot,
+                                                              std::size_t i) {
+            return channelTable_.at(firstSlot, i);
+        }
+
+        /// Drops since boot - a buffer (DMA mode) or a drained batch (ISR mode) - because the FIFO
+        /// over- or underran (FCS.OVER / FCS.UNDER): the reader was held off for longer than the FIFO's 8
+        /// entries (RP2040 datasheet 4.9.2.4, RP2350 12.4.3.4).
+        [[nodiscard]] static std::uint32_t overruns() {
+            return overruns_.load(std::memory_order_relaxed);
+        }
+
+        /// Dropped since boot because AINSEL disagreed with the sample count: a sample gained or
+        /// lost that no FIFO flag reported.
+        [[nodiscard]] static std::uint32_t misalignments() {
+            return misalignments_.load(std::memory_order_relaxed);
+        }
+
+    protected:
+        // Written only by the one interrupt that reads the stream (load + store: no
+        // read-modify-write call on the M0+). One ADC, one owner (Hal::Owns): one pair.
+        inline static std::atomic<std::uint32_t> overruns_{0};
+        inline static std::atomic<std::uint32_t> misalignments_{0};
+
+        static void countDrop(Alignment a) {
+            auto& counter = a == Alignment::overrun ? overruns_ : misalignments_;
+            counter.store(counter.load(std::memory_order_relaxed) + 1U, std::memory_order_relaxed);
+        }
+
+        /// Clear START_MANY and wait out a conversion in flight (waitConversionsDone()).
+        static void haltConversions() {
+            apply(clear(Regs::CS::start_many));
+            static_cast<void>(waitConversionsDone());
+        }
+
+    public:
+        static constexpr auto powerClockEnable  = list(clear(Rp::Block<Regs>::reset));
         static constexpr auto initStepPinConfig = Detail::makeAllPinConfigs(ADCConfig::pins);
 
         static constexpr auto initStepPeripheryConfig = list(
           Regs::CS::overrideDefaults(
-            write(Regs::CS::en, Register::value<1u>()),
-            write(Regs::CS::ts_en, Register::value<ADCConfig::enableTempSensor ? 1u : 0u>()),
+            write(Regs::CS::en, Register::value<1U>()),
+            write(Regs::CS::ts_en, Register::value<ADCConfig::enableTempSensor ? 1U : 0U>()),
             write(Regs::CS::ainsel, Register::value<static_cast<std::uint32_t>(firstChannel_)>()),
-            write(Regs::CS::rrobin, Register::value<useRoundRobin_ ? channelMask_ : 0u>())),
+            write(Regs::CS::rrobin, Register::value<useRoundRobin_ ? channelMask_ : 0U>())),
           Regs::DIV::overrideDefaults(
             write(Regs::DIV::_int, Register::value<static_cast<std::uint32_t>(divRegs_.int_)>()),
             write(Regs::DIV::frac, Register::value<static_cast<std::uint32_t>(divRegs_.frac)>())),
@@ -324,14 +254,44 @@ namespace Kvasir { namespace ADC {
           = list(Nvic::makeSetPriority<ADCConfig::isrPriority>(InterruptIndexs{}),
                  Nvic::makeClearPending(InterruptIndexs{}));
 
-        // Bounds for the hardware-flag waits below. A conversion takes ~2 us and
-        // the FIFO is 4 deep, so hitting either limit means the ADC is disabled
-        // or wedged - give up rather than hang the caller.
-        static constexpr int ReadyPollLimit = 100000;
-        static constexpr int FifoDrainLimit = 64;
+        // Bounds for the hardware-flag waits below. A conversion takes 96 ADC clocks, 2 us at
+        // 48 MHz (RP2040 datasheet 4.9.2, RP2350 12.4.3), and the FIFO holds 8 results
+        // (RP2040 4.9.2.4, RP2350 12.4.3.4), so hitting either limit means the ADC is
+        // disabled or wedged - give up rather than hang the caller.
+        static constexpr int readyPollLimit = 100000;
+        static constexpr int fifoDrainLimit = 64;
+
+        /// ADC clocks per conversion (RP2040 datasheet 4.9.2, RP2350 12.4.3).
+        static constexpr std::uint32_t conversionClocks = 96;
+
+        /// READY reads in a row that span one whole conversion: every read takes at least one
+        /// system clock, and the system clock is at most the chip's ceiling.
+        static constexpr int readyStableReads = static_cast<int>(
+          conversionClocks
+          * ((Rp::ChipTraits::cpuHzCeiling + ADCConfig::clockSpeed - 1) / ADCConfig::clockSpeed));
+
+        static_assert(readyStableReads < readyPollLimit / 4,
+                      "the stable-READY wait must fit the poll bound several times over");
+
+        /// After START_MANY was cleared: wait until no conversion is in flight. CS.READY is 0
+        /// while one runs (RP2040 datasheet Table 568, RP2350 Table 1121), and both datasheets
+        /// say to poll it before draining the FIFO (RP2040 4.9.2.5, RP2350 12.4.3.5). One read
+        /// of 1 is not proof: a conversion the pacer started in the very cycles START_MANY was
+        /// cleared may not have dropped READY yet. It would complete after the FIFO was
+        /// drained and AINSEL reset - an extra first sample, and AINSEL one past the first
+        /// channel. So READY must read 1 for ReadyStableReads reads in a row, one conversion's
+        /// worth. Bounded by ReadyPollLimit; false when it never settled.
+        static bool waitConversionsDone() {
+            int stable = 0;
+            for(int i = 0; i < readyPollLimit; ++i) {
+                stable = get<0>(apply(read(Regs::CS::ready))) ? stable + 1 : 0;
+                if(stable >= readyStableReads) { return true; }
+            }
+            return false;
+        }
 
         static void drainFifo() {
-            for(int i = 0; i < FifoDrainLimit; ++i) {
+            for(int i = 0; i < fifoDrainLimit; ++i) {
                 if(get<0>(apply(read(Regs::FCS::empty)))) { break; }
                 apply(read(Regs::FIFO::val));
             }
@@ -342,7 +302,7 @@ namespace Kvasir { namespace ADC {
         [[nodiscard]] static bool startOnceAndWait(std::uint8_t channel) {
             apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(channel)));
             apply(set(Regs::CS::start_once));
-            for(int i = 0; i < ReadyPollLimit; ++i) {
+            for(int i = 0; i < readyPollLimit; ++i) {
                 if(get<0>(apply(read(Regs::CS::ready)))) { return true; }
             }
             return false;
@@ -382,15 +342,20 @@ namespace Kvasir { namespace ADC {
         }
     };
 
-    // DMA double-buffer behavior
-    // Continuously samples ADC into two ping-pong buffers.
-    // When one buffer fills, the callback is called with a span to the completed buffer
-    // while DMA fills the other.
-    //
-    // A FIFO overrun (the callback held the DMA off for longer than the FIFO's four
-    // entries) leaves the round-robin misaligned with the buffers, so the callback should
-    // check fifoOverran() and, when set, discard the buffer and call restart(): it clears
-    // the flag and realigns on the first channel.
+    /// Free-running sampling into two ping-pong DMA buffers. When one is full the callback
+    /// gets it, with the channel-table slot of its first sample, while the DMA fills the other:
+    /// sample i is on channel `channelAt(firstSlot, i)` (channelTable_.channels[(firstSlot + i)
+    /// % numChannels_]). A buffer does not start at the first channel unless BufferSize is a
+    /// multiple of the channel count.
+    ///
+    /// The FIFO carries no channel number (RP2040 datasheet Table 571, RP2350 Table 1124), so
+    /// the attribution is a count, and one sample lost or gained moves every channel onto its
+    /// neighbour for good - a die temperature read from a 2.5 V input. So the count is checked
+    /// against the hardware at the end of every buffer, right after the DMA was re-armed:
+    /// AINSEL must name the channel the count says comes next (checkAlignment()). A buffer that fails - or that saw a FIFO overrun or underrun - is
+    /// never handed to the callback: the stream is halted, realigned on the first channel and
+    /// re-armed, and the event counted (overruns(), misalignments()). The callback only ever
+    /// sees buffers whose attribution the hardware confirmed.
     template<typename ADCConfig_,
              typename Dma,
              typename Dma::Channel  DmaChannel,
@@ -400,16 +365,25 @@ namespace Kvasir { namespace ADC {
         using base = ADCBase<ADCConfig_>;
         using Regs = typename base::Regs;
 
+        static_assert(BufferSize > 0,
+                      "a DMA buffer holds at least one sample");
+
         using Claims = brigand::append<typename base::Claims, Kvasir::DMA::Claims<Dma, DmaChannel>>;
 
-        using DmaCallback_t = Kvasir::StaticFunction<void(std::span<std::uint16_t>),
-                                                     base::ADCConfig::callbackFunctionSize>;
+        /// (completed buffer, channel-table slot of its first sample)
+        using DmaCallback_t
+          = Kvasir::StaticFunction<void(std::span<std::uint16_t>, std::size_t firstSlot),
+                                   base::ADCConfig::callbackFunctionSize>;
 
         inline static std::array<std::uint16_t, BufferSize> bufferA_{};
         inline static std::array<std::uint16_t, BufferSize> bufferB_{};
         inline static bool                                  activeIsA_{true};
         inline static std::atomic<bool>                     running_{false};
         inline static DmaCallback_t                         userCallback_{};
+        // Channel-table slot of the first sample of the buffer being filled.
+        inline static std::size_t slot_{0};
+        using base::channelAt;
+        using typename base::Alignment;
 
         template<typename F>
         static void start(F&& callback) {
@@ -423,15 +397,9 @@ namespace Kvasir { namespace ADC {
             userCallback_.reset();
         }
 
-        /// FCS.OVER: the FIFO was full when a sample arrived, so samples were lost and the
-        /// channel alignment of the buffers is unknown. Sticky until restart() (or stop()
-        /// and start()) clears it.
-        [[nodiscard]] static bool fifoOverran() {
-            return get<0>(apply(read(Regs::FCS::over))) != 0;
-        }
-
-        /// Realign on the first channel without reassigning userCallback_: halts, clears
-        /// the overrun flag and re-arms. What the callback calls after fifoOverran().
+        /// Realign on the first channel without reassigning the callback: halts and re-arms.
+        /// The driver does this by itself for every buffer it does not hand over; a caller
+        /// needs it only to start the count over at a moment of its own choosing.
         static void restart() {
             halt();
             arm();
@@ -440,16 +408,17 @@ namespace Kvasir { namespace ADC {
     private:
         static void arm() {
             activeIsA_ = true;
+            slot_      = 0;
             running_.store(true, std::memory_order_relaxed);
 
             // Configure FIFO for DMA
-            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<1u>()),
-                                              write(Regs::FCS::dreq_en, Register::value<1u>()),
-                                              write(Regs::FCS::thresh, Register::value<1u>())));
+            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<1U>()),
+                                              write(Regs::FCS::dreq_en, Register::value<1U>()),
+                                              write(Regs::FCS::thresh, Register::value<1U>())));
 
             base::drainFifo();
 
-            // write-1-to-clear and survive halt(): left set, an overrun restart loops forever.
+            // write-1-to-clear and survive halt(): left set, every buffer would be an overrun.
             apply(set(Regs::FCS::over));
             apply(set(Regs::FCS::under));
 
@@ -458,14 +427,15 @@ namespace Kvasir { namespace ADC {
 
             // Start first DMA transfer to buffer A
             Dma::template start<DmaChannel,
-                                DmaPriority,
-                                base::DmaTrigger,
-                                Dma::TransferSize::_16,
-                                true,
-                                false>(reinterpret_cast<std::uint32_t>(bufferA_.data()),
-                                       Regs::FIFO::Addr::value,
-                                       BufferSize,
-                                       []() { dmaComplete(); });
+                                ::Kvasir::DMA::ChannelConfig{.priority = DmaPriority,
+                                                             .trigger  = base::dmaTrigger,
+                                                             .size     = Dma::TransferSize::size16,
+                                                             .incrementRead  = false,
+                                                             .incrementWrite = true}>(
+              reinterpret_cast<std::uint32_t>(bufferA_.data()),
+              Regs::FIFO::Addr::value,
+              BufferSize,
+              []() { dmaComplete(); });
 
             // Start free-running ADC
             apply(set(Regs::CS::start_many));
@@ -477,65 +447,137 @@ namespace Kvasir { namespace ADC {
             // channel armed for the rest of its transfers, so the next arm()
             // would re-arm a live channel. See DMA::abort.
             Dma::template abort<DmaChannel>();
-            apply(clear(Regs::CS::start_many));
-            for(int i = 0; i < base::ReadyPollLimit; ++i) {   // bounded, see drainFifo
-                if(get<0>(apply(read(Regs::CS::ready)))) { break; }
-            }
+            base::haltConversions();
 
-            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<0u>()),
-                                              write(Regs::FCS::dreq_en, Register::value<1u>())));
+            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<0U>()),
+                                              write(Regs::FCS::dreq_en, Register::value<1U>())));
 
             base::drainFifo();
+        }
+
+        /// At the end of a buffer, right after the DMA was re-armed on the other one
+        /// (Detail::checkAttribution, AdcMath.hpp, has the datasheet reasoning). Since the last
+        /// realign the DMA has moved slot_ + BufferSize samples (modulo the channel count) into
+        /// the buffer just completed, BufferSize - TRANS_COUNT more into the new one (TRANS_COUNT
+        /// reads the transfers left, live: RP2040 datasheet 2.5.1.2, RP2350 12.6.2.2), and the
+        /// FIFO holds LEVEL more. A snapshot holds still when TRANS_COUNT and LEVEL read the same
+        /// before and after AINSEL. Re-arming first keeps the FIFO's 8 entries (16 us at
+        /// 500 kS/s) for the interrupt's entry alone: checked before the re-arm, the first buffer
+        /// after a start overran on an RP2040 (a cold XIP cache in the handler).
+        [[gnu::always_inline]] static Detail::AttributionSnapshot snapshot() {
+            auto const left1 = Dma::template remaining<DmaChannel>();
+            auto const fcs
+              = apply(read(Regs::FCS::level), read(Regs::FCS::over), read(Regs::FCS::under));
+            auto const ainsel = get<0>(apply(read(Regs::CS::ainsel)));
+            auto const level2 = get<0>(apply(read(Regs::FCS::level)));
+            auto const left2  = Dma::template remaining<DmaChannel>();
+            auto const level  = get<0>(fcs);
+            return Detail::AttributionSnapshot{.flagged = get<1>(fcs) != 0 || get<2>(fcs) != 0,
+                                               .stable  = level == level2 && left1 == left2
+                                                       && left1 <= BufferSize,
+                                               .moved   = BufferSize + (BufferSize - left1) + level,
+                                               .ainsel  = static_cast<std::uint32_t>(ainsel)};
+        }
+
+        /// The rest of checkAlignment() after a first snapshot that did not settle it (judged
+        /// `first`). True: aligned. False: the buffer is dropped, counted, the stream halted and
+        /// re-armed.
+        [[gnu::noinline,
+          gnu::cold]] static bool
+        confirmOrRealign(Detail::Look first) {
+            auto const check = Detail::checkAttributionAfter(base::channelTable_, slot_, first, [] {
+                return snapshot();
+            });
+            if(check == Alignment::aligned) { return true; }
+            base::countDrop(check);
+            // halt() aborts the channel, arm() starts it with this same callback: the slot
+            // being invoked is re-published, which StaticFunction allows (its invoker runs
+            // on a copy of the callable).
+            halt();
+            arm();
+            return false;
+        }
+
+        /// The first snapshot inline (it decides nearly every buffer), the rest out of line.
+        [[nodiscard]] static bool checkAlignment() {
+            auto const s = snapshot();
+            auto const look
+              = Detail::judge<base::numChannels_>(s, base::channelTable_.at(slot_, s.moved));
+            if(look == Detail::Look::aligned) [[likely]] { return true; }
+            return confirmOrRealign(look);
         }
 
         static void dmaComplete() {
             if(!running_.load(std::memory_order_relaxed)) { return; }
 
-            auto completed = activeIsA_ ? std::span{bufferA_} : std::span{bufferB_};
-            activeIsA_     = !activeIsA_;
-            auto& next     = activeIsA_ ? bufferA_ : bufferB_;
+            auto const completed = activeIsA_ ? std::span{bufferA_} : std::span{bufferB_};
+            activeIsA_           = !activeIsA_;
+            auto& next           = activeIsA_ ? bufferA_ : bufferB_;
 
-            // retrigger(), not start(): start() would assign the slot onIsr() is invoking.
+            // First, while the FIFO still has room. retrigger(), not start(): start() would
+            // assign the slot onIsr() is invoking.
             Dma::template retrigger<DmaChannel,
-                                    DmaPriority,
-                                    base::DmaTrigger,
-                                    Dma::TransferSize::_16,
-                                    true,
-                                    false>(reinterpret_cast<std::uint32_t>(next.data()),
-                                           Regs::FIFO::Addr::value,
-                                           BufferSize);
+                                    ::Kvasir::DMA::ChannelConfig{.priority = DmaPriority,
+                                                                 .trigger  = base::dmaTrigger,
+                                                                 .size = Dma::TransferSize::size16,
+                                                                 .incrementRead  = false,
+                                                                 .incrementWrite = true}>(
+              reinterpret_cast<std::uint32_t>(next.data()),
+              Regs::FIFO::Addr::value,
+              BufferSize);
 
-            if(userCallback_) { userCallback_(completed); }
+            if(!checkAlignment()) { return; }
+
+            auto const firstSlot = slot_;
+            slot_ = Detail::ChannelTable<base::numChannels_>::template advance<BufferSize>(slot_);
+            if(userCallback_) { userCallback_(completed, firstSlot); }
         }
     };
 
-    // ISR behavior
-    // Each ADC FIFO sample triggers the user callback with (channel, value).
+    /// Free-running sampling, read by the ADC interrupt: the callback gets every sample with its
+    /// channel, `(channel, value)`.
+    ///
+    /// The attribution is a count, as in ADCDmaBehavior (the FIFO carries no channel number), so
+    /// it is checked the same way (Detail::checkAttribution, AdcMath.hpp): each interrupt drains
+    /// at most the FIFO's 8 entries into a local batch, then AINSEL must name the channel of
+    /// "delivered + drained + FIFO LEVEL" samples. Only a batch that passed is delivered - drained
+    /// samples are held until then, so a misattributed sample never reaches the callback. A batch
+    /// that fails, or a FIFO overrun or underrun (FCS.OVER / UNDER), drops the batch, halts,
+    /// realigns on the first channel and restarts, and is counted (overruns(),
+    /// misalignments()). The interrupt is level-triggered - asserted while LEVEL >= THRESH
+    /// (RP2040 datasheet Table 570, 4.9.2.6; RP2350 Table 1123, 12.4.3.6) - so samples left in
+    /// the FIFO after a batch raise it again at once.
     template<typename ADCConfig_>
     struct ADCIsrBehavior : ADCBase<ADCConfig_> {
         using base = ADCBase<ADCConfig_>;
         using Regs = typename base::Regs;
+        using base::channelAt;
+        using typename base::Alignment;
 
         using IsrCallback_t = Kvasir::StaticFunction<void(std::uint8_t, std::uint16_t),
                                                      base::ADCConfig::callbackFunctionSize>;
 
-        inline static std::size_t   channelIndex_{0};
+        /// The FIFO's depth (RP2040 datasheet 4.9.2.4, RP2350 12.4.3.4): one interrupt's batch.
+        static constexpr std::size_t batchSize = 8;
+
+        // Channel-table slot of the next sample the FIFO hands out.
+        inline static std::size_t   slot_{0};
         inline static IsrCallback_t userCallback_{};
 
         template<typename F>
         static void start(F&& callback) {
-            channelIndex_ = 0;
             userCallback_.publish(std::forward<F>(callback));
 
-            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<1u>()),
-                                              write(Regs::FCS::thresh, Register::value<1u>())));
+            // A conversion still in flight (a START_ONCE, a stream not stopped) would complete
+            // after AINSEL was written and step it past the first channel.
+            base::haltConversions();
 
-            base::drainFifo();
+            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<1U>()),
+                                              write(Regs::FCS::thresh, Register::value<1U>())));
+            realignStopped();
 
-            apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(base::firstChannel_)));
-
-            // channelIndex_ and userCallback_ are plain memory the ISR reads: keep their stores
-            // before the volatile writes that let it run
+            // slot_ and userCallback_ are plain memory the ISR reads: keep their stores before
+            // the volatile writes that let it run
             std::atomic_signal_fence(std::memory_order_seq_cst);
 
             // Enable FIFO interrupt
@@ -547,58 +589,101 @@ namespace Kvasir { namespace ADC {
         }
 
         static void stop() {
-            apply(clear(Regs::CS::start_many));
-            for(int i = 0; i < base::ReadyPollLimit; ++i) {   // bounded: see drainFifo
-                if(get<0>(apply(read(Regs::CS::ready)))) { break; }
-            }
+            base::haltConversions();
 
             apply(clear(Regs::INTE::fifo));
 
-            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<0u>())));
+            apply(Regs::FCS::overrideDefaults(write(Regs::FCS::en, Register::value<0U>())));
 
             base::drainFifo();
             userCallback_.reset();
         }
 
         static void onIsr() {
-            // On overrun the round-robin advanced past samples that were never
-            // stored, so channelIndex_ no longer matches the FIFO contents and
-            // every later sample would be attributed to the wrong channel. The
-            // offset is unknowable, so realign the way start() does: halt,
-            // discard the FIFO, reset AINSEL to the first channel, restart.
-            // Checked before the drain so misattributed samples are dropped.
-            if(get<0>(apply(read(Regs::FCS::over)))) {
-                apply(clear(Regs::CS::start_many));
-                for(int i = 0; i < base::ReadyPollLimit; ++i) {   // bounded, see drainFifo
-                    if(get<0>(apply(read(Regs::CS::ready)))) { break; }
-                }
-                base::drainFifo();
-                // Write-1-to-clear, safe here because the conversion is halted.
-                apply(set(Regs::FCS::over));
-                apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(base::firstChannel_)));
-                channelIndex_ = 0;
-                apply(set(Regs::CS::start_many));
-                return;
+            // At most one FIFO's worth a run: LEVEL only grows while it is read. A built-in array:
+            // std::array's operator[] is a call in the sanitize images.
+            std::uint16_t batch[batchSize];
+            auto const    level = static_cast<std::size_t>(get<0>(apply(read(Regs::FCS::level))));
+            std::size_t const drained = level < batchSize ? level : batchSize;
+            for(std::size_t i = 0; i < drained; ++i) {
+                batch[i] = static_cast<std::uint16_t>(get<0>(apply(read(Regs::FIFO::val))));
             }
-            // Bounded: in ISR context with the ADC free-running, an unbounded
-            // drain can be refilled as fast as it is emptied.
-            for(int i = 0; i < base::FifoDrainLimit; ++i) {
-                if(get<0>(apply(read(Regs::FCS::empty)))) { break; }
-                auto val = static_cast<std::uint16_t>(get<0>(apply(read(Regs::FIFO::val))));
-                auto ch  = base::channelTable_.channels[channelIndex_];
-                if constexpr(base::numChannels_ > 1) {
-                    channelIndex_ = (channelIndex_ + 1) % base::numChannels_;
-                }
-                if(userCallback_) { userCallback_(ch, val); }
+
+            // The check's first snapshot inline; it decides nearly every run. Anything else - a
+            // flag, a count that moved, a mismatch to confirm - is the out-of-line rest.
+            auto const first = slot_;
+            auto const s     = snapshot(drained);
+            if(auto const look = Detail::judge<n>(s, base::channelTable_.near(first, s.moved));
+               look != Detail::Look::aligned) [[unlikely]]
+            {
+                if(!confirmOrRealign(look, drained)) {
+                    return;
+                }   // dropped: the channels are unknown
+            }
+
+            if constexpr(n > 1) { slot_ = base::channelTable_.slotAfter(first, drained); }
+            for(std::size_t i = 0; i < drained; ++i) {
+                if(userCallback_) { userCallback_(base::channelTable_.near(first, i), batch[i]); }
             }
         }
 
-        template<typename... Ts>
-        static constexpr auto makeIsr(brigand::list<Ts...>) {
-            return brigand::list<
-              Kvasir::Nvic::Isr<std::addressof(onIsr), Nvic::Index<Ts::value>>...>{};
+        using Isr = Nvic::IsrsFor<std::addressof(onIsr), typename base::InterruptIndexs>;
+
+    private:
+        static constexpr std::size_t n = base::numChannels_;
+
+        static_assert(batchSize == Detail::fifoDepth);
+        static_assert((Regs::FCS::level.mask >> std::countr_zero(Regs::FCS::level.mask))
+                        == Detail::levelFieldMax,
+                      "near()/slotAfter() reach a batch plus the largest LEVEL");
+
+        /// One look for Detail::checkAttribution after `drained` samples were drained: FCS (LEVEL, OVER,
+        /// UNDER: one load), AINSEL, LEVEL again - stable when both LEVELs agree. One channel
+        /// needs only the flags (no round robin: checkAttribution asks nothing else).
+        [[gnu::always_inline]] static Detail::AttributionSnapshot snapshot(std::size_t drained) {
+            auto const fcs
+              = apply(read(Regs::FCS::level), read(Regs::FCS::over), read(Regs::FCS::under));
+            bool const flagged = get<1>(fcs) != 0 || get<2>(fcs) != 0;
+            if constexpr(n == 1) {
+                return {.flagged = flagged, .stable = true, .moved = drained, .ainsel = 0};
+            } else {
+                auto const ainsel = get<0>(apply(read(Regs::CS::ainsel)));
+                auto const level2 = get<0>(apply(read(Regs::FCS::level)));
+                return {.flagged = flagged,
+                        .stable  = get<0>(fcs) == level2,
+                        .moved   = drained + static_cast<std::size_t>(get<0>(fcs)),
+                        .ainsel  = static_cast<std::uint32_t>(ainsel)};
+            }
         }
 
-        using Isr = decltype(makeIsr(typename base::InterruptIndexs{}));
+        /// The rest of the check after a first snapshot that did not settle it, judged `first`
+        /// (up to 16 snapshots in all, a mismatch confirmed twice, a flag ends it). True: aligned,
+        /// deliver. False: the batch is dropped, counted, and the stream halted, realigned and
+        /// restarted.
+        [[gnu::noinline,
+          gnu::cold]] static bool
+        confirmOrRealign(Detail::Look first,
+                         std::size_t  drained) {
+            auto const check
+              = Detail::checkAttributionAfter(base::channelTable_, slot_, first, [drained] {
+                    return snapshot(drained);
+                });
+            if(check == Alignment::aligned) { return true; }
+            base::countDrop(check);
+            base::haltConversions();
+            realignStopped();
+            apply(set(Regs::CS::start_many));
+            return false;
+        }
+
+        /// With no conversion in flight: empty the FIFO, clear its sticky flags, AINSEL to the
+        /// first channel, the count to slot 0.
+        static void realignStopped() {
+            base::drainFifo();
+            // write-1-to-clear (Table 570 / 1123); left set, every batch would be an overrun.
+            apply(set(Regs::FCS::over), set(Regs::FCS::under));
+            apply(write(Regs::CS::ainsel, static_cast<std::uint32_t>(base::firstChannel_)));
+            slot_ = 0;
+        }
     };
 }}   // namespace Kvasir::ADC

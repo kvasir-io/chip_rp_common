@@ -1,9 +1,8 @@
 #pragma once
+#include "DMA.hpp"
+#include "chip/RpTraits.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/XIP_CTRL.hpp"
-#if __has_include("peripherals/XIP_AUX.hpp")
-    #include "peripherals/XIP_AUX.hpp"
-#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -43,16 +42,10 @@ namespace Kvasir { namespace Xip {
         apply(write(Ctrl::CTR_ACC::FULLREGISTER, Register::value<0>()));
     }
 
-    /// The streaming FIFO's address through the auxiliary window: what a DMA channel reads.
-    /// (The RP2040's SVD has no XIP_AUX block; its window is at 0x50400000.)
-#if __has_include("peripherals/XIP_AUX.hpp")
-    static constexpr std::uint32_t StreamFifoAux
-      = Kvasir::Peripheral::XIP_AUX::Registers<>::STREAM::Addr::value;
-#else
-    static constexpr std::uint32_t StreamFifoAux = 0x5040'0000U;
-#endif
+    /// The streaming FIFO's address through the auxiliary window: what a DMA channel reads (chip/RpTraits.hpp).
+    static constexpr std::uint32_t streamFifoAux = Rp::ChipTraits::xipStreamFifoAux;
 
-    [[nodiscard]] inline bool streamFifoEmpty() { return apply(read(Ctrl::STAT::fifo_empty)); }
+    [[nodiscard]] inline bool streamFifoEmpty() { return apply(read(Ctrl::STAT::fifo_empty)) != 0; }
 
     /// Drain whatever a previous stream left, then start `words` from `flashAddress`
     /// (a 4-byte aligned XIP address). STREAM_ADDR's field is bits 31:2 (RP2040 Table 160, RP2350
@@ -82,14 +75,15 @@ namespace Kvasir { namespace Xip {
                       "the XIP stream's DMA channel is not this DmaBase's");
         startStream(flashAddress, words);
         Dma::template start<Channel,
-                            Dma::Priority::high,
-                            Dma::TriggerSource::xip_stream,
-                            Dma::TransferSize::_32,
-                            true,
-                            false>(reinterpret_cast<std::uint32_t>(into),
-                                   StreamFifoAux,
-                                   words,
-                                   std::forward<F>(f));
+                            ::Kvasir::DMA::ChannelConfig{.priority = Dma::Priority::high,
+                                                         .trigger  = Dma::TriggerSource::xip_stream,
+                                                         .size     = Dma::TransferSize::size32,
+                                                         .incrementRead  = false,
+                                                         .incrementWrite = true}>(
+          reinterpret_cast<std::uint32_t>(into),
+          streamFifoAux,
+          words,
+          std::forward<F>(f));
     }
 
 }}   // namespace Kvasir::Xip

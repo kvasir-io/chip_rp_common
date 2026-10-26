@@ -7,4 +7,4 @@ struct Nops : Kvasir::Pio::Program<Kvasir::Pio::assemble([](Kvasir::Pio::Asm& a)
     for(int i = 0; i < N; ++i) { a.nop(); }
 })> {};
 
-static_assert(Nops<33>::Wrap == 32);
+static_assert(Nops<33>::wrap == 32);

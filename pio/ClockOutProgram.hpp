@@ -7,7 +7,7 @@
 namespace Kvasir { namespace Pio {
     /// A square wave on one pin, for a clock the chip's own clock generators cannot reach.
     ///
-    /// Two instructions, so one period is two cycles: the output is ClockSpeed / (2 * clockDiv)
+    /// Two instructions, so one period is two cycles: the output is clockSpeed / (2 * clockDiv)
     /// at 50% duty. The shortest loop needs the largest divider and so gives the finest 16.8
     /// step. No wrap is needed: a two-instruction program wraps on its own.
     struct ClockOutProgram : Program<assemble([](Asm& a) {

@@ -1,0 +1,10 @@
+# Headers that do not compile alone right after kvasir_config.hpp yet: <dir>/<file> <chip> <reason>, <chip> the
+# CONFORMANCE_CHIP (rp2040, rp2350 or both) the line holds for; CMakeLists.txt hands the lines of the configured chip to
+# kvasir_conformance_project(NOT_ALONE). They compile inside chip/chip.hpp, which includes the register headers and
+# chip/PinConfig.hpp before the drivers. The list is the input of making the headers self-contained; a header that
+# compiles alone again comes off it (then the build compiles it alone).
+rp_common/Powman.hpp         rp2040  POWMAN is RP2350-only: #error on the RP2040 by design
+rp_common/Sha256.hpp         rp2040  the SHA-256 block is RP2350-only: #error on the RP2040 by design
+rp_common/Trng.hpp           rp2040  the TRNG is RP2350-only: #error on the RP2040 by design
+rp_common/Qmi.hpp            rp2040  the QMI is RP2350-only: #error on the RP2040 by design
+rp_common/Rtc.hpp            rp2350  the RTC is RP2040-only: #error on the RP2350 by design

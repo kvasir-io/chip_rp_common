@@ -1,8 +1,10 @@
 #pragma once
-#if !__has_include("chip/rp2350.hpp")
+#ifndef KVASIR_CHIP_RP2350
     #error "the TRNG exists on the RP2350 only"
 #endif
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Config.hpp"
 #include "peripherals/RESETS.hpp"
 #include "peripherals/TRNG.hpp"
 
@@ -38,27 +40,12 @@ namespace Kvasir { namespace Trng {
     template<typename Config_ = void>
     struct Trng {
         struct Config {
-            static constexpr bool rawSamples = [] {
-                if constexpr(requires { Config_::rawSamples; }) {
-                    return static_cast<bool>(Config_::rawSamples);
-                } else {
-                    return false;
-                }
-            }();
-            static constexpr std::uint32_t sampleCount = [] {
-                if constexpr(requires { Config_::sampleCount; }) {
-                    return static_cast<std::uint32_t>(Config_::sampleCount);
-                } else {
-                    return rawSamples ? 25U : 250U;
-                }
-            }();
-            static constexpr std::uint32_t chainLength = [] {
-                if constexpr(requires { Config_::chainLength; }) {
-                    return static_cast<std::uint32_t>(Config_::chainLength);
-                } else {
-                    return 0U;
-                }
-            }();
+            static constexpr bool rawSamples
+              = static_cast<bool>(KVASIR_CONFIG_OR(Config_, rawSamples, false));
+            static constexpr std::uint32_t sampleCount = static_cast<std::uint32_t>(
+              KVASIR_CONFIG_OR(Config_, sampleCount, rawSamples ? 25U : 250U));
+            static constexpr std::uint32_t chainLength
+              = static_cast<std::uint32_t>(KVASIR_CONFIG_OR(Config_, chainLength, 0U));
         };
 
         static_assert(Config::chainLength < 4,
@@ -70,8 +57,7 @@ namespace Kvasir { namespace Trng {
 
         using Regs = Kvasir::Peripheral::TRNG::Registers<>;
 
-        static constexpr auto powerClockEnable
-          = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::trng));
+        static constexpr auto powerClockEnable = list(clear(Rp::Block<Regs>::reset));
 
         static constexpr auto initStepPeripheryConfig = list(
           write(Regs::SAMPLE_CNT1::sample_cntr1, Register::value<Config::sampleCount>()),
@@ -84,12 +70,12 @@ namespace Kvasir { namespace Trng {
         static constexpr auto initStepPeripheryEnable
           = list(set(Regs::RND_SOURCE_ENABLE::rnd_src_en));
 
-        static constexpr std::size_t WordsPerFill = 6;
+        static constexpr std::size_t wordsPerFill = 6;
 
         static inline std::uint32_t restarts_{};
 
         /// Whether the EHR holds a complete fill.
-        [[nodiscard]] static bool ready() { return apply(read(Regs::VALID::ehr_valid)); }
+        [[nodiscard]] static bool ready() { return apply(read(Regs::VALID::ehr_valid)) != 0; }
 
         /// RNG_ICR: a 1 clears the bit in RNG_ISR (RP2350 datasheet 12.12.5, Table 1264;
         /// AUTOCORR_ERR only by an RNG reset). Every field named, the rest reserved: one store.
@@ -119,7 +105,7 @@ namespace Kvasir { namespace Trng {
         /// One fill of the EHR: six words, 192 bits. Blocks until the fill is complete; with
         /// the checks on, a fill the block rejected is discarded and the wait starts over.
         [[nodiscard]] static std::array<std::uint32_t,
-                                        WordsPerFill>
+                                        wordsPerFill>
         fill() {
             while(true) {
                 while(!ready()) {
@@ -130,7 +116,7 @@ namespace Kvasir { namespace Trng {
                         if(get<0>(errors) || get<1>(errors) || get<2>(errors)) { restart(); }
                     }
                 }
-                std::array<std::uint32_t, WordsPerFill> words{
+                std::array<std::uint32_t, wordsPerFill> words{
                   get<0>(apply(read(Regs::EHR_DATA0::ehr_data0))),
                   get<0>(apply(read(Regs::EHR_DATA1::ehr_data1))),
                   get<0>(apply(read(Regs::EHR_DATA2::ehr_data2))),
@@ -148,11 +134,11 @@ namespace Kvasir { namespace Trng {
 
         /// A word from the cached fill, refilling when it is used up.
         [[nodiscard]] static std::uint32_t next32() {
-            static std::array<std::uint32_t, WordsPerFill> cache{};
+            static std::array<std::uint32_t, wordsPerFill> cache{};
             static std::size_t                             left = 0;
             if(left == 0) {
                 cache = fill();
-                left  = WordsPerFill;
+                left  = wordsPerFill;
             }
             return cache[--left];
         }

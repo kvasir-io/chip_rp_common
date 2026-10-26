@@ -1,6 +1,6 @@
 #pragma once
-// The PLL settings search of clock_config.hpp. Chip-free (no register header), so the SDK's
-// prescaler tests compile this very file against the search it replaced.
+// The PLL settings search of clock_config.hpp. Chip-free (no register header), so the host test
+// tests/pll_search_test.cpp compiles this very file against an exhaustive search.
 #include "kvasir/Util/Prescaler.hpp"
 
 #include <algorithm>
@@ -47,7 +47,7 @@ namespace Kvasir { namespace DefaultClockSettings { namespace detail {
         // nearest allowed FBDIV below the ideal one and the nearest above it can win: two
         // candidates per (REFDIV, POSTDIV2, POSTDIV1) instead of every FBDIV. A setting with the
         // best margin is always one of them, and among equal VCOs the order (REFDIV, POSTDIV2,
-        // POSTDIV1) is vcocalc.py's, so the result is the full search's (util_prescaler_tests).
+        // POSTDIV1) is vcocalc.py's, so the result is the full search's (tests/pll_search_test.cpp).
         auto const candidate = [=](std::uint32_t k) {
             std::uint32_t const refdiv = k / (2 * pairs) + 1;
             std::uint32_t const p      = k % (2 * pairs) / 2;
@@ -81,9 +81,7 @@ namespace Kvasir { namespace DefaultClockSettings { namespace detail {
                                .refdiv = refdiv};
         };
 
-        auto candidates = std::views::iota(0U, refdivs * 2 * pairs)
-                        | std::views::transform(candidate)
-                        | std::views::filter([](PllSettings const& c) { return c.refdiv != 0; });
+        auto const usable = [](PllSettings const& c) { return c.refdiv != 0; };
 
         // VCO a above VCO b: fbdiv_a / refdiv_a > fbdiv_b / refdiv_b
         auto const prefer = [](PllSettings const& a, PllSettings const& b) {
@@ -95,7 +93,9 @@ namespace Kvasir { namespace DefaultClockSettings { namespace detail {
         auto const r = Prescaler::search(
           crystalSpeed,
           clockSpeed,
-          candidates,
+          // passed as a temporary: a filter_view is iterated non-const (it caches its begin)
+          std::views::iota(0U, refdivs * 2 * pairs) | std::views::transform(candidate)
+            | std::views::filter(usable),
           [](PllSettings const& s) {
               return Prescaler::Rational{s.fbdiv, std::uint64_t{s.refdiv} * s.pd1 * s.pd2};
           },

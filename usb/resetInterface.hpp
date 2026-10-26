@@ -2,7 +2,7 @@
 
 // The picotool reset interface (kvasir/Devices/USB/VendorReset.hpp) on an RP2040 / RP2350.
 
-#include "../bootrom_functions.hpp"
+#include "../BootromReboot.hpp"
 
 #include <cstddef>
 #include <kvasir/Devices/USB/VendorReset.hpp>

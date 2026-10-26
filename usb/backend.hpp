@@ -12,17 +12,29 @@
 // Besides what the device reads, the config struct may carry
 //
 //     isrPriority      1
-//     DoubleBuffered   true: two packets armed per IN endpoint (endpointOps.hpp)
+//     doubleBuffered   true: two packets armed per IN endpoint (endpointOps.hpp)
 
 #include "../Clocks.hpp"
+#include "Reattach.hpp"   // a degraded boot's re-attach after its switch-up (Clocks::AfterSwitchUp)
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
+#include "chip/Interrupt.hpp"
+#include "core/core.hpp"
 #include "detail.hpp"
 #include "endpointOps.hpp"
-#include "kvasir/Register/RegisterFmt.hpp"
-#include "kvasir/Util/RateLimiter.hpp"
+#include "kvasir/Hal/Owns.hpp"
+#include "kvasir/Log/FaultLog.hpp"
+#include "kvasir/Log/LogLimited.hpp"
+#include "kvasir/Log/RateLimiter.hpp"
+#include "kvasir/Register/Flags.hpp"
+#include "kvasir/Util/Config.hpp"
+#include "peripherals/CLOCKS.hpp"
+#include "peripherals/PLL.hpp"
+#include "peripherals/RESETS.hpp"
+#include "peripherals/USB.hpp"
+#include "peripherals/USB_DPRAM.hpp"
 
 #include <atomic>
 #include <bit>
-#include <chip/chip.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -31,11 +43,9 @@
 #include <kvasir/Devices/USB/Descriptors.hpp>
 #include <memory>
 #include <string_view>
+#include <uc_log/uc_log.hpp>
 
 namespace Kvasir::USB::Rp {
-// Startup resource: the one USB controller (kvasir/StartUp/Resources.hpp).
-struct InstanceTag {};
-
 template<typename Clock, typename ConfigT>
 struct Backend {
 private:
@@ -47,41 +57,24 @@ private:
     using ClockType  = Clock;
     using Traits     = Kvasir::USB::ConfigTraits<ConfigT>;
 
-    static constexpr auto isrPriority = [] {
-        if constexpr(requires { ConfigT::isrPriority; }) {
-            return ConfigT::isrPriority;
-        } else {
-            return 1;
-        }
-    }();
-    static constexpr auto DoubleBuffered = [] {
-        if constexpr(requires { ConfigT::DoubleBuffered; }) {
-            return ConfigT::DoubleBuffered;
-        } else {
-            return true;
-        }
-    }();
+    static constexpr auto isrPriority    = KVASIR_CONFIG_OR(ConfigT, isrPriority, 1);
+    static constexpr auto doubleBuffered = KVASIR_CONFIG_OR(ConfigT, doubleBuffered, true);
 
     // clk_sys, for the gap between a buffer control's fields and its AVAILABLE bit
     // (EndpointOps::writeBufferControl). A config that does not say gets the fastest clk_sys
     // anybody runs these chips at, which only makes the gap longer than it has to be.
-    static constexpr std::uint64_t UsbClockHz = 48'000'000;
-    static constexpr std::uint64_t SysClockHz = [] {
-        if constexpr(requires { ConfigT::sysClockHz; }) {
-            return static_cast<std::uint64_t>(ConfigT::sysClockHz);
-        } else {
-            return std::uint64_t{300'000'000};
-        }
-    }();
+    static constexpr std::uint64_t usbClockHz = 48'000'000;
+    static constexpr std::uint64_t sysClockHz = static_cast<std::uint64_t>(
+      KVASIR_CONFIG_OR(ConfigT, sysClockHz, std::uint64_t{300'000'000}));
     // RP2350-E12 and RP2040-E16: clk_usb-to-clk_sys events are not synchronised, and get lost
     // unless clk_sys runs at least 10 % faster than clk_usb. Only a config that states its
     // sysClockHz is checked: the 300 MHz default passes by construction.
-    static_assert(SysClockHz * 10 >= UsbClockHz * 11,
+    static_assert(sysClockHz * 10 >= usbClockHz * 11,
                   "USB: clk_sys must run at least 10 % faster than clk_usb (RP2350-E12)");
     // At least one clk_usb cycle in clk_sys cycles, plus one for the edge the first write
     // lands on (RP2350 datasheet 12.7.3.7.1: 125 / 48 MHz -> 3 nops).
-    static constexpr std::uint32_t AvailableDelayCycles
-      = static_cast<std::uint32_t>((SysClockHz + UsbClockHz - 1) / UsbClockHz) + 1;
+    static constexpr std::uint32_t availableDelayCycles
+      = static_cast<std::uint32_t>((sysClockHz + usbClockHz - 1) / usbClockHz) + 1;
 
     enum class Fault : std::uint8_t {
         epTxError = 1,
@@ -91,16 +84,16 @@ private:
     };
     // Fault logging goes through this: a bad cable repeats these per packet, from inside the
     // ISR.
-    static inline Kvasir::RateLimiter<Clock, Kvasir::RateLimiterConfig{.burst = 8}> faultLog_{};
+    static inline Kvasir::FaultLog<Clock, Fault, Kvasir::RateLimiterConfig{.burst = 8}> faultLog_{};
 
     // RP2040/RP2350 DPSRAM buffer size
-    static constexpr std::size_t DPSRAMSize = 4096;
+    static constexpr std::size_t dpsramSize = 4096;
 
-    static constexpr auto InterruptIndexes = brigand::list<decltype(Kvasir::Interrupt::usbctrl)>{};
+    static constexpr auto interruptIndexes = brigand::list<decltype(Kvasir::Interrupt::usbctrl)>{};
 
     static SetupPacket getSetupPacket() {
         SetupPacket ret;
-        detail::device_memory_memcpy(
+        detail::deviceMemoryMemcpy(
           std::addressof(ret),
           reinterpret_cast<void const*>(BufferRegs::SETUP_PACKET_LOW::Addr::value),
           sizeof(SetupPacket));
@@ -131,7 +124,7 @@ private:
     }
 
     static constexpr auto getWatchdogEnable() {
-#if __has_include("chip/rp2350.hpp")
+#ifdef KVASIR_CHIP_RP2350
         return Kvasir::MPL::list(
           Regs::DEV_SM_WATCHDOG::overrideDefaults(
             clear(Regs::DEV_SM_WATCHDOG::enable),
@@ -153,50 +146,50 @@ private:
                                        set(Regs::INTE::abort_done),
                                        set(Regs::INTE::dev_suspend),
                                        set(Regs::INTE::dev_resume_from_host),
-#if __has_include("chip/rp2350.hpp")
+#ifdef KVASIR_CHIP_RP2350
                                        set(Regs::INTE::dev_sm_watchdog_fired),
 #endif
                                        getSofEnable()));
     }
 
 public:
-    static constexpr std::size_t MaxPacketSize = 64;
+    static constexpr std::size_t maxPacketSize = 64;
     // EP0 plus one DPRAM group per further endpoint number. EndpointOps always addresses
     // buffers through the DOUBLEBUFFER groups (2 x 2 x 64 bytes each), of which the buffer map
     // has 8, whether or not double buffering is enabled.
-    static constexpr std::size_t EndpointCount = 8;
+    static constexpr std::size_t endpointCount = 8;
     // EP_ABORT is a request; the controller answers with the abort_done interrupt.
-    static constexpr bool AsyncCancel = true;
+    static constexpr bool asyncCancel = true;
 
     template<std::size_t N, EndpointDirection Dir, EndpointTransferType Type>
     using Endpoint = Kvasir::USB::detail::EndpointOps<Backend, N, Dir, Type>;
 
 private:
-    using EP0_IN  = Endpoint<0, EndpointDirection::In, EndpointTransferType::Control>;
-    using EP0_OUT = Endpoint<0, EndpointDirection::Out, EndpointTransferType::Control>;
+    using Ep0In  = Endpoint<0, EndpointDirection::In, EndpointTransferType::Control>;
+    using Ep0Out = Endpoint<0, EndpointDirection::Out, EndpointTransferType::Control>;
 
 public:
     template<typename Sink>
     static void dispatchEvents() {
-        static constexpr auto CommonIsrList
+        static constexpr auto commonIsrList
           = Kvasir::MPL::list(read(Regs::INTS::setup_req),
                               read(Regs::INTS::buff_status),
                               read(Regs::INTS::bus_reset),
-#if __has_include("chip/rp2350.hpp")
+#ifdef KVASIR_CHIP_RP2350
                               read(Regs::INTS::dev_sm_watchdog_fired),
 #endif
                               read(Regs::INTS::dev_suspend),
                               read(Regs::INTS::dev_resume_from_host),
                               read(Regs::INTS::abort_done));
-        static constexpr auto IsrList = []() {
+        static constexpr auto isrList = []() {
             if constexpr(Traits::UseSof) {
-                return Kvasir::MPL::list(CommonIsrList, read(Regs::INTS::dev_sof));
+                return Kvasir::MPL::list(commonIsrList, read(Regs::INTS::dev_sof));
             } else {
-                return CommonIsrList;
+                return commonIsrList;
             }
         }();
 
-        auto const status = apply(IsrList);
+        auto const status = apply(isrList);
 
         // The controller ACKs a SETUP and clears only EP0's stall arms (RP2040 datasheet 4.1.2.5,
         // md l.18232-18244): a buffer still AVAILABLE answers the next IN token, which for a host
@@ -209,24 +202,24 @@ public:
         std::uint32_t const sieStatus = apply(read(Regs::SIE_STATUS::FULLREGISTER));
 
         constexpr std::uint32_t errorMask
-          = Regs::SIE_STATUS::data_seq_error.Mask | Regs::SIE_STATUS::rx_timeout.Mask
-          | Regs::SIE_STATUS::rx_overflow.Mask | Regs::SIE_STATUS::bit_stuff_error.Mask
-          | Regs::SIE_STATUS::crc_error.Mask
-#if __has_include("chip/rp2350.hpp")
-          | Regs::SIE_STATUS::endpoint_error.Mask
+          = Regs::SIE_STATUS::data_seq_error.mask | Regs::SIE_STATUS::rx_timeout.mask
+          | Regs::SIE_STATUS::rx_overflow.mask | Regs::SIE_STATUS::bit_stuff_error.mask
+          | Regs::SIE_STATUS::crc_error.mask
+#ifdef KVASIR_CHIP_RP2350
+          | Regs::SIE_STATUS::endpoint_error.mask
 #endif
           ;
 
-#if __has_include("chip/rp2350.hpp")
+#ifdef KVASIR_CHIP_RP2350
         if(std::uint32_t const txError = apply(read(Regs::EP_TX_ERROR::FULLREGISTER))) {
-            KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::epTxError, txError)),
+            KVASIR_LOG_LIMITED(faultLog_.note(Fault::epTxError, txError),
                                UC_LOG_E,
                                "USB: EP_TX_ERROR: {}",
                                Kvasir::Register::Flags<typename Regs::EP_TX_ERROR>{txError});
             apply(write(Regs::EP_TX_ERROR::FULLREGISTER, Kvasir::Register::value<0xffffffff>()));
         }
         if(std::uint32_t const rxError = apply(read(Regs::EP_RX_ERROR::FULLREGISTER))) {
-            KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::epRxError, rxError)),
+            KVASIR_LOG_LIMITED(faultLog_.note(Fault::epRxError, rxError),
                                UC_LOG_E,
                                "USB: EP_RX_ERROR: {}",
                                Kvasir::Register::Flags<typename Regs::EP_RX_ERROR>{rxError});
@@ -235,7 +228,7 @@ public:
 #endif
         if(sieStatus & errorMask) {
             KVASIR_LOG_LIMITED(
-              faultLog_.allow(Kvasir::rateLimitKey(Fault::sieError, sieStatus & errorMask)),
+              faultLog_.note(Fault::sieError, sieStatus & errorMask),
               UC_LOG_E,
               "USB: SIE_STATUS error: {}",
               Kvasir::Register::Flags<typename Regs::SIE_STATUS>{sieStatus & errorMask});
@@ -243,7 +236,7 @@ public:
             apply(write(Regs::SIE_STATUS::FULLREGISTER, sieStatus & errorMask));
         }
 
-        if constexpr(Traits::UseSof == true) {
+        if constexpr(Traits::UseSof) {
             if(status[Regs::INTS::dev_sof]) {
                 auto const sof = get<0>(apply(read(Regs::SOF_RD::count)));
                 Sink::startOfFrame(static_cast<std::uint16_t>(sof));
@@ -263,7 +256,7 @@ public:
         // both chips' SVDs: reset() writes the one bit.
         if(status[Regs::INTS::dev_suspend]) {
             apply(reset(Regs::SIE_STATUS::suspended));
-            if(sieStatus & Regs::SIE_STATUS::suspended.Mask) {
+            if(sieStatus & Regs::SIE_STATUS::suspended.mask) {
                 Sink::suspend();
             } else {
                 Sink::resume();
@@ -274,11 +267,9 @@ public:
             Sink::resume();
         }
 
-#if __has_include("chip/rp2350.hpp")
+#ifdef KVASIR_CHIP_RP2350
         if(status[Regs::INTS::dev_sm_watchdog_fired]) {
-            KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::watchdog)),
-                               UC_LOG_E,
-                               "USB: watchdog");
+            KVASIR_LOG_LIMITED(faultLog_.note(Fault::watchdog), UC_LOG_E, "USB: watchdog");
             apply(set(Regs::DEV_SM_WATCHDOG::fired));
         }
 #endif
@@ -317,8 +308,8 @@ public:
     // (EP_ABORT needs an RP2040 B2 or later, erratum RP2040-E2 - as the bulk endpoints' abort does.)
     static void beginControlTransfer() {
         std::uint32_t armed = 0;
-        if(EP0_IN::armedBuffers() != 0) { armed |= 1U << 0U; }
-        if(EP0_OUT::armedBuffers() != 0) { armed |= 1U << 1U; }
+        if(Ep0In::armedBuffers() != 0) { armed |= 1U << 0U; }
+        if(Ep0Out::armedBuffers() != 0) { armed |= 1U << 1U; }
         if(armed != 0) {
             std::uint32_t const aborts = apply(read(Regs::EP_ABORT::FULLREGISTER));
             apply(write(Regs::EP_ABORT::FULLREGISTER, aborts | armed));
@@ -327,43 +318,35 @@ public:
                 if((done & armed) == armed) { break; }
             }
         }
-        EP0_IN::cancelTransfer();
-        EP0_OUT::cancelTransfer();
+        Ep0In::cancelTransfer();
+        Ep0Out::cancelTransfer();
         if(armed != 0) {
             std::uint32_t const aborts = apply(read(Regs::EP_ABORT::FULLREGISTER));
             apply(write(Regs::EP_ABORT::FULLREGISTER, aborts & ~armed));
             // Acknowledged here: nobody waits for an abort_done of endpoint 0.
             apply(write(Regs::EP_ABORT_DONE::FULLREGISTER, armed));
         }
-        EP0_IN::state.setDataPhase();
-        EP0_OUT::state.setDataPhase();
+        Ep0In::state.setDataPhase();
+        Ep0Out::state.setDataPhase();
     }
 
-    // The ICER/ISER writes are volatile stores and order nothing else: the masked section's plain
-    // loads could move above the mask, its stores below the unmask, into reach of the interrupt.
-    // dsb; isb after the mask so an interrupt already on its way is not taken after it either.
+    // The controller's interrupt masked around thread code (Nvic::LineMask, core/Nvic.hpp: ICER, dsb; isb -
+    // fence, ISER). Not nesting: the device layer counts.
     static void maskInterrupt() {
-        apply(Kvasir::Nvic::makeDisable(InterruptIndexes));
-        asm volatile(
-          "dsb\n"
-          "isb\n"
-          :
-          :
-          : "memory");
+        Kvasir::Nvic::LineMask<std::remove_cvref_t<decltype(interruptIndexes)>>::mask();
     }
 
     static void unmaskInterrupt() {
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-        apply(Kvasir::Nvic::makeEnable(InterruptIndexes));
+        Kvasir::Nvic::LineMask<std::remove_cvref_t<decltype(interruptIndexes)>>::unmask();
     }
 
     static void prepare() {
         //can use std::memset here since it should always make alligned access.
-        std::memset(reinterpret_cast<void*>(BufferRegs::baseAddr), 0, DPSRAMSize);
+        std::memset(reinterpret_cast<void*>(BufferRegs::baseAddr), 0, dpsramSize);
     }
 
     static void connect() {
-        apply(Kvasir::Nvic::makeEnable(InterruptIndexes));
+        apply(Kvasir::Nvic::makeEnable(interruptIndexes));
 
         apply(Regs::SIE_CTRL::overrideDefaults(
           set(Regs::SIE_CTRL::pullup_en),
@@ -378,19 +361,19 @@ public:
     /// from main(), after Startup. (Data sheets, register descriptions: "RESETS: RESET_DONE",
     /// "CLOCKS: CLK_USB_CTRL", "PLL: CS", "USB: MAIN_CTRL", "USB: SIE_CTRL", "USB: SIE_STATUS".)
     static bool selfTest() {
-        using Resets     = Kvasir::Peripheral::RESETS::Registers<>;
         using ClkUsb     = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_USB_CTRL;
         using PllUsb     = Kvasir::Peripheral::PLL::Registers<1>;
         bool       ok    = true;
         auto const check = [&ok](bool pass, std::string_view what, std::string_view hint) {
             if(pass) {
-                UC_LOG_I("USB self-test: ok   {}", what);
+                UC_LOG_D("USB self-test: ok   {}", what);
             } else {
                 UC_LOG_E("USB self-test: FAIL {} - {}", what, hint);
                 ok = false;
             }
         };
-        std::uint32_t const resetDone = apply(read(Resets::RESET_DONE::usbctrl));
+        std::uint32_t const resetDone
+          = apply(read(::Kvasir::Rp::Block<Kvasir::Peripheral::USB_DPRAM::Registers<>>::resetDone));
         check(resetDone != 0, "the controller is out of reset", "RESETS.RESET.usbctrl still set");
         std::uint32_t const clkEnabled = apply(read(ClkUsb::enable));
         check(clkEnabled != 0, "clk_usb is enabled", "the clock settings never started clk_usb");
@@ -405,7 +388,7 @@ public:
         check(vbus != 0, "VBUS is seen", "no cable, or VBUS detection without its override");
         std::uint32_t const connected = apply(read(Regs::SIE_STATUS::connected));
         std::uint32_t const suspended = apply(read(Regs::SIE_STATUS::suspended));
-        UC_LOG_I("USB self-test: bus connected={} suspended={} (a host that enumerates shows 1/0)",
+        UC_LOG_D("USB self-test: bus connected={} suspended={} (a host that enumerates shows 1/0)",
                  connected,
                  suspended);
         return ok;
@@ -419,13 +402,13 @@ public:
     using Isr = brigand::list<
       Kvasir::Nvic::Isr<Handler, Kvasir::Nvic::Index<decltype(Kvasir::Interrupt::usbctrl)::value>>>;
 
-    using Provides = brigand::list<Kvasir::Startup::Resource<InstanceTag, 0>>;
+    using Provides = brigand::list<Kvasir::Hal::Owns<Regs>>;
     // The PHY runs from clk_usb at 48 MHz; a ClockSettings that programs it otherwise is
     // caught here (optional tag: unchecked until the settings declare their clocks).
-    using Claims = Clocks::Claim<Clocks::ClkUsb, 48'000'000>;
+    using Claims = Kvasir::Hal::Claim<Clocks::ClkUsb, 48'000'000>;
 
     static constexpr auto powerClockEnable
-      = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::usbctrl));
+      = list(clear(::Kvasir::Rp::Block<Kvasir::Peripheral::USB_DPRAM::Registers<>>::reset));
 
     static constexpr auto initStepPeripheryConfig
       = list(Regs::MUXING::overrideDefaults(set(Regs::MUXING::to_phy)),
@@ -437,7 +420,7 @@ public:
              getWatchdogEnable());
 
     static constexpr auto initStepInterruptConfig
-      = list(Kvasir::Nvic::makeSetPriority<isrPriority>(InterruptIndexes),
-             Kvasir::Nvic::makeClearPending(InterruptIndexes));
+      = list(Kvasir::Nvic::makeSetPriority<isrPriority>(interruptIndexes),
+             Kvasir::Nvic::makeClearPending(interruptIndexes));
 };
 }   // namespace Kvasir::USB::Rp

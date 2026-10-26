@@ -1,6 +1,7 @@
 #pragma once
 #include "Clocks.hpp"
 #include "WaitBounds.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "chip/Interrupt.hpp"
 #include "core/Nvic.hpp"
 #include "core/core.hpp"
@@ -8,6 +9,7 @@
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
 #include "kvasir/Util/Rollover.hpp"
+#include "kvasir/Util/SteadyClock.hpp"
 #include "kvasir/Util/attributes.hpp"
 
 #include <chrono>
@@ -15,7 +17,7 @@
 #include <memory>
 #include <peripherals/RESETS.hpp>
 #include <peripherals/TIMER.hpp>
-#if __has_include("peripherals/TICKS.hpp")
+#ifdef KVASIR_CHIP_RP2350
     #include <peripherals/TICKS.hpp>
 #else
     #include <peripherals/WATCHDOG.hpp>   // the RP2040 ticks its timer from WATCHDOG.TICK
@@ -40,65 +42,53 @@ struct InstanceTag {
 };
 
 template<typename TConfig>
-struct TimerClockBase {
+struct TimerClockBase;
+
+namespace Detail {
+    // The std::chrono shell of TimerClockBase (Kvasir::Chrono::SteadyClock): one microsecond a tick, the same shape
+    // as Systick::SystickClockBase's, so the two are interchangeable as a `Clock` template argument.
+    template<typename TConfig>
+    using TimerShell = Chrono::SteadyClock<TimerClockBase<TConfig>,
+                                           std::chrono::duration<std::int64_t, std::micro>>;
+}   // namespace Detail
+
+template<typename TConfig>
+struct TimerClockBase : Detail::TimerShell<TConfig> {
 private:
     using Config = TConfig;
 
-    static constexpr bool Rp2040 = PinConfig::isRp2040(PinConfig::CurrentChip);
+    static constexpr bool rp2040 = PinConfig::isRp2040(Chip::part);
 
-    static constexpr unsigned Instance = Config::instance;
-    static_assert(Instance < PinConfig::timerCount(PinConfig::CurrentChip),
+    static constexpr unsigned instanceValue = Config::instance;
+    static_assert(instanceValue < PinConfig::timerCount(Chip::part),
                   "the RP2350 has TIMER0 and TIMER1, the RP2040 one TIMER (instance 0)");
 
-    using Regs   = Kvasir::Peripheral::TIMER::Registers<Instance>;
-    using Resets = Kvasir::Peripheral::RESETS::Registers<>;
+    using Regs = Kvasir::Peripheral::TIMER::Registers<instanceValue>;
 
     // The tick generator (TICKS on the RP2350, WATCHDOG.TICK on the RP2040) divides clk_ref
     // down to the 1 MHz the timer counts.
-    static constexpr std::uint64_t TickClockHz = Config::tickClockHz;
-    static_assert(TickClockHz % 1'000'000 == 0,
+    static constexpr std::uint64_t tickClockHz = Config::tickClockHz;
+    static_assert(tickClockHz % 1'000'000 == 0,
                   "clk_ref must be a whole number of MHz");
-    static constexpr std::uint32_t Cycles = static_cast<std::uint32_t>(TickClockHz / 1'000'000);
-    static_assert(Cycles > 0 && Cycles < (1U << 9U),
+    static constexpr std::uint32_t cycles = static_cast<std::uint32_t>(tickClockHz / 1'000'000);
+    static_assert(cycles > 0 && cycles < (1U << 9U),
                   "TIMERx_CYCLES is nine bits");
 
-    template<typename R = Resets>
-    static constexpr auto resetBit() {
-        if constexpr(Rp2040) {
-            return R::RESET::timer;
-        } else if constexpr(Instance == 0) {
-            return R::RESET::timer0;
-        } else {
-            return R::RESET::timer1;
-        }
-    }
-
-    template<typename R = Resets>
-    static constexpr auto resetDoneBit() {
-        if constexpr(Rp2040) {
-            return R::RESET_DONE::timer;
-        } else if constexpr(Instance == 0) {
-            return R::RESET_DONE::timer0;
-        } else {
-            return R::RESET_DONE::timer1;
-        }
-    }
-
-#if __has_include("peripherals/TICKS.hpp")
+#ifdef KVASIR_CHIP_RP2350
     static constexpr auto tickConfig() {
         using Ticks = Kvasir::Peripheral::TICKS::Registers<>;
-        if constexpr(Instance == 0) {
-            return list(write(Ticks::TIMER0_CYCLES::timer0_cycles, Register::value<Cycles>()),
+        if constexpr(instanceValue == 0) {
+            return list(write(Ticks::TIMER0_CYCLES::timer0_cycles, Register::value<cycles>()),
                         write(Ticks::TIMER0_CTRL::enable, Register::value<1>()));
         } else {
-            return list(write(Ticks::TIMER1_CYCLES::timer1_cycles, Register::value<Cycles>()),
+            return list(write(Ticks::TIMER1_CYCLES::timer1_cycles, Register::value<cycles>()),
                         write(Ticks::TIMER1_CTRL::enable, Register::value<1>()));
         }
     }
 #else
     static constexpr auto tickConfig() {
         using Tick = Kvasir::Peripheral::WATCHDOG::Registers<>::TICK;
-        return list(write(Tick::cycles, Register::value<Cycles>()),
+        return list(write(Tick::cycles, Register::value<cycles>()),
                     write(Tick::enable, Register::value<1>()));
     }
 #endif
@@ -113,48 +103,20 @@ private:
 
 public:
     /// Which TIMER block this is, for the alarms below.
-    static constexpr unsigned instance = Instance;
+    static constexpr unsigned instance = instanceValue;
 
     // Startup: this timer, and the clock its TICKS generator divides (clk_ref).
-    using Provides = brigand::list<Startup::Resource<InstanceTag, Instance>>;
-    using Claims   = Clocks::Claim<Clocks::ClkRef, TickClockHz>;
+    using Provides = brigand::list<Startup::Resource<InstanceTag, instanceValue>>;
+    using Claims   = Hal::Claim<Clocks::ClkRef, tickClockHz>;
 
-    // chrono interface, same shape as SystickClockBase so the two are interchangeable as a
-    // `Clock` template argument.
-    using duration = std::chrono::duration<std::int64_t, std::micro>;
+    using Shell = Detail::TimerShell<TConfig>;
+    using typename Shell::duration;
+    using typename Shell::time_point;
+
     // Counts from the tick generator, not from the core's clock: it runs while the core sleeps in WFE/WFI (SLEEP
     // gates clocks by SLEEP_EN0/1, all on by default - a firmware that prunes them must keep clk_ref, TICKS and the
     // TIMER; RP2040 2.11.2). Kvasir::Executor's sleeping loop requires it.
     static constexpr bool runsAsleep = true;
-    using rep                        = duration::rep;
-    using period                     = duration::period;
-    using time_point                 = std::chrono::time_point<TimerClockBase, duration>;
-
-    static constexpr bool is_steady = true;
-
-    template<typename Rep,
-             typename Period>
-    friend constexpr std::enable_if_t<!std::is_same_v<std::chrono::duration<Rep,
-                                                                            Period>,
-                                                      duration>,
-                                      time_point>
-    operator+(time_point                    t,
-              std::chrono::duration<Rep,
-                                    Period> d) {
-        return t + std::chrono::duration_cast<duration>(d);
-    }
-
-    template<typename Rep,
-             typename Period>
-    friend constexpr std::enable_if_t<!std::is_same_v<std::chrono::duration<Rep,
-                                                                            Period>,
-                                                      duration>,
-                                      time_point>
-    operator-(time_point                    t,
-              std::chrono::duration<Rep,
-                                    Period> d) {
-        return t - std::chrono::duration_cast<duration>(d);
-    }
 
     // The raw pair, not the latched TIMELR/TIMEHR: reading TIMELR latches TIMEHR in one
     // register shared by both cores, so two readers would hand each other stale halves.
@@ -173,9 +135,9 @@ public:
     }
 
     template<typename Duration,
-             typename duration::rep value>
+             typename duration::rep Value>
     static void delay() {
-        static constexpr auto wait = std::chrono::duration_cast<duration>(Duration{value});
+        static constexpr auto wait = std::chrono::duration_cast<duration>(Duration{Value});
         auto const            end  = now() + wait;
         while(now() < end) {}
     }
@@ -199,13 +161,10 @@ public:
     // kvasir init: once, on the core whose Startup list carries this type. TICKS is not
     // behind a reset; the timer itself is, hence the reset-done poll before anyone can
     // call now().
-    static constexpr auto powerClockEnable        = list(clear(resetBit()));
+    static constexpr auto powerClockEnable        = list(clear(Rp::Block<Regs>::reset));
     static constexpr auto initStepPeripheryConfig = tickConfig();
 
-    static void preEnableRuntimeInit() {
-        Kvasir::Register::waitUntil<Kvasir::Chip::ResetDoneBound>(
-          Kvasir::Register::isSet(resetDoneBit()));
-    }
+    static void preEnableRuntimeInit() { Rp::Block<Regs>::waitResetDone(); }
 };
 
 // One of a TIMER block's four alarm comparators as a Startup-list peripheral: `F()` runs
@@ -231,13 +190,13 @@ struct Alarm {
     static_assert(N < 4,
                   "a TIMER block has four alarms");
 
-    static constexpr unsigned Instance = TimerClock::instance;
-    static_assert(Instance < PinConfig::timerCount(PinConfig::CurrentChip),
+    static constexpr unsigned instanceValue = TimerClock::instance;
+    static_assert(instanceValue < PinConfig::timerCount(Chip::part),
                   "the RP2350 has TIMER0 and TIMER1, the RP2040 one TIMER");
 
-    using Regs = Kvasir::Peripheral::TIMER::Registers<Instance>;
+    using Regs = Kvasir::Peripheral::TIMER::Registers<instanceValue>;
     // TIMERn_IRQ_m: 0..3 for TIMER0 (and the RP2040's timer), 4..7 for TIMER1.
-    using Irq = Kvasir::Nvic::Index<static_cast<int>(Instance * 4 + N)>;
+    using Irq = Kvasir::Nvic::Index<static_cast<int>(instanceValue * 4 + N)>;
 
     using duration   = typename TimerClock::duration;
     using time_point = typename TimerClock::time_point;
@@ -246,59 +205,27 @@ struct Alarm {
     // "already behind" test covers half the range: a wake further ahead than this is clamped (Kvasir::Executor).
     static constexpr auto maxAhead = std::chrono::microseconds{(std::int64_t{1} << 31) - 1'000'000};
 
-    using Provides = brigand::list<Startup::Resource<AlarmTag, Instance, N>>;
-    using Claims   = brigand::list<Startup::Resource<InstanceTag, Instance>>;
+    using Provides = brigand::list<Startup::Resource<AlarmTag, instanceValue, N>>;
+    using Claims   = brigand::list<Startup::Resource<InstanceTag, instanceValue>>;
 
     static constexpr std::uint32_t bit = 1U << N;
 
 private:
+    // ALARMn, and alarm n's bit of INTE / INTR / INTF: bit n (RP2040 datasheet Table 542, md l.25389; RP2350
+    // datasheet Table 1244, md l.58055)
     static constexpr auto alarmField() {
-        if constexpr(N == 0) {
-            return Regs::ALARM0::FULLREGISTER;
-        } else if constexpr(N == 1) {
-            return Regs::ALARM1::FULLREGISTER;
-        } else if constexpr(N == 2) {
-            return Regs::ALARM2::FULLREGISTER;
-        } else {
-            return Regs::ALARM3::FULLREGISTER;
-        }
+        using Alarms = brigand::list<typename Regs::ALARM0,
+                                     typename Regs::ALARM1,
+                                     typename Regs::ALARM2,
+                                     typename Regs::ALARM3>;
+        return brigand::at_c<Alarms, N>::FULLREGISTER;
     }
 
-    static constexpr auto inteField() {
-        if constexpr(N == 0) {
-            return Regs::INTE::alarm_0;
-        } else if constexpr(N == 1) {
-            return Regs::INTE::alarm_1;
-        } else if constexpr(N == 2) {
-            return Regs::INTE::alarm_2;
-        } else {
-            return Regs::INTE::alarm_3;
-        }
-    }
+    static constexpr auto inteField() { return Register::fieldAt<N>(typename Regs::INTE{}); }
 
-    static constexpr auto intrField() {
-        if constexpr(N == 0) {
-            return Regs::INTR::alarm_0;
-        } else if constexpr(N == 1) {
-            return Regs::INTR::alarm_1;
-        } else if constexpr(N == 2) {
-            return Regs::INTR::alarm_2;
-        } else {
-            return Regs::INTR::alarm_3;
-        }
-    }
+    static constexpr auto intrField() { return Register::fieldAt<N>(typename Regs::INTR{}); }
 
-    static constexpr auto intfField() {
-        if constexpr(N == 0) {
-            return Regs::INTF::alarm_0;
-        } else if constexpr(N == 1) {
-            return Regs::INTF::alarm_1;
-        } else if constexpr(N == 2) {
-            return Regs::INTF::alarm_2;
-        } else {
-            return Regs::INTF::alarm_3;
-        }
-    }
+    static constexpr auto intfField() { return Register::fieldAt<N>(typename Regs::INTF{}); }
 
     [[nodiscard]] static std::uint32_t lowNow() {
         return static_cast<std::uint32_t>(TimerClock::now().time_since_epoch().count());
@@ -345,11 +272,12 @@ public:
 
     /// Cancel a pending alarm (ARMED is write-one-to-clear).
     static void disarm() {
-        apply(Register::write(Regs::ARMED::armed, Register::value<std::uint32_t, bit>()));
+        apply(Register::reset(
+          Register::bit<N>(Regs::ARMED::armed)));   // this alarm's bit alone: one store
     }
 
     [[nodiscard]] static bool armed() {
-        return (get<0>(apply(read(Regs::ARMED::armed))) & bit) != 0;
+        return get<0>(apply(read(Register::bit<N>(Regs::ARMED::armed)))) != 0;
     }
 
     static void onIsr() {
@@ -358,7 +286,7 @@ public:
         F();
     }
 
-    static constexpr Nvic::Isr<std::addressof(onIsr), Irq> isr{};
+    using Isr = Nvic::Isr<std::addressof(onIsr), Irq>;
 };
 
 }   // namespace Kvasir::Timer

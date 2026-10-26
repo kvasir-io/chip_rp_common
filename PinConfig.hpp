@@ -1,28 +1,32 @@
 #pragma once
 
-#include <array>
+#include <cstddef>
 #include <cstdint>
-#include <type_traits>
-#include <utility>
+
+namespace Kvasir::Chip {
+// The RP parts, the chip contract's Chip::Part; Chip::part (below) is the one this translation unit is for.
+enum class Part { rp2040, rp2350a, rp2350b };
+}   // namespace Kvasir::Chip
 
 namespace Kvasir { namespace PinConfig {
-    enum class ChipVariant { RP2040, RP2350A, RP2350B };
 
     // What differs between the two chip families beyond pins and pin functions, for the
     // shared drivers to ask instead of assuming the RP2350.
-    constexpr bool isRp2040(ChipVariant c) { return c == ChipVariant::RP2040; }
+    constexpr bool isRp2040(Chip::Part c) { return c == Chip::Part::rp2040; }
 
-    constexpr unsigned pioCount(ChipVariant c) { return isRp2040(c) ? 2U : 3U; }
+    constexpr unsigned pioCount(Chip::Part c) { return isRp2040(c) ? 2U : 3U; }
 
-    constexpr unsigned timerCount(ChipVariant c) { return isRp2040(c) ? 1U : 2U; }
+    constexpr unsigned timerCount(Chip::Part c) { return isRp2040(c) ? 1U : 2U; }
 
     // The GPIO function select of the clock outputs (CLOCKS_GPOUTn).
-    constexpr int gpoutFunction(ChipVariant c) { return isRp2040(c) ? 8 : 9; }
+    constexpr int gpoutFunction(Chip::Part c) { return isRp2040(c) ? 8 : 9; }
 
-    // Which CLK_GPOUT generator a pin carries, -1 for none. The RP2040 has 21 / 23 / 24 / 25;
-    // the RP2350 adds 13 / 15 (and, on the B variant, 33..37 which are not listed here).
-    constexpr int gpoutOf(ChipVariant c,
-                          int         pin) {
+    // Which CLK_GPOUT generator a pin carries, -1 for none. The RP2040 has 21 / 23 / 24 / 25
+    // (RP2040 datasheet 1.4.3 Table 2, F8, md l.646-661); the RP2350 adds 13 / 15 (RP2350
+    // datasheet 1.2.3 Table 3, F9, md l.951-968); the B variant's GPIO 30-47 carry none
+    // (md l.977-996).
+    constexpr int gpoutOf(Chip::Part c,
+                          int        pin) {
         switch(pin) {
         case 21: return 0;
         case 23: return 1;
@@ -34,45 +38,74 @@ namespace Kvasir { namespace PinConfig {
         }
     }
 
-    template<ChipVariant Chip>
+    // User GPIOs: 30 on the RP2040 (RP2040 datasheet md l.466), 30 on the RP2350A (QFN-60) and 48 on the RP2350B
+    // (QFN-80; RP2350 datasheet 9.1, md l.29215)
+    constexpr int pinCountOf(Chip::Part c) { return c == Chip::Part::rp2350b ? 48 : 30; }
+
+    template<Chip::Part P>
     struct ChipTraits;
 
-    template<ChipVariant Chip>
+    template<Chip::Part P>
     struct DmaTraits;
 
-    template<ChipVariant Chip>
+    template<Chip::Part P>
     struct PwmTraits;
 
-    enum class UartPinType { Tx0, Rx0, Cts0, Rts0, Tx1, Rx1, Cts1, Rts1, Invalid };
-    enum class I2cPinType { Sda0, Scl0, Sda1, Scl1, Invalid };
-    enum class SpiPinType { Rx0, Tx0, Cs0, Sck0, Rx1, Tx1, Cs1, Sck1, Invalid };
+    enum class UartPinType { tx0, rx0, cts0, rts0, tx1, rx1, cts1, rts1, invalid };
+    enum class I2cPinType { sda0, scl0, sda1, scl1, invalid };
+    enum class SpiPinType { rx0, tx0, cs0, sck0, rx1, tx1, cs1, sck1, invalid };
 
-    template<ChipVariant Chip>
-    struct UartPinMap {
-        static constexpr std::array<UartPinType, ChipTraits<Chip>::pinCount> pins = {};
-    };
+    // The pin functions are one pattern repeated every 8 GPIOs (RP2040 datasheet 1.4.3 Table 2, md l.620-667; RP2350
+    // datasheet 9.4 Table 645, md l.29354-29440): F1 SPI, F2 UART, F3 I2C, and on the RP2350 F11 UART TX/RX on the
+    // CTS/RTS pins. chip_rp_common/tests/pin_function_test.cpp checks the formulas against both tables.
 
-    template<ChipVariant Chip>
-    struct I2cPinMap {
-        static constexpr std::array<I2cPinType, ChipTraits<Chip>::pinCount> pins = {};
-    };
+    // F2: role pin%4 -> TX, RX, CTS, RTS; instance ((pin+4)/8)%2
+    constexpr UartPinType uartPin(int pin) {
+        constexpr UartPinType roles[2][4]{
+          {UartPinType::tx0, UartPinType::rx0, UartPinType::cts0, UartPinType::rts0},
+          {UartPinType::tx1, UartPinType::rx1, UartPinType::cts1, UartPinType::rts1}
+        };
+        return roles[((pin + 4) / 8) % 2][pin % 4];
+    }
 
-    template<ChipVariant Chip>
-    struct SpiPinMap {
-        static constexpr std::array<SpiPinType, ChipTraits<Chip>::pinCount> pins = {};
-    };
+    // RP2350 F11: UART TX/RX of the same instance on the CTS/RTS pins (pin%4 in {2,3}: (pin-2+4)/8 == (pin+4)/8, the
+    // 8-pin groups start at a multiple of 4), else the F2 role
+    constexpr UartPinType uartAuxPin(int pin) {
+        return pin % 4 >= 2 ? uartPin(pin - 2) : uartPin(pin);
+    }
+
+    // F1: role pin%4 -> RX, CSn, SCK, TX; instance (pin/8)%2
+    constexpr SpiPinType spiPin(int pin) {
+        constexpr SpiPinType roles[2][4]{
+          {SpiPinType::rx0, SpiPinType::cs0, SpiPinType::sck0, SpiPinType::tx0},
+          {SpiPinType::rx1, SpiPinType::cs1, SpiPinType::sck1, SpiPinType::tx1}
+        };
+        return roles[(pin / 8) % 2][pin % 4];
+    }
+
+    // F3: role pin%2 -> SDA, SCL; instance (pin/2)%2
+    constexpr I2cPinType i2cPin(int pin) {
+        constexpr I2cPinType roles[2][2]{
+          {I2cPinType::sda0, I2cPinType::scl0},
+          {I2cPinType::sda1, I2cPinType::scl1}
+        };
+        return roles[(pin / 2) % 2][pin % 2];
+    }
+
+    // The RP2350's UART has the F11 function (Table 645); the RP2040's does not (Table 2).
+    constexpr bool hasUartAuxFunction(Chip::Part c) { return !isRp2040(c); }
 
     struct PwmChannelInfo {
         std::uint32_t channel;
         bool          isChannelA;
     };
 
-    template<ChipVariant Chip,
-             int         Pin>
+    template<Chip::Part P,
+             int        Pin>
     constexpr PwmChannelInfo getPwmChannelInfo() {
-        if constexpr(Chip == ChipVariant::RP2040 || Chip == ChipVariant::RP2350A) {
+        if constexpr(P == Chip::Part::rp2040 || P == Chip::Part::rp2350a) {
             static_assert(Pin >= 0 && Pin < 30, "Pin number out of range for RP2040/RP2350A");
-        } else if constexpr(Chip == ChipVariant::RP2350B) {
+        } else if constexpr(P == Chip::Part::rp2350b) {
             static_assert(Pin >= 0 && Pin < 48, "Pin number out of range for RP2350B");
         }
 
@@ -89,72 +122,183 @@ namespace Kvasir { namespace PinConfig {
         return {.channel = channel, .isChannelA = isChannelA};
     }
 
-    template<ChipVariant Chip,
-             unsigned    Instance>
-    constexpr bool isValidUartPin(int         pin,
-                                  UartPinType expectedType) {
-        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) { return false; }
+    // A peripheral pin's role, the one name the drivers' pin checks and pin set-ups use: the UART's TX/RX/CTS/RTS
+    // (F2, and F11 on the RP2350), the SPI's RX/TX/CSn/SCK (F1), the I2C's SDA/SCL (F3).
+    enum class Function {
+        uartTx,
+        uartRx,
+        uartCts,
+        uartRts,
+        spiRx,
+        spiTx,
+        spiCs,
+        spiSck,
+        i2cSda,
+        i2cScl
+    };
 
-        using PinElement
-          = std::remove_cv_t<std::remove_reference_t<decltype(UartPinMap<Chip>::pins[0])>>;
-
-        bool matches = false;
-        if constexpr(std::is_same_v<PinElement, UartPinType>) {
-            matches = (UartPinMap<Chip>::pins[static_cast<std::size_t>(pin)] == expectedType);
-        } else {
-            auto [first, second] = UartPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
-            matches              = (first == expectedType || second == expectedType);
+    namespace detail {
+        constexpr UartPinType uartType(Function f,
+                                       unsigned instance) {
+            constexpr UartPinType t[2][4]{
+              {UartPinType::tx0, UartPinType::rx0, UartPinType::cts0, UartPinType::rts0},
+              {UartPinType::tx1, UartPinType::rx1, UartPinType::cts1, UartPinType::rts1}
+            };
+            return t[instance][static_cast<unsigned>(f) - static_cast<unsigned>(Function::uartTx)];
         }
 
-        if(Instance == 0) {
-            return matches
-                && (expectedType == UartPinType::Tx0 || expectedType == UartPinType::Rx0
-                    || expectedType == UartPinType::Cts0 || expectedType == UartPinType::Rts0);
+        constexpr SpiPinType spiType(Function f,
+                                     unsigned instance) {
+            constexpr SpiPinType t[2][4]{
+              {SpiPinType::rx0, SpiPinType::tx0, SpiPinType::cs0, SpiPinType::sck0},
+              {SpiPinType::rx1, SpiPinType::tx1, SpiPinType::cs1, SpiPinType::sck1}
+            };
+            return t[instance][static_cast<unsigned>(f) - static_cast<unsigned>(Function::spiRx)];
         }
-        if(Instance == 1) {
-            return matches
-                && (expectedType == UartPinType::Tx1 || expectedType == UartPinType::Rx1
-                    || expectedType == UartPinType::Cts1 || expectedType == UartPinType::Rts1);
+
+        constexpr I2cPinType i2cType(Function f,
+                                     unsigned instance) {
+            constexpr I2cPinType t[2][2]{
+              {I2cPinType::sda0, I2cPinType::scl0},
+              {I2cPinType::sda1, I2cPinType::scl1}
+            };
+            return t[instance][static_cast<unsigned>(f) - static_cast<unsigned>(Function::i2cSda)];
         }
-        return false;
+
+        constexpr bool isUart(Function f) { return f <= Function::uartRts; }
+
+        constexpr bool isSpi(Function f) { return f >= Function::spiRx && f <= Function::spiSck; }
+    }   // namespace detail
+
+    // The GPIO function select that gives `pin` role `f` of the instance, -1 for none: F1 SPI, F2 UART, F3 I2C, and on
+    // the RP2350 F11 for UART TX/RX on the CTS/RTS pins (the formulas above, from Table 2 / Table 645).
+    constexpr int functionSelect(Chip::Part part,
+                                 Function   f,
+                                 unsigned   instance,
+                                 int        pin) {
+        if(instance > 1 || pin < 0 || pin >= pinCountOf(part)) { return -1; }
+        if(detail::isUart(f)) {
+            auto const want = detail::uartType(f, instance);
+            if(uartPin(pin) == want) { return 2; }
+            return hasUartAuxFunction(part) && uartAuxPin(pin) == want ? 11 : -1;
+        }
+        if(detail::isSpi(f)) { return spiPin(pin) == detail::spiType(f, instance) ? 1 : -1; }
+        return i2cPin(pin) == detail::i2cType(f, instance) ? 3 : -1;
     }
 
-    template<ChipVariant Chip,
-             unsigned    Instance>
-    constexpr bool isValidI2cPin(int        pin,
-                                 I2cPinType expectedType) {
-        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) { return false; }
-
-        auto pinType = I2cPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
-        if(Instance == 0) {
-            return pinType == expectedType
-                && (expectedType == I2cPinType::Sda0 || expectedType == I2cPinType::Scl0);
-        }
-        if(Instance == 1) {
-            return pinType == expectedType
-                && (expectedType == I2cPinType::Sda1 || expectedType == I2cPinType::Scl1);
-        }
-        return false;
+    constexpr bool isValidPin(Chip::Part part,
+                              Function   f,
+                              unsigned   instance,
+                              int        pin) {
+        return functionSelect(part, f, instance, pin) >= 0;
     }
 
-    template<ChipVariant Chip,
-             unsigned    Instance>
-    constexpr bool isValidSpiPin(int        pin,
-                                 SpiPinType expectedType) {
-        if(pin < 0 || pin >= static_cast<int>(ChipTraits<Chip>::pinCount)) { return false; }
+    namespace detail {
+        // A compile-time message without the library: "GPIO 5 is not UART0 TX on the RP2040 (UART0 TX: GPIO 0 12 16
+        // 28)" - an object with size() and data(), a C++26 static_assert message
+        struct PinText {
+            char        buffer[200]{};
+            std::size_t length{};
 
-        auto pinType = SpiPinMap<Chip>::pins[static_cast<std::size_t>(pin)];
-        if(Instance == 0) {
-            return pinType == expectedType
-                && (expectedType == SpiPinType::Rx0 || expectedType == SpiPinType::Tx0
-                    || expectedType == SpiPinType::Cs0 || expectedType == SpiPinType::Sck0);
+            constexpr PinText& operator<<(char const* t) {
+                for(; *t != '\0' && length + 1 < sizeof(buffer); ++t) { buffer[length++] = *t; }
+                return *this;
+            }
+
+            constexpr PinText& operator<<(int v) {
+                if(v < 0) {   // a negative pin number in a refused PinLocation
+                    *this << "-";
+                    v = -v;
+                }
+                char        digits[12]{};
+                std::size_t n = 0;
+                do {
+                    digits[n++] = static_cast<char>('0' + v % 10);
+                    v /= 10;
+                } while(v != 0);
+                while(n != 0 && length + 1 < sizeof(buffer)) { buffer[length++] = digits[--n]; }
+                return *this;
+            }
+
+            [[nodiscard]] constexpr std::size_t size() const { return length; }
+
+            [[nodiscard]] constexpr char const* data() const { return buffer; }
+        };
+
+        constexpr char const* functionName(Function f) {
+            constexpr char const*
+              names[]{"TX", "RX", "CTS", "RTS", "RX", "TX", "CSn", "SCK", "SDA", "SCL"};
+            return names[static_cast<unsigned>(f)];
         }
-        if(Instance == 1) {
-            return pinType == expectedType
-                && (expectedType == SpiPinType::Rx1 || expectedType == SpiPinType::Tx1
-                    || expectedType == SpiPinType::Cs1 || expectedType == SpiPinType::Sck1);
+
+        constexpr PinText pinRefused(Chip::Part part,
+                                     Function   f,
+                                     unsigned   instance,
+                                     int        pin) {
+            char const* block = isUart(f) ? "UART" : isSpi(f) ? "SPI" : "I2C";
+            PinText     t;
+            t << "GPIO " << pin << " is not " << block << static_cast<int>(instance) << " "
+              << functionName(f) << " on the "
+              << (isRp2040(part)                ? "RP2040"
+                  : part == Chip::Part::rp2350a ? "RP2350A"
+                                                : "RP2350B")
+              << " (" << block << static_cast<int>(instance) << " " << functionName(f) << ": GPIO";
+            for(int p = 0; p != pinCountOf(part); ++p) {
+                if(isValidPin(part, f, instance, p)) { t << " " << p; }
+            }
+            return t << ")";
         }
-        return false;
-    }
+
+        template<int>
+        inline constexpr bool alwaysFalse = false;
+    }   // namespace detail
+
+    /// `value` true; for a pin that cannot have the role a static_assert names pin, role, instance and the pins that
+    /// can (instantiated only then: the message is built for a refused pin alone).
+    template<Chip::Part P,
+             Function   F,
+             unsigned   Instance,
+             int        Pin,
+             bool       Ok = isValidPin(P, F, Instance, Pin)>
+    struct CheckedPin {
+        static constexpr bool value = true;
+    };
+
+    template<Chip::Part P, Function F, unsigned Instance, int Pin>
+    struct CheckedPin<P, F, Instance, Pin, false> {
+        static constexpr bool check = detail::alwaysFalse<Pin>;
+        static_assert(check,
+                      detail::pinRefused(P,
+                                         F,
+                                         Instance,
+                                         Pin));
+        static constexpr bool value = true;
+    };
 
 }}   // namespace Kvasir::PinConfig
+
+// Which RP chip this translation unit is for. The chip package's cmake/chip.cmake passes the macros to every TU of an
+// image (kvasir_chip DEFINITIONS): chip_rp2040 KVASIR_CHIP_RP2040, chip_rp2350 KVASIR_CHIP_RP2350 and
+// KVASIR_CHIP_RP2350A or KVASIR_CHIP_RP2350B (its KVASIR_RP2350_MPU), both KVASIR_CHIP_FAMILY_RP. Test them with `#if
+// defined(...)` only (gcc -Wundef).
+#if !defined(KVASIR_CHIP_RP2040) && !defined(KVASIR_CHIP_RP2350)
+    #error \
+      "chip/rp_common without KVASIR_CHIP_RP2040 or KVASIR_CHIP_RP2350: not compiled with the chip package's kvasir_chip DEFINITIONS"
+#elif defined(KVASIR_CHIP_RP2040) && defined(KVASIR_CHIP_RP2350)
+    #error \
+      "chip/rp_common with both KVASIR_CHIP_RP2040 and KVASIR_CHIP_RP2350: kvasir_chip DEFINITIONS of two chip packages"
+#elif defined(KVASIR_CHIP_RP2350) && defined(KVASIR_CHIP_RP2350A) == defined(KVASIR_CHIP_RP2350B)
+    #error \
+      "chip_rp2350 needs exactly one of KVASIR_CHIP_RP2350A, KVASIR_CHIP_RP2350B (cmake: KVASIR_RP2350_MPU)"
+#endif
+
+namespace Kvasir::Chip {
+// The part this translation unit is for, from the package's KVASIR_CHIP_* macros.
+#ifdef KVASIR_CHIP_RP2040
+inline constexpr Part part = Part::rp2040;
+#elifdef KVASIR_CHIP_RP2350A
+inline constexpr Part part = Part::rp2350a;
+#else
+inline constexpr Part part = Part::rp2350b;
+#endif
+}   // namespace Kvasir::Chip

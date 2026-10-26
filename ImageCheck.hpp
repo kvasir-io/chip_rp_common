@@ -1,5 +1,5 @@
 #pragma once
-// The RP backend of Kvasir::ImageCheck (Kvasir_SDK kvasir/Util/ImageCheck.hpp): the XIP streaming FIFO read by a DMA
+// The RP backend of Kvasir::ImageCheck (Kvasir_SDK kvasir/Runtime/ImageCheck.hpp): the XIP streaming FIFO read by a DMA
 // channel into a dummy word with the DMA's CRC sniffer on that channel, so no CPU cycle goes per byte and the reads
 // neither use nor pollute the XIP cache.
 //
@@ -19,12 +19,18 @@
 // A channel that does not finish in TimeoutUs is aborted (RP2040-E8's workaround after clearing STREAM_CTR: one
 // dummy read of the uncached window, RP2040 datasheet errata md l.29710-29722) and the chunk fails: the checker
 // drops the pass instead of judging it.
-#include "CRC.hpp"
+//
+// A pass keeps its sum in the sniffer across turns, so nothing else may use the sniffer while a pass runs: listed
+// (the Checker forwards these), the backend claims its channel and provides the sniffer as held (DmaCrc.hpp's
+// SnifferUse), which any other sniffer user in the Startup lists - a SnifferCalc, an image's DmaCrc::Sniffer -
+// collides with.
 #include "DMA.hpp"
+#include "DmaCrc.hpp"
 #include "WaitBounds.hpp"
 #include "Xip.hpp"
 #include "flash.hpp"
-#include "kvasir/Util/ImageCheck.hpp"
+#include "kvasir/Register/Memory.hpp"
+#include "kvasir/Runtime/ImageCheck.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -40,13 +46,16 @@ struct RpStream {
     static_assert(Dma::ownsChannel(Channel),
                   "the image check's DMA channel is not one of this DmaBase's channels");
 
-    static constexpr auto Sniff = [] {
-        auto s     = Kvasir::CRC::Sniff::crc32();
+    using Claims   = Kvasir::DMA::Claims<Dma, Channel>;
+    using Provides = brigand::list<Kvasir::DmaCrc::SnifferUse<Kvasir::DmaCrc::heldBy(Channel)>>;
+
+    static constexpr auto sniff = [] {
+        auto s     = Kvasir::DmaCrc::Sniff::crc32();
         s.byteSwap = ByteSwap;
         return s;
     }();
 
-    static void begin() { Kvasir::CRC::armSniffer<Sniff, Dma, Channel>(); }
+    static void begin() { Kvasir::DmaCrc::armSniffer<sniff, Dma, Channel>(); }
 
     [[nodiscard]] static bool chunk(std::uintptr_t address,
                                     std::size_t    length) {
@@ -59,34 +68,40 @@ struct RpStream {
         if(words != 0) {
             Kvasir::Xip::startStream(a, words);
             Dma::template start<Channel,
-                                Dma::Priority::high,
-                                Dma::TriggerSource::xip_stream,
-                                Dma::TransferSize::_32,
-                                false,
-                                false>(reinterpret_cast<std::uint32_t>(&sink_),
-                                       Kvasir::Xip::StreamFifoAux,
-                                       words);
+                                ::Kvasir::DMA::ChannelConfig{
+                                  .priority       = Dma::Priority::high,
+                                  .trigger        = Dma::TriggerSource::xip_stream,
+                                  .size           = Dma::TransferSize::size32,
+                                  .incrementRead  = false,
+                                  .incrementWrite = false,
+                                  .sniff          = true}>(reinterpret_cast<std::uint32_t>(&sink_),
+                                                  Kvasir::Xip::streamFifoAux,
+                                                  words);
             if(!finished()) { return false; }
             a += words * 4U;
         }
         return a == end || bytes(a, end - a);
     }
 
-    [[nodiscard]] static std::uint32_t result() { return Kvasir::CRC::sniffResult<Sniff, Dma>(); }
+    [[nodiscard]] static std::uint32_t result() {
+        return Kvasir::DmaCrc::sniffResult<sniff, Dma>();
+    }
 
 private:
-    using Timeout = Kvasir::Chip::MicrosecondsBound<TimeoutUs>;
+    using Timeout = Kvasir::Register::MicrosecondsBound<TimeoutUs>;
 
     static bool bytes(std::uint32_t a,
                       std::uint32_t n) {
         Dma::template start<Channel,
-                            Dma::Priority::high,
-                            Dma::TriggerSource::permanent,
-                            Dma::TransferSize::_8,
-                            false,
-                            true>(reinterpret_cast<std::uint32_t>(&sink_),
-                                  Kvasir::Flash::uncached(a),
-                                  n);
+                            ::Kvasir::DMA::ChannelConfig{.priority = Dma::Priority::high,
+                                                         .trigger  = Dma::TriggerSource::permanent,
+                                                         .size     = Dma::TransferSize::size8,
+                                                         .incrementRead  = true,
+                                                         .incrementWrite = false,
+                                                         .sniff          = true}>(
+          reinterpret_cast<std::uint32_t>(&sink_),
+          Kvasir::Flash::uncached(a),
+          n);
         return finished();
     }
 
@@ -101,7 +116,7 @@ private:
     // stop the stream (RP2040-E8: then one dummy read of the uncached window) and the channel
     static void quiesce() {
         apply(write(Kvasir::Xip::Ctrl::STREAM_CTR::stream_ctr, 0U));
-        (void)*reinterpret_cast<std::uint32_t const volatile*>(Kvasir::Flash::XipUncachedBase);
+        (void)Kvasir::Memory::load<std::uint32_t>(Kvasir::Flash::xipUncachedBase);
         (void)Dma::template abort<Channel>();
         while(!Kvasir::Xip::streamFifoEmpty()) {
             (void)apply(read(Kvasir::Xip::Ctrl::STREAM_FIFO::FULLREGISTER));

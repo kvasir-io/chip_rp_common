@@ -10,8 +10,15 @@
 // An alias write acts on its mask's bits only: a pending write-one-to-clear flag of the same
 // register survives unless its own bit is in the mask. So atomic() is refused for a one-to-* field
 // (Register::atomic, AtomicFactories.hpp) but fine beside one. Behind the bus interposer (I2C, UART, SPI, SSI) an alias write is a
-// read-modify-write: a register with a read side effect never gets one (RmwHazard).
+// read-modify-write: a register with a read side effect never gets one (Register::Semantics::readSideEffect).
+//
+// The access is the Register::ExecuteSeam hook (Kvasir_SDK Register/Exec.hpp) for Kvasir::Tag::User. chip_rp2040 and
+// chip_rp2350 name this header in KVASIR_CHIP_REGISTER_SEAM (cmake/chip.cmake), and Exec.hpp includes it at its end:
+// every TU of an image that reaches apply() has it before its first atomic(). Only the SDK, Tags and Mmio here - it is
+// read in the middle of the register layer.
+#include "kvasir/Common/Tags.hpp"
 #include "kvasir/Register/Exec.hpp"
+#include "kvasir/Register/Mmio.hpp"
 
 #include <array>
 #include <cstdint>
@@ -26,9 +33,9 @@ namespace Detail {
     // (SIO, the CoreSight window, the PPB; RP2350 also the OTP block, whose SBPI programming
     // registers have none) and what is memory or a FIFO window rather than registers (USB DPRAM,
     // XIP_AUX, HSTX_FIFO, OTP data, BOOTRAM).
-#if __has_include("chip/rp2040.hpp")
+#ifdef KVASIR_CHIP_RP2040
     // RP2040 datasheet 2.2.2 (APB, AHB-Lite)
-    inline constexpr auto AliasBlocks = std::to_array<unsigned>(
+    inline constexpr auto aliasBlocks = std::to_array<unsigned>(
       {0x40000000, 0x40004000, 0x40008000, 0x4000c000, 0x40010000, 0x40014000, 0x40018000,
        0x4001c000, 0x40020000, 0x40024000, 0x40028000, 0x4002c000, 0x40030000, 0x40034000,
        0x40038000, 0x4003c000, 0x40040000, 0x40044000, 0x40048000, 0x4004c000, 0x40050000,
@@ -36,7 +43,7 @@ namespace Detail {
        0x50110000, 0x50200000, 0x50300000});
 #else
     // RP2350 datasheet 2.2.4 Table 13 (APB) and 2.2.5 Table 14 (AHB)
-    inline constexpr auto AliasBlocks = std::to_array<unsigned>(
+    inline constexpr auto aliasBlocks = std::to_array<unsigned>(
       {0x40000000, 0x40008000, 0x40010000, 0x40018000, 0x40020000, 0x40028000, 0x40030000,
        0x40038000, 0x40040000, 0x40048000, 0x40050000, 0x40058000, 0x40060000, 0x40068000,
        0x40070000, 0x40078000, 0x40080000, 0x40088000, 0x40090000, 0x40098000, 0x400a0000,
@@ -48,7 +55,7 @@ namespace Detail {
 
 // address lies in the first 4 KB of an aliased block (the normal-access window)
 constexpr bool hasAtomicAlias(unsigned address) {
-    for(auto const base : Detail::AliasBlocks) {
+    for(auto const base : Detail::aliasBlocks) {
         if(address >= base && address < base + aliasXor) { return true; }
     }
     return false;
@@ -66,8 +73,8 @@ template<unsigned A,
          typename FT,
          unsigned Data>
 struct ExecuteSeam<
-  Action<FieldLocation<Address<A, Z, O, T, M>, Mask, Acc, FT>, AtomicWriteLiteralAction<Data>>,
-  ::Kvasir::Tag::User> {
+  ::Kvasir::Tag::User,
+  Action<FieldLocation<Address<A, Z, O, T, M>, Mask, Acc, FT>, AtomicWriteLiteralAction<Data>>> {
     static_assert(
       Rp::hasAtomicAlias(A),
       "Register::atomic: this register has no atomic alias (SIO, PPB, a memory window): "
@@ -75,7 +82,7 @@ struct ExecuteSeam<
     static_assert(sizeof(T) == 4,
                   "RP registers are 32 bits wide");
     static_assert(
-      !M::readHasSideEffect,
+      !M::semantics.readSideEffect,
       "Register::atomic: the register's read has a side effect, and an alias write behind "
       "the bus interposer reads it (RP2350 datasheet 2.1.3)");
 
@@ -84,11 +91,7 @@ struct ExecuteSeam<
 
     template<unsigned Alias>
     [[gnu::always_inline]] static void store(unsigned v) {
-#ifdef KVASIR_REGISTER_MOCK
-        ::Kvasir::Test::write<T, A + Alias>(static_cast<T>(v));
-#else
-        *reinterpret_cast<T volatile*>(A + Alias) = static_cast<T>(v);
-#endif
+        Mmio<T>::store(A + Alias, static_cast<T>(v));
     }
 
     [[gnu::always_inline]] unsigned operator()(unsigned = 0) {
@@ -98,7 +101,7 @@ struct ExecuteSeam<
             store<Rp::aliasClr>(clrBits);   // one store, no read
         } else {
             // a field that needs both: flip exactly the bits that differ (pico-sdk hw_write_masked)
-            unsigned const old = Detail::GetAddress<Address<A, Z, O, T, M>>::read();
+            unsigned const old = RegisterTraits<Address<A, Z, O, T, M>>::read();
             store<Rp::aliasXor>((old ^ Data) & Mask);
         }
         return 0;

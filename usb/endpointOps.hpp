@@ -1,7 +1,11 @@
 #pragma once
 
+#include "core/Barrier.hpp"
+#include "core/Delay.hpp"
 #include "detail.hpp"
-#include "kvasir/Util/RateLimiter.hpp"
+#include "kvasir/Log/FaultLog.hpp"
+#include "kvasir/Log/LogLimited.hpp"
+#include "kvasir/Log/RateLimiter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -27,41 +31,41 @@ private:
 
     // EP0 is always single buffered: a transfer the host abandons leaves the controller's buffer
     // selection where software cannot put it back.
-    static constexpr bool DoubleBuffered = Base::DoubleBuffered && EP != 0;
+    static constexpr bool doubleBuffered = Base::doubleBuffered && EP != 0;
 
     struct EPState {
-        bool next_pid_data1{};   // false=DATA0, true=DATA1
+        bool nextPidData1{};   // false=DATA0, true=DATA1
 
-        using bufferType = std::conditional_t<DoubleBuffered, bool, std::monostate>;
+        using BufferType = std::conditional_t<doubleBuffered, bool, std::monostate>;
 
-        [[no_unique_address]] bufferType next_buffer_b{};   // false=buffer_0, true=buffer_1
+        [[no_unique_address]] BufferType nextBufferB{};   // false=buffer_0, true=buffer_1
 
-        constexpr void togglePid() { next_pid_data1 = !next_pid_data1; }
+        constexpr void togglePid() { nextPidData1 = !nextPidData1; }
 
         constexpr void toggleBuffer() {
-            if constexpr(DoubleBuffered) { next_buffer_b = !next_buffer_b; }
+            if constexpr(doubleBuffered) { nextBufferB = !nextBufferB; }
         }
 
         constexpr void resetBuffer() {
-            if constexpr(DoubleBuffered) { next_buffer_b = false; }
+            if constexpr(doubleBuffered) { nextBufferB = false; }
         }
 
-        constexpr void resetPid() { next_pid_data1 = false; }
+        constexpr void resetPid() { nextPidData1 = false; }
 
         constexpr void reset() {
             resetBuffer();
             resetPid();
         }
 
-        constexpr void setSetupStage() { next_pid_data1 = false; }
+        constexpr void setSetupStage() { nextPidData1 = false; }
 
-        constexpr void setDataPhase() { next_pid_data1 = true; }
+        constexpr void setDataPhase() { nextPidData1 = true; }
 
-        constexpr bool pid() const { return next_pid_data1; }
+        [[nodiscard]] constexpr bool pid() const { return nextPidData1; }
 
-        constexpr std::size_t buffer() const {
-            if constexpr(DoubleBuffered) {
-                return next_buffer_b ? 1 : 0;
+        [[nodiscard]] constexpr std::size_t buffer() const {
+            if constexpr(doubleBuffered) {
+                return nextBufferB ? 1 : 0;
             } else {
                 return 0;
             }
@@ -71,19 +75,19 @@ private:
 public:
     // State
     static inline EPState        state{};
-    static constexpr std::size_t ep_num = EP;
-    static constexpr bool        IsIn   = (Dir == EndpointDirection::In);
+    static constexpr std::size_t epNum = EP;
+    static constexpr bool        isIn  = (Dir == EndpointDirection::In);
 
     // The buffer and PID cursor advance when a packet is armed, on every endpoint: a
     // double-buffered IN endpoint has to (its second packet is armed behind the first), and with
     // all of them alike nobody has to be told when a packet is over. A packet that is taken back
     // unsent moves the cursor back with it (rewindArmed).
-    static constexpr bool AdvancesOnArm = true;
+    static constexpr bool advancesOnArm = true;
 
     // How many packets may be with the controller at once.
-    static constexpr std::size_t QueueDepth = IsIn && DoubleBuffered ? 2 : 1;
+    static constexpr std::size_t queueDepth = isIn && doubleBuffered ? 2 : 1;
 
-    static constexpr bool AsyncCancel = Base::AsyncCancel;
+    static constexpr bool asyncCancel = Base::asyncCancel;
 
     enum class Fault : std::uint8_t {
         readEmptyBuffer = 1,
@@ -94,12 +98,12 @@ public:
     };
     // Fault logging goes through this: a stalled host or a pulled cable repeats
     // these per packet.
-    static inline Kvasir::RateLimiter<typename Base::ClockType> faultLog_{};
+    static inline Kvasir::FaultLog<typename Base::ClockType, Fault> faultLog_{};
 
 private:
     template<std::size_t Buffer>
     using BufferControlReg = std::conditional_t<
-      IsIn,
+      isIn,
       std::conditional_t<Buffer == 0,
                          typename BufferRegs::template EP<EP>::IN_BUFFER_CONTROL_0,
                          typename BufferRegs::template EP<EP>::IN_BUFFER_CONTROL_1>,
@@ -108,30 +112,17 @@ private:
                          typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL_1>>;
 
     using BothBuffersControlReg
-      = std::conditional_t<IsIn,
+      = std::conditional_t<isIn,
                            typename BufferRegs::template EP<EP>::IN_BUFFER_CONTROL,
                            typename BufferRegs::template EP<EP>::OUT_BUFFER_CONTROL>;
 
     // This endpoint's bit in the per-endpoint registers (EP_ABORT, EP_ABORT_DONE,
     // BUFF_CPU_SHOULD_HANDLE, ...): ep0_in, ep0_out, ep1_in, ... The SVD names each bit as a field
     // of its own, so the bit is picked out of FULLREGISTER by index.
-    static constexpr unsigned EPBit    = (EP * 2) + (IsIn ? 0 : 1);
-    static constexpr auto     abortBit = Kvasir::Register::bit<EPBit>(Regs::EP_ABORT::FULLREGISTER);
+    static constexpr unsigned epBit    = (EP * 2) + (isIn ? 0 : 1);
+    static constexpr auto     abortBit = Kvasir::Register::bit<epBit>(Regs::EP_ABORT::FULLREGISTER);
     static constexpr auto     cpuShouldHandleBit
-      = Kvasir::Register::bit<EPBit>(Regs::BUFF_CPU_SHOULD_HANDLE::FULLREGISTER);
-
-    // At least `cycles` clk_sys cycles: a counted loop, since a Cortex-M may drop a nop from the
-    // pipeline (Armv8-M: "NOP ... not guaranteed to be time consuming"). One turn is a subs and a
-    // taken branch, at least one cycle each.
-    static void waitCycles(std::uint32_t cycles) {
-        asm volatile(
-          ".syntax unified\n"   // gcc assembles Thumb-1 inline asm in divided syntax otherwise
-          "1: subs %0, %0, #1\n"
-          "   bne 1b\n"
-          : "+l"(cycles)
-          :
-          : "cc", "memory");
-    }
+      = Kvasir::Register::bit<epBit>(Regs::BUFF_CPU_SHOULD_HANDLE::FULLREGISTER);
 
     // The controller reads a buffer control on clk_usb, the core writes it on clk_sys. Written
     // in one store, LENGTH, PID and AVAILABLE can reach the controller in different clk_usb
@@ -146,23 +137,24 @@ private:
                                    std::uint16_t length) {
         using BC = BufferControlReg<Buffer>;
 
-        BC::overrideDefaultsRuntime(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
-                                    write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
-                                    write(BC::pid, pid ? 1 : 0),
-                                    write(BC::length, length));
+        apply(BC::overrideDefaults(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
+                                   write(BC::full, Kvasir::Register::value<std::uint16_t, isIn>()),
+                                   write(BC::pid, pid ? 1 : 0),
+                                   write(BC::length, length)));
 
-        asm volatile("dsb" : : : "memory");
-        waitCycles(Base::AvailableDelayCycles);
+        Kvasir::Core::dsb();
+        // twice the delay: the margin the counted loop always had (a turn per cycle asked for)
+        Kvasir::Core::spinCycles<2U * Base::availableDelayCycles>();
 
-        BC::overrideDefaultsRuntime(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
-                                    write(BC::full, Kvasir::Register::value<std::uint16_t, IsIn>()),
-                                    write(BC::pid, pid ? 1 : 0),
-                                    write(BC::length, length),
-                                    set(BC::available));
+        apply(BC::overrideDefaults(write(BC::last, Kvasir::Register::value<std::uint16_t, Last>()),
+                                   write(BC::full, Kvasir::Register::value<std::uint16_t, isIn>()),
+                                   write(BC::pid, pid ? 1 : 0),
+                                   write(BC::length, length),
+                                   set(BC::available)));
     }
 
     static void clearBufferControl() {
-        if constexpr(DoubleBuffered) {
+        if constexpr(doubleBuffered) {
             apply(BothBuffersControlReg::overrideDefaults());
         } else {
             apply(BufferControlReg<0>::overrideDefaults());
@@ -174,11 +166,11 @@ private:
     static void startTransfer(std::span<std::byte const> data,
                               bool                       pid) {
         static_assert(Buffer == 0 || Buffer == 1, "only dual buffered");
-        static_assert(IsIn, "span data transfer only for IN endpoints");
+        static_assert(isIn, "span data transfer only for IN endpoints");
         if(!data.empty()) {
-            device_memory_memcpy(reinterpret_cast<void*>(getBufferAddress<Buffer>()),
-                                 data.data(),
-                                 data.size());
+            deviceMemoryMemcpy(reinterpret_cast<void*>(getBufferAddress<Buffer>()),
+                               data.data(),
+                               data.size());
         }
         writeBufferControl<Buffer, Last>(pid, static_cast<std::uint16_t>(data.size()));
     }
@@ -188,7 +180,7 @@ private:
     static void startTransfer(std::size_t size,
                               bool        pid) {
         static_assert(Buffer == 0 || Buffer == 1, "only dual buffered");
-        static_assert(!IsIn, "size-only transfer only for OUT endpoints");
+        static_assert(!isIn, "size-only transfer only for OUT endpoints");
         writeBufferControl<Buffer, Last>(pid, static_cast<std::uint16_t>(size));
     }
 
@@ -198,7 +190,7 @@ private:
     static std::size_t readBuffer(std::span<std::byte> dest) {
         using namespace std::string_view_literals;
         static_assert(Buffer == 0 || Buffer == 1, "Buffer must be 0 or 1");
-        static_assert(!IsIn, "read only on OUT endpoint");
+        static_assert(!isIn, "read only on OUT endpoint");
 
         auto const bufferState = apply(read(BufferControlReg<Buffer>::length),
                                        read(BufferControlReg<Buffer>::full),
@@ -210,11 +202,11 @@ private:
 
         if(!full || !available) {
             KVASIR_LOG_LIMITED(
-              faultLog_.allow(Kvasir::rateLimitKey(Fault::readEmptyBuffer, Buffer)),
+              faultLog_.note(Fault::readEmptyBuffer, Buffer),
               UC_LOG_C,
               "Attempted read on empty buffer (EP{} {} buffer{}): full={} available={}",
               EP,
-              IsIn ? "IN"sv : "OUT"sv,
+              isIn ? "IN"sv : "OUT"sv,
               Buffer,
               full,
               available);
@@ -222,16 +214,15 @@ private:
         }
 
         if(transferLength != dest.size()) {
-            bool report = true;
-            if constexpr(EP != 0) { report = transferLength > dest.size(); }
+            bool const report = EP == 0 || transferLength > dest.size();
 
             if(report) {
                 KVASIR_LOG_LIMITED(
-                  faultLog_.allow(Kvasir::rateLimitKey(Fault::sizeMismatch, Buffer)),
+                  faultLog_.note(Fault::sizeMismatch, Buffer),
                   UC_LOG_E,
                   "Buffer size mismatch (EP{} {} buffer{}): received={} expected={}",
                   EP,
-                  IsIn ? "IN"sv : "OUT"sv,
+                  isIn ? "IN"sv : "OUT"sv,
                   Buffer,
                   transferLength,
                   dest.size());
@@ -241,9 +232,9 @@ private:
               = std::min<std::uint16_t>(transferLength, static_cast<std::uint16_t>(dest.size()));
         }
 
-        device_memory_memcpy(dest.data(),
-                             reinterpret_cast<void const*>(getBufferAddress<Buffer>()),
-                             transferLength);
+        deviceMemoryMemcpy(dest.data(),
+                           reinterpret_cast<void const*>(getBufferAddress<Buffer>()),
+                           transferLength);
 
         return transferLength;
     }
@@ -253,7 +244,7 @@ private:
         static_assert(Buffer == 0 || Buffer == 1, "Buffer must be 0 or 1");
         using B = typename BufferRegs::template DOUBLEBUFFER<EP>;
         // EP0 IN and OUT share the same buffer
-        if constexpr(IsIn || EP == 0) {
+        if constexpr(isIn || EP == 0) {
             return B::template IN<Buffer>::Addr::value;
         } else {
             return B::template OUT<Buffer>::Addr::value;
@@ -262,10 +253,10 @@ private:
 
 public:
     // Per buffer, whether it is free: not with the controller.
-    using FreeBuffers = std::array<bool, DoubleBuffered ? 2 : 1>;
+    using FreeBuffers = std::array<bool, doubleBuffered ? 2 : 1>;
 
     static FreeBuffers freeBuffers() {
-        if constexpr(DoubleBuffered) {
+        if constexpr(doubleBuffered) {
             auto const av = apply(read(BothBuffersControlReg::available_0),
                                   read(BothBuffersControlReg::available_1));
             return {!static_cast<bool>(get<0>(av)), !static_cast<bool>(get<1>(av))};
@@ -290,11 +281,11 @@ public:
 
         // All buffers busy?
         if(std::ranges::none_of(buffersAvailable, [](bool av) { return av; })) {
-            KVASIR_LOG_LIMITED(faultLog_.allow(Kvasir::rateLimitKey(Fault::allBuffersBusy)),
+            KVASIR_LOG_LIMITED(faultLog_.note(Fault::allBuffersBusy),
                                UC_LOG_W,
                                "EP{} {}: All buffers busy, cannot transfer (buffers_av: {}) {}",
                                EP,
-                               IsIn ? "IN"sv : "OUT"sv,
+                               isIn ? "IN"sv : "OUT"sv,
                                buffersAvailable,
                                BothBuffersControlReg{});
             return false;
@@ -306,7 +297,7 @@ public:
         if(buffersAvailable[expectedBuffer]) {
             bool const pidToUse = state.pid();
 
-            if constexpr(DoubleBuffered) {
+            if constexpr(doubleBuffered) {
                 if(expectedBuffer == 0) {
                     startTransfer<0, Last>(data, pidToUse);
                 } else {
@@ -321,14 +312,13 @@ public:
         }
 
         // Expected buffer busy
-        KVASIR_LOG_LIMITED(
-          faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferNotAvailable, expectedBuffer)),
-          UC_LOG_W,
-          "EP{} {}: Buffer {} not available (buffers_av: {})",
-          EP,
-          IsIn ? "IN"sv : "OUT"sv,
-          expectedBuffer,
-          buffersAvailable);
+        KVASIR_LOG_LIMITED(faultLog_.note(Fault::bufferNotAvailable, expectedBuffer),
+                           UC_LOG_W,
+                           "EP{} {}: Buffer {} not available (buffers_av: {})",
+                           EP,
+                           isIn ? "IN"sv : "OUT"sv,
+                           expectedBuffer,
+                           buffersAvailable);
 
         return false;
     }
@@ -342,16 +332,16 @@ public:
     // Read data from the current buffer based on BUFF_CPU_SHOULD_HANDLE register
     // Returns the number of bytes read
     static std::size_t readCurrentBuffer(std::span<std::byte> dest) {
-        static_assert(!IsIn, "read only on OUT endpoint");
+        static_assert(!isIn, "read only on OUT endpoint");
 
-        if constexpr(DoubleBuffered) {
+        if constexpr(doubleBuffered) {
             bool const buffer0 = apply(read(cpuShouldHandleBit)) == 0;
 
             // The cursor has moved on to the other buffer when this one was armed.
             if(buffer0) {
                 if(state.buffer() != 1) {
                     KVASIR_LOG_LIMITED(
-                      faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferMismatch, 0)),
+                      faultLog_.note(Fault::bufferMismatch, 0),
                       UC_LOG_W,
                       "EP{} OUT: Buffer mismatch - HW indicates buffer0 but state expects "
                       "buffer1",
@@ -359,18 +349,16 @@ public:
                     return 0;
                 }
                 return readBuffer<0>(dest);
-            } else {
-                if(state.buffer() != 0) {
-                    KVASIR_LOG_LIMITED(
-                      faultLog_.allow(Kvasir::rateLimitKey(Fault::bufferMismatch, 1)),
-                      UC_LOG_W,
-                      "EP{} OUT: Buffer mismatch - HW indicates buffer1 but state expects "
-                      "buffer0",
-                      EP);
-                    return 0;
-                }
-                return readBuffer<1>(dest);
             }
+            if(state.buffer() != 0) {
+                KVASIR_LOG_LIMITED(
+                  faultLog_.note(Fault::bufferMismatch, 1),
+                  UC_LOG_W,
+                  "EP{} OUT: Buffer mismatch - HW indicates buffer1 but state expects buffer0",
+                  EP);
+                return 0;
+            }
+            return readBuffer<1>(dest);
         } else {
             return readBuffer<0>(dest);
         }
@@ -382,16 +370,16 @@ public:
     }
 
     template<bool Last = false>
-    static bool armReceive(std::size_t max_size) {
-        static_assert(!IsIn, "armReceive only valid for OUT endpoints");
-        return tryTransfer<Last>(max_size);
+    static bool armReceive(std::size_t maxSize) {
+        static_assert(!isIn, "armReceive only valid for OUT endpoints");
+        return tryTransfer<Last>(maxSize);
     }
 
     static void stall() {
         apply(set(BothBuffersControlReg::stall));
 
         if constexpr(EP == 0) {
-            if constexpr(IsIn) {
+            if constexpr(isIn) {
                 apply(set(Regs::EP_STALL_ARM::ep0_in));
             } else {
                 apply(set(Regs::EP_STALL_ARM::ep0_out));
@@ -442,7 +430,7 @@ public:
         apply(clear(BothBuffersControlReg::stall));
 
         if constexpr(EP == 0) {
-            if constexpr(IsIn) {
+            if constexpr(isIn) {
                 apply(clear(Regs::EP_STALL_ARM::ep0_in));
             } else {
                 apply(clear(Regs::EP_STALL_ARM::ep0_out));
@@ -451,7 +439,7 @@ public:
     }
 
     static void setupEndpoint() {
-        using EPReg   = std::conditional_t<IsIn,
+        using EPReg   = std::conditional_t<isIn,
                                            typename BufferRegs::template EP<EP>::IN_CONTROL,
                                            typename BufferRegs::template EP<EP>::OUT_CONTROL>;
         using RegType = typename EPReg::ENDPOINT_TYPEValC;
@@ -470,7 +458,7 @@ public:
             apply(EPReg::overrideDefaults(
               set(EPReg::enable),
               write(regValue),
-              write(EPReg::double_buffered, Kvasir::Register::value<DoubleBuffered ? 1 : 0>()),
+              write(EPReg::double_buffered, Kvasir::Register::value<doubleBuffered ? 1 : 0>()),
               set(EPReg::interrupt_per_buff),
               write(EPReg::buffer_address, Kvasir::Register::value<getBufferOffset()>())));
         }

@@ -18,8 +18,9 @@
 // the spinlocks and releases whichever one happens to be held. Kvasir::Atomic::Spinlock is
 // a software lock on exclusive accesses, which the RP2350 bus supports across cores and
 // which no erratum touches; the doorbells are then safe to use. The RP2040 has no
-// exclusives: there the atomic shim's cross-core lock is SPINLOCK31 (chip/CrossCoreLock.hpp)
-// and Atomic::Spinlock is built on that; SPINLOCK0..30 are the application's.
+// exclusives: there the atomic shim's cross-core lock is SPINLOCK31 (the Port::CrossCoreLock
+// hook, chip_rp2040 chip/CrossCoreLock.hpp) and Atomic::Spinlock is built on that;
+// SPINLOCK0..30 are the application's.
 namespace Kvasir::Sio {
 
 using Regs = Kvasir::Peripheral::SIO::Registers<0>;
@@ -29,7 +30,7 @@ using Regs = Kvasir::Peripheral::SIO::Registers<0>;
     return get<0>(apply(Register::read(Regs::CPUID::FULLREGISTER)));
 }
 
-// Functor form, for template parameters such as uc_log's MulticoreRttComBackend.
+// Functor form, for template parameters such as uc_log's TwoCores<CoreId> ring layout.
 struct CpuId {
     std::uint32_t operator()() const { return cpuId(); }
 };
@@ -188,7 +189,7 @@ struct FifoIsrOn {
         if(Fifo::readable()) { F(); }
     }
 
-    static constexpr Nvic::Isr<std::addressof(onIsr), Irq> isr{};
+    using Isr = Nvic::Isr<std::addressof(onIsr), Irq>;
 };
 
 template<void (*F)(), int Priority = 3, typename I = Kvasir::Interrupt>

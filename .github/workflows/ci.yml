@@ -1,9 +1,12 @@
 name: CI
 
-# The host tests of the constexpr PIO assembler (tests/CMakeLists.txt): most checks are static_asserts, so building is
-# the test. A lone checkout of this repository is all they need: pioasm (the oracle), cmake_helpers, pico-sdk and
-# pico-examples (the .pio corpus) are fetched by the tests' CMakeLists. arm-none-eabi-gcc is installed so the gcc check
-# covers the firmware compiler too.
+# The host tests (tests/CMakeLists.txt: the constexpr PIO assembler, PWM, pin functions, alias backend, PLL search): most
+# checks are static_asserts, so building is the test. A lone checkout of this repository is all they need: Kvasir_SDK's
+# headers (the alias and PLL tests) are fetched by the tests' CMakeLists. arm-none-eabi-gcc is installed so the gcc
+# check covers the firmware compiler too.
+# conformance-rp2040 / conformance-rp2350: the RP chips' conformance tree (tests/conformance), Kvasir_SDK
+# package-conformance.yml, once per chip: it fetches the chip (master, its core submodule) and puts this checkout in as
+# the chip's src/chip/rp_common, so the tree tests these headers with the chip as it is.
 
 on:
     push:
@@ -16,34 +19,17 @@ on:
 
 jobs:
     test:
-        name: ${{ matrix.compiler.cc }}
-        runs-on: ubuntu-latest
-        container:
-            image: archlinux:latest
-        strategy:
-            fail-fast: false
-            matrix:
-                compiler:
-                    - {cc: gcc, cxx: g++}
-                    - {cc: clang, cxx: clang++}
+        uses: kvasir-io/Kvasir_SDK/.github/workflows/package-host-tests.yml@master
+        with: {extra-packages: python arm-none-eabi-gcc arm-none-eabi-newlib}
 
-        steps:
-            - name: Set up C++ environment
-              run: |
-                pacman -Syu --noconfirm --disable-download-timeout
-                pacman -S --noconfirm --disable-download-timeout git cmake ninja base-devel python arm-none-eabi-gcc arm-none-eabi-newlib ${{ matrix.compiler.cc == 'clang' && 'clang' || '' }}
+    conformance-rp2040:
+        uses: kvasir-io/Kvasir_SDK/.github/workflows/package-conformance.yml@master
+        with: {cmake-args: -DCONFORMANCE_CHIP=rp2040}
 
-            - name: Checkout repository
-              uses: actions/checkout@v6
+    conformance-rp2350:
+        uses: kvasir-io/Kvasir_SDK/.github/workflows/package-conformance.yml@master
+        with: {variants: '["RP2350A","RP2350B"]', cmake-args: -DCONFORMANCE_CHIP=rp2350}
 
-            - name: Configure CMake
-              run: cmake -S tests -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
-              env:
-                CC: ${{ matrix.compiler.cc }}
-                CXX: ${{ matrix.compiler.cxx }}
-
-            - name: Build tests
-              run: cmake --build build -j"$(nproc)"
-
-            - name: Run tests
-              run: ctest --test-dir build --output-on-failure
+    # the include layering of this repository against Kvasir_SDK tools/layers.toml (any finding fails)
+    layers:
+        uses: kvasir-io/Kvasir_SDK/.github/workflows/package-layers.yml@master

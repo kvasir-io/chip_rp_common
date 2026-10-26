@@ -1,6 +1,6 @@
 #pragma once
-// A region of the QSPI flash the firmware runs from, in the shape fs/log/Flash.hpp takes
-// (SectorBytes, sectorCount(), read, program, erase; nothing here includes fs).
+// A region of the QSPI flash the firmware runs from, a Kvasir::Hal::NorRegion (kvasir/Hal/Flash.hpp; the bounds and
+// the page split are Hal::FlashRegionBase's) in the shape fs/log/Flash.hpp takes too (nothing here includes fs).
 //
 // - erase: one 4096-byte sector, boot ROM flash_range_erase (RP2350 data sheet 5.4.8.10).
 // - program: whole 256-byte pages only (flash_range_program, 5.4.8.11); the bytes not asked for
@@ -14,107 +14,76 @@
 //
 // Both mask interrupts and stop XIP for the whole operation (an erase takes tens of ms): nothing
 // may run from flash meanwhile, on the other core neither.
-#include "bootrom_functions.hpp"
+#include "FlashOps.hpp"
+#include "Rom.hpp"
 #include "flash.hpp"
-#include "kvasir/StartUp/LinkerSymbols.hpp"
+#include "kvasir/Hal/Flash.hpp"
+#include "kvasir/Port/LinkerSymbols.hpp"
+#include "kvasir/Register/Memory.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <span>
-
-#if __has_include("chip/rp2040.hpp") && defined(KVASIR_CORE_SCRATCH) && KVASIR_CORE_SCRATCH
-// the scratch banks' load image follows .data's in flash (chip_rp2040/linker/chip.ld; declared as in its StartUp.hpp).
-// Only with SCRATCH_BANKS: a firmware's own linker script (omniscope) may not define these
-extern "C" {
-extern std::byte _LINKER_INTERN_scratch_y_load_;
-extern std::byte _LINKER_INTERN_scratch_y_data_start_;
-extern std::byte _LINKER_INTERN_scratch_y_data_end_;
-}
-#endif
 
 namespace Kvasir { namespace Flash {
 
     /// `Sectors` sectors from `Offset` (bytes from the start of the flash, sector aligned).
     template<std::uint32_t Offset, std::uint32_t Sectors>
-    struct Region {
-        static_assert(Offset % SectorSize == 0,
+    struct Region
+      : Hal::FlashRegionBase<Region<Offset, Sectors>,
+                             Hal::FlashGeometry{xipBase + Offset,
+                                                static_cast<std::uint32_t>(sectorSize),
+                                                static_cast<std::uint32_t>(pageSize),
+                                                Sectors},
+                             Hal::PageSplit::split> {
+        static_assert(Offset % sectorSize == 0,
                       "the region must start on a sector");
-        static constexpr std::uint32_t SectorBytes = SectorSize;
-        static constexpr std::uint32_t PageBytes   = PageSize;   // what program() pads to
-        static constexpr std::uint32_t Start       = Offset;
-        static constexpr std::uint32_t Bytes       = Sectors * SectorBytes;
+        static constexpr std::uint32_t pageBytes = pageSize;   // what program() pads to
+        static constexpr std::uint32_t start     = Offset;
 
-        [[nodiscard]] static constexpr std::uint32_t sectorCount() { return Sectors; }
+        static void readAt(std::uint32_t        addr,
+                           std::span<std::byte> out) {
+            Kvasir::Memory::loadBytes(xipUntranslatedBase + Offset + addr, out.data(), out.size());
+        }
 
-        static bool read(std::uint32_t        addr,
-                         std::span<std::byte> out) {
-            if(std::uint64_t{addr} + out.size() > Bytes) { return false; }
-            std::memcpy(out.data(),
-                        reinterpret_cast<std::byte const*>(XipUntranslatedBase + Offset + addr),
-                        out.size());
+        // the integer flash offset only: no flash symbol's address reaches the boot ROM's RAM function
+        static bool programPage(std::uint32_t        page,
+                                std::span<std::byte const,
+                                          pageBytes> bytes) {
+            Kvasir::Core::IrqGuard const guard{};
+            Kvasir::detail::flashWrite(Offset + page,
+                                       reinterpret_cast<std::uint8_t const*>(bytes.data()),
+                                       bytes.size());
             return true;
         }
 
-        static bool program(std::uint32_t              addr,
-                            std::span<std::byte const> in) {
-            if(std::uint64_t{addr} + in.size() > Bytes) { return false; }
-            while(!in.empty()) {
-                auto const page = addr & ~std::uint32_t{PageSize - 1U};
-                auto const at   = addr - page;
-                auto const n    = std::min<std::size_t>(PageSize - at, in.size());
-                alignas(4) std::array<std::byte, PageSize> buf{};
-                buf.fill(std::byte{0xFF});
-                std::copy_n(in.begin(), n, buf.begin() + static_cast<std::ptrdiff_t>(at));
-                {
-                    Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
-                    Kvasir::detail::flash_write(Offset + page,
-                                                reinterpret_cast<std::uint8_t const*>(buf.data()),
-                                                buf.size());
-                }
-                addr += static_cast<std::uint32_t>(n);
-                in = in.subspan(n);
-            }
+        static bool eraseSector(std::uint32_t sector) {
+            Kvasir::Core::IrqGuard const guard{};
+            Kvasir::detail::flashErase(Offset + sector * sectorSize, 1);
             return true;
         }
 
-        /// The region lies past the end of the firmware's flash image (the load end of .data, on an RP2040 image with
-        /// SCRATCH_BANKS of the scratch banks' image after it). Kvasir::Flash::CellStore refuses to touch a region that does not.
+        /// The region lies past the end of the firmware's flash image (_LINKER_image_end_flash_: every section the
+        /// linker loads into flash, whatever the chip's script loads after .data). Kvasir::Flash::CellStore refuses to
+        /// touch a region that does not. Hides FlashRegionBase's: the RP2350's partitions.
         [[nodiscard]] static bool outsideImage() {
-            std::uintptr_t end
-              = reinterpret_cast<std::uintptr_t>(std::addressof(_LINKER_data_start_flash_))
-              + reinterpret_cast<std::size_t>(std::addressof(_LINKER_data_size_));
-#if __has_include("chip/rp2040.hpp") && defined(KVASIR_CORE_SCRATCH) && KVASIR_CORE_SCRATCH
-            end = std::max<std::uintptr_t>(
-              end,
-              reinterpret_cast<std::uintptr_t>(std::addressof(_LINKER_INTERN_scratch_y_load_))
-                + static_cast<std::uintptr_t>(
-                  std::addressof(_LINKER_INTERN_scratch_y_data_end_)
-                  - std::addressof(_LINKER_INTERN_scratch_y_data_start_)));
-#endif
-#if __has_include("chip/rp2350.hpp")
+            std::uintptr_t const end = Kvasir::Startup::linkerAddress<_LINKER_image_end_flash_>();
+#ifdef KVASIR_CHIP_RP2350
             // `end` is a runtime address, Offset a flash byte: an image launched from a partition is linked at
             // 0x10000000 but lies at the partition's base, so compare in flash bytes (flash_runtime_to_storage_addr,
             // RP2350 data sheet 5.4.8.13; it answers in the XIP space, 0x10000000 for flash byte 0 - measured). Its
             // last byte, since `end` may lie past the mapped window. A region in front of the image (the other A/B
             // partition) is refused too. Not mapped (a RAM image): as before.
-            if(auto const last = Kvasir::detail::flash_runtime_to_storage_addr(
+            if(auto const last = Kvasir::RomFunctions::flashRuntimeToStorageAddr(
                  static_cast<std::uint32_t>(end - 1U));
                last >= 0)
             {
-                return XipBase + Offset > static_cast<std::uint32_t>(last);
+                return xipBase + Offset > static_cast<std::uint32_t>(last);
             }
 #endif
-            return XipBase + Offset >= end;
-        }
-
-        static bool erase(std::uint32_t sector) {
-            if(sector >= Sectors) { return false; }
-            Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
-            Kvasir::detail::flash_erase(Offset + sector * SectorBytes, 1);
-            return true;
+            return xipBase + Offset >= end;
         }
     };
 

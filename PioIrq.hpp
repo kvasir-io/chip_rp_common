@@ -1,5 +1,6 @@
 #pragma once
 #include "PIO.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "chip/Interrupt.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Register/Register.hpp"
@@ -39,14 +40,14 @@ namespace Kvasir { namespace Pio {
              void (*F)(),
              int Priority = 3>
     struct IrqSource {
-        static_assert(Instance < PinConfig::pioCount(PinConfig::CurrentChip),
+        static_assert(Instance < PinConfig::pioCount(Chip::part),
                       "the RP2350 has PIO0..PIO2, the RP2040 PIO0 and PIO1");
         static_assert(Line < 2,
                       "a PIO instance has two interrupt lines");
         static_assert(Kind == IrqSourceKind::flag ? N < 8 : N < 4,
                       "four state machines, eight IRQ flags");
         static_assert(Nvic::isNullHandler<F> || Kind != IrqSourceKind::flag
-                        || !PinConfig::isRp2040(PinConfig::CurrentChip) || N < 4,
+                        || !PinConfig::isRp2040(Chip::part) || N < 4,
                       "the RP2040 routes IRQ flags 0..3 to the NVIC only");
 
         // The INTE / INTS bit layout: sm0..3_rxnempty in 3:0, sm0..3_txnfull in 7:4, the
@@ -58,36 +59,10 @@ namespace Kvasir { namespace Pio {
         using PioRegs = Kvasir::Peripheral::PIO::Registers<Instance>;
         using IrqRegs = typename PioRegs::template IRQS<Line>;
 
-        // The NVIC line, by the chip's name for it (PIO0_IRQ_0 is 15 on the RP2350, 7 on the
-        // RP2040).
-        static constexpr auto nvicLine() {
-            if constexpr(Instance == 0) {
-                if constexpr(Line == 0) {
-                    return Kvasir::Interrupt::pio0_0;
-                } else {
-                    return Kvasir::Interrupt::pio0_1;
-                }
-            } else if constexpr(Instance == 1) {
-                if constexpr(Line == 0) {
-                    return Kvasir::Interrupt::pio1_0;
-                } else {
-                    return Kvasir::Interrupt::pio1_1;
-                }
-            } else {
-                return nvicLinePio2();
-            }
-        }
-
-        template<typename I = Kvasir::Interrupt>
-        static constexpr auto nvicLinePio2() {
-            if constexpr(Line == 0) {
-                return I::pio2_0;
-            } else {
-                return I::pio2_1;
-            }
-        }
-
-        using NvicIndex = Nvic::Index<decltype(nvicLine())::value>;
+        // The NVIC line: the block row's interrupt `Line` (chip/Blocks.hpp: PIOn_IRQ_0, PIOn_IRQ_1; PIO0_IRQ_0 is 15
+        // on the RP2350, 7 on the RP2040).
+        using NvicIndex
+          = std::remove_cvref_t<brigand::at_c<typename Rp::Block<PioRegs>::Irqs, Line>>;
 
         static constexpr Register::
           FieldLocation<typename IrqRegs::INTS::Addr, bit, Register::ReadOnlyAccess, std::uint32_t>
@@ -112,7 +87,8 @@ namespace Kvasir { namespace Pio {
             Nvic::
               SubIsr<NvicIndex, F, Nvic::Status<status>, ClearT, Nvic::Enable<enable>, Priority>>>;
 
-        static constexpr auto powerClockEnable = list(Kvasir::Pio::getEnable<Instance>());
+        static constexpr auto powerClockEnable
+          = list(clear(Rp::Block<Kvasir::Peripheral::PIO::Registers<Instance>>::reset));
     };
 
     template<unsigned Instance, unsigned Line, unsigned Sm, void (*F)(), int Priority = 3>

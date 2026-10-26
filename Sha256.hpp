@@ -1,8 +1,10 @@
 #pragma once
-#if !__has_include("chip/rp2350.hpp")
+#ifndef KVASIR_CHIP_RP2350
     #error "the SHA-256 block exists on the RP2350 only"
 #endif
+#include "DMA.hpp"
 #include "WaitBounds.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "kvasir/Register/Register.hpp"
 #include "peripherals/RESETS.hpp"
 #include "peripherals/SHA256.hpp"
@@ -31,10 +33,9 @@ namespace Kvasir { namespace Sha256 {
     struct Sha256 {
         using Regs = Kvasir::Peripheral::SHA256::Registers<>;
 
-        static constexpr std::size_t BlockBytes = 64;
+        static constexpr std::size_t blockBytes = 64;
 
-        static constexpr auto powerClockEnable
-          = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::sha256));
+        static constexpr auto powerClockEnable = list(clear(Rp::Block<Regs>::reset));
 
         static constexpr auto initStepPeripheryConfig
           = list(Regs::CSR::overrideDefaults(write(Regs::CSR::bswap, Register::value<1>()),
@@ -56,7 +57,7 @@ namespace Kvasir { namespace Sha256 {
             total_ += data.size();
             for(auto const b : data) {
                 block_[pending_++] = b;
-                if(pending_ == BlockBytes) {
+                if(pending_ == blockBytes) {
                     feedBlock_();
                     pending_ = 0;
                 }
@@ -68,12 +69,12 @@ namespace Kvasir { namespace Sha256 {
         [[nodiscard]] static Digest finish() {
             auto const bits    = static_cast<std::uint64_t>(total_) * 8U;
             block_[pending_++] = std::byte{0x80};
-            if(pending_ > BlockBytes - 8) {
-                while(pending_ < BlockBytes) { block_[pending_++] = std::byte{0}; }
+            if(pending_ > blockBytes - 8) {
+                while(pending_ < blockBytes) { block_[pending_++] = std::byte{0}; }
                 feedBlock_();
                 pending_ = 0;
             }
-            while(pending_ < BlockBytes - 8) { block_[pending_++] = std::byte{0}; }
+            while(pending_ < blockBytes - 8) { block_[pending_++] = std::byte{0}; }
             for(int i = 7; i >= 0; --i) {
                 block_[pending_++] = static_cast<std::byte>(bits >> (8 * i));
             }
@@ -111,7 +112,7 @@ namespace Kvasir { namespace Sha256 {
                               F&&                        f) {
             static_assert(Dma::ownsChannel(Channel),
                           "the SHA-256 DMA channel is not this DmaBase's");
-            auto const blocks = (data.size() / BlockBytes) * BlockBytes;
+            auto const blocks = (data.size() / blockBytes) * blockBytes;
             auto const tail   = data.subspan(blocks);
             if(blocks == 0) {
                 update(tail);
@@ -121,27 +122,30 @@ namespace Kvasir { namespace Sha256 {
             total_ += blocks;
             tail_ = tail;
             Dma::template start<Channel,
-                                Dma::Priority::high,
-                                Dma::TriggerSource::sha256,
-                                Dma::TransferSize::_32,
-                                false,
-                                true>(Regs::WDATA::Addr::value,
-                                      reinterpret_cast<std::uint32_t>(data.data()),
-                                      blocks / 4,
-                                      [cb = std::forward<F>(f)]() {
-                                          update(tail_);
-                                          cb();
-                                      });
+                                ::Kvasir::DMA::ChannelConfig{.priority = Dma::Priority::high,
+                                                             .trigger  = Dma::TriggerSource::sha256,
+                                                             .size     = Dma::TransferSize::size32,
+                                                             .incrementRead  = true,
+                                                             .incrementWrite = false}>(
+              Regs::WDATA::Addr::value,
+              reinterpret_cast<std::uint32_t>(data.data()),
+              blocks / 4,
+              [cb = std::forward<F>(f)]() {
+                  update(tail_);
+                  cb();
+              });
         }
 
         /// The block's error flag: a word was written while it was not ready (sticky).
-        [[nodiscard]] static bool overrun() { return apply(read(Regs::CSR::err_wdata_not_rdy)); }
+        [[nodiscard]] static bool overrun() {
+            return apply(read(Regs::CSR::err_wdata_not_rdy)) != 0;
+        }
 
         static constexpr std::uint32_t wdataAddress = Regs::WDATA::Addr::value;
 
     private:
         static void feedBlock_() {
-            for(std::size_t i = 0; i < BlockBytes; i += 4) {
+            for(std::size_t i = 0; i < blockBytes; i += 4) {
                 std::uint32_t const w = static_cast<std::uint32_t>(block_[i])
                                       | (static_cast<std::uint32_t>(block_[i + 1]) << 8)
                                       | (static_cast<std::uint32_t>(block_[i + 2]) << 16)
@@ -162,7 +166,7 @@ namespace Kvasir { namespace Sha256 {
             d[at + 3] = static_cast<std::uint8_t>(w);
         }
 
-        static inline std::array<std::byte, BlockBytes> block_{};
+        static inline std::array<std::byte, blockBytes> block_{};
         static inline std::size_t                       pending_{};
         static inline std::uint64_t                     total_{};
         static inline std::span<std::byte const>        tail_{};

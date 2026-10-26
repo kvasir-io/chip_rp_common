@@ -1,8 +1,8 @@
-// Every instruction form, worked out by hand from the RP2350 datasheet 11.4 (Table 980 and the
-// operand lists of 11.4.2-11.4.12), side-set and delay packing (11.4.1), the builder against the
-// parser, and the messages. The cross-check against pioasm (generated files) is the other half.
-#include "crosscheck_summary.hpp"
-#include "pio/AsmParse.hpp"
+// Every instruction form of the builder (pio/Asm.hpp), worked out by hand from the RP2350
+// datasheet 11.4 (Table 980 and the operand lists of 11.4.2-11.4.12), side-set and delay
+// packing (11.4.1), labels, defines, Program<>'s members and the messages.
+#include "pio/Asm.hpp"
+
 #include "pio/ClockOutProgram.hpp"
 #include "pio/I2sOutProgram.hpp"
 #include "pio/PioQspiProgram.hpp"
@@ -27,111 +27,107 @@ consteval std::uint16_t one(auto f) {
     return a.ok() ? a.words[0] : 0xFFFF;
 }
 
-consteval std::uint16_t text(std::string_view t) {
-    auto const a = parse(t);
-    return a.ok() ? a.words[0] : 0xFFFF;
-}
-
 // ---- JMP, 11.4.2: 000 | cond | address ----------------------------------------------------
 static_assert(one([](Asm& a) { a.jmp(Cond::always, 0U); }) == 0x0000);
-static_assert(text(".program p\njmp 0\n") == 0x0000);
-static_assert(text(".program p\njmp !x 0\n") == 0x0020);      // 001
-static_assert(text(".program p\njmp x-- 0\n") == 0x0040);     // 010
-static_assert(text(".program p\njmp !y 0\n") == 0x0060);      // 011
-static_assert(text(".program p\njmp y-- 0\n") == 0x0080);     // 100
-static_assert(text(".program p\njmp x!=y 0\n") == 0x00A0);    // 101
-static_assert(text(".program p\njmp pin 0\n") == 0x00C0);     // 110
-static_assert(text(".program p\njmp !osre 0\n") == 0x00E0);   // 111
-static_assert(text(".program p\nnop\nnop\njmp x--, 2\n") == 0xA042);
-static_assert(parse(".program p\nnop\nnop\njmp x--, 2\n").words[2] == 0x0042);   // 010 | 00010
+static_assert(one([](Asm& a) { a.jmp(Cond::notX, 0U); }) == 0x0020);      // 001
+static_assert(one([](Asm& a) { a.jmp(Cond::xDec, 0U); }) == 0x0040);      // 010
+static_assert(one([](Asm& a) { a.jmp(Cond::notY, 0U); }) == 0x0060);      // 011
+static_assert(one([](Asm& a) { a.jmp(Cond::yDec, 0U); }) == 0x0080);      // 100
+static_assert(one([](Asm& a) { a.jmp(Cond::xNeY, 0U); }) == 0x00A0);      // 101
+static_assert(one([](Asm& a) { a.jmp(Cond::pin, 0U); }) == 0x00C0);       // 110
+static_assert(one([](Asm& a) { a.jmp(Cond::notOsre, 0U); }) == 0x00E0);   // 111
+static_assert(assemble([](Asm& a) {
+                  a.nop();
+                  a.nop();
+                  a.jmp(Cond::xDec, 2U);
+              }).words[2]
+              == 0x0042);   // 010 | 00010
 
 // ---- WAIT, 11.4.3: 001 | pol[7] | source[6:5] | index[4:0] --------------------------------
-static_assert(text(".program p\nwait 0 gpio 5\n") == 0x2005);   // src 00
-static_assert(text(".program p\nwait 1 gpio 31\n") == 0x209F);
-static_assert(text(".program p\nwait 1 pin 3\n") == 0x20A3);   // 0x80 | 01<<5 | 3
-static_assert(text(".program p\nwait pin 3\n") == 0x20A3);     // polarity defaults to 1
-static_assert(text(".program p\nwait 0 irq 7\n") == 0x2047);   // 10<<5 | 7
-static_assert(text(".program p\nwait 1 irq 1 rel\n")
+static_assert(one([](Asm& a) { a.wait(0, Wait::gpio, 5); }) == 0x2005);   // src 00
+static_assert(one([](Asm& a) { a.wait(1, Wait::gpio, 31); }) == 0x209F);
+static_assert(one([](Asm& a) { a.wait(1, Wait::pin, 3); }) == 0x20A3);   // 0x80 | 01<<5 | 3
+static_assert(one([](Asm& a) { a.wait(0, Wait::irq, 7); }) == 0x2047);   // 10<<5 | 7
+static_assert(one([](Asm& a) { a.wait(1, Wait::irq, 1, IrqMode::rel); })
               == 0x20D1);   // 0x80 | 0x40 | IdxMode 10<<3 | 1
-static_assert(one([](Asm& a) { a.wait(1, Wait::irq, 1, IrqMode::rel); }) == 0x20D1);
-static_assert(text(".program p\n.pio_version 1\nwait 1 irq prev 2\n") == 0x20CA);    // 01<<3 | 2
-static_assert(text(".program p\n.pio_version 1\nwait 1 irq next, 3\n") == 0x20DB);   // 11<<3 | 3
-static_assert(text(".program p\n.pio_version 1\nwait 1 jmppin\n") == 0x20E0);        // src 11
-static_assert(text(".program p\n.pio_version 1\nwait 0 jmppin + 3\n") == 0x2063);
+static_assert(one<1>([](Asm& a) { a.wait(1, Wait::irq, 2, IrqMode::prev); }) == 0x20CA);   // 01<<3
+static_assert(one<1>([](Asm& a) { a.wait(1, Wait::irq, 3, IrqMode::next); }) == 0x20DB);   // 11<<3
+static_assert(one<1>([](Asm& a) { a.wait(1, Wait::jmppin, 0); }) == 0x20E0);               // src 11
+static_assert(one<1>([](Asm& a) { a.wait(0, Wait::jmppin, 3); }) == 0x2063);
 
 // ---- IN, 11.4.4: 010 | source | bit count (32 as 0) ------------------------------------------
-static_assert(text(".program p\nin pins, 32\n") == 0x4000);
-static_assert(text(".program p\nin x, 1\n") == 0x4021);
-static_assert(text(".program p\nin y, 5\n") == 0x4045);
-static_assert(text(".program p\nin null, 31\n") == 0x407F);
-static_assert(text(".program p\nin isr, 8\n") == 0x40C8);    // 110
-static_assert(text(".program p\nin osr, 16\n") == 0x40F0);   // 111
+static_assert(one([](Asm& a) { a.in(In::pins, 32); }) == 0x4000);
+static_assert(one([](Asm& a) { a.in(In::x, 1); }) == 0x4021);
+static_assert(one([](Asm& a) { a.in(In::y, 5); }) == 0x4045);
+static_assert(one([](Asm& a) { a.in(In::null, 31); }) == 0x407F);
+static_assert(one([](Asm& a) { a.in(In::isr, 8); }) == 0x40C8);    // 110
+static_assert(one([](Asm& a) { a.in(In::osr, 16); }) == 0x40F0);   // 111
 
 // ---- OUT, 11.4.5: 011 | destination | bit count --------------------------------------------
-static_assert(text(".program p\nout pins, 1\n") == 0x6001);
-static_assert(text(".program p\nout x, 2\n") == 0x6022);
-static_assert(text(".program p\nout y, 3\n") == 0x6043);
-static_assert(text(".program p\nout null, 32\n") == 0x6060);
-static_assert(text(".program p\nout pindirs, 4\n") == 0x6084);   // 100
-static_assert(text(".program p\nout pc, 5\n") == 0x60A5);        // 101
-static_assert(text(".program p\nout isr, 6\n") == 0x60C6);       // 110
-static_assert(text(".program p\nout exec, 16\n") == 0x60F0);     // 111
+static_assert(one([](Asm& a) { a.out(Out::pins, 1); }) == 0x6001);
+static_assert(one([](Asm& a) { a.out(Out::x, 2); }) == 0x6022);
+static_assert(one([](Asm& a) { a.out(Out::y, 3); }) == 0x6043);
+static_assert(one([](Asm& a) { a.out(Out::null, 32); }) == 0x6060);
+static_assert(one([](Asm& a) { a.out(Out::pindirs, 4); }) == 0x6084);   // 100
+static_assert(one([](Asm& a) { a.out(Out::pc, 5); }) == 0x60A5);        // 101
+static_assert(one([](Asm& a) { a.out(Out::isr, 6); }) == 0x60C6);       // 110
+static_assert(one([](Asm& a) { a.out(Out::exec, 16); }) == 0x60F0);     // 111
 
 // ---- PUSH / PULL, 11.4.6-7: 100 | pull | IfF/IfE | Blk | 00000 ------------------------------
-static_assert(text(".program p\npush\n") == 0x8020);   // block by default
-static_assert(text(".program p\npush noblock\n") == 0x8000);
-static_assert(text(".program p\npush iffull\n") == 0x8060);
-static_assert(text(".program p\npush iffull noblock\n") == 0x8040);
-static_assert(text(".program p\npull\n") == 0x80A0);
-static_assert(text(".program p\npull noblock\n") == 0x8080);
-static_assert(text(".program p\npull ifempty\n") == 0x80E0);
-static_assert(text(".program p\npull ifempty block\n") == 0x80E0);
-static_assert(text(".program p\npull ifempty noblock\n") == 0x80C0);
+static_assert(one([](Asm& a) { a.push(); }) == 0x8020);   // block by default
+static_assert(one([](Asm& a) { a.push(false, false); }) == 0x8000);
+static_assert(one([](Asm& a) { a.push(true); }) == 0x8060);
+static_assert(one([](Asm& a) { a.push(true, false); }) == 0x8040);
+static_assert(one([](Asm& a) { a.pull(); }) == 0x80A0);
+static_assert(one([](Asm& a) { a.pull(false, false); }) == 0x8080);
+static_assert(one([](Asm& a) { a.pull(true); }) == 0x80E0);
+static_assert(one([](Asm& a) { a.pull(true, false); }) == 0x80C0);
 
 // ---- MOV, 11.4.10: 101 | destination | op | source --------------------------------------------
-static_assert(text(".program p\nmov x, y\n") == 0xA022);    // 001 | 00 | 010
-static_assert(text(".program p\nmov y, ~x\n") == 0xA049);   // 010 | 01 | 001
-static_assert(text(".program p\nmov y, !x\n") == 0xA049);
-static_assert(text(".program p\nmov isr, ::osr\n") == 0xA0D7);   // 110 | 10 | 111
-static_assert(text(".program p\nmov pins, null\n") == 0xA003);
-static_assert(text(".program p\nmov exec, x\n") == 0xA081);      // 100
-static_assert(text(".program p\nmov pc, status\n") == 0xA0A5);   // 101 | 00 | 101
-static_assert(text(".program p\nmov osr, isr\n") == 0xA0E6);
-static_assert(text(".program p\nnop\n") == 0xA042);                              // mov y, y
-static_assert(text(".program p\n.pio_version 1\nmov pindirs, x\n") == 0xA061);   // 011
-static_assert(one<1>([](Asm& a) { a.mov(MovDst::pindirs, MovSrc::x); }) == 0xA061);
+static_assert(one([](Asm& a) { a.mov(MovDst::x, MovSrc::y); }) == 0xA022);   // 001 | 00 | 010
+static_assert(one([](Asm& a) { a.mov(MovDst::y, MovSrc::x, MovOp::invert); })
+              == 0xA049);   // 010 | 01 | 001
+static_assert(one([](Asm& a) { a.mov(MovDst::isr, MovSrc::osr, MovOp::reverse); })
+              == 0xA0D7);   // 110 | 10 | 111
+static_assert(one([](Asm& a) { a.mov(MovDst::pins, MovSrc::null); }) == 0xA003);
+static_assert(one([](Asm& a) { a.mov(MovDst::exec, MovSrc::x); }) == 0xA081);      // 100
+static_assert(one([](Asm& a) { a.mov(MovDst::pc, MovSrc::status); }) == 0xA0A5);   // 101 | 00 | 101
+static_assert(one([](Asm& a) { a.mov(MovDst::osr, MovSrc::isr); }) == 0xA0E6);
+static_assert(one([](Asm& a) { a.nop(); }) == 0xA042);   // mov y, y
+static_assert(Enc::nop == 0xA042);
+static_assert(one<1>([](Asm& a) { a.mov(MovDst::pindirs, MovSrc::x); }) == 0xA061);   // 011
 
 // ---- MOV to / from RX, 11.4.8-9 (v1): 100 | from | 00 | 1 | IdxI | 0 | index -----------------
-static_assert(text(".program p\n.pio_version 1\n.fifo putget\nmov rxfifo[y], isr\n") == 0x8010);
-static_assert(text(".program p\n.pio_version 1\n.fifo txput\nmov rxfifo[2], isr\n") == 0x801A);
-static_assert(text(".program p\n.pio_version 1\n.fifo txget\nmov osr, rxfifo[y]\n") == 0x8090);
-static_assert(text(".program p\n.pio_version 1\n.fifo putget\nmov osr, rxfifo[3]\n") == 0x809B);
 static_assert(one<1,
-                  Fifo::putget>([](Asm& a) { a.movToRx(2); })
+                  Fifo::putget>([](Asm& a) { a.movToRxY(); })
+              == 0x8010);
+static_assert(one<1,
+                  Fifo::txput>([](Asm& a) { a.movToRx(2); })
               == 0x801A);
 static_assert(one<1,
-                  Fifo::putget>([](Asm& a) { a.movFromRxY(); })
+                  Fifo::txget>([](Asm& a) { a.movFromRxY(); })
               == 0x8090);
+static_assert(one<1,
+                  Fifo::putget>([](Asm& a) { a.movFromRx(3); })
+              == 0x809B);
 
 // ---- IRQ, 11.4.11: 110 | 0 | Clr | Wait | IdxMode | index ------------------------------------
-static_assert(text(".program p\nirq 3\n") == 0xC003);
-static_assert(text(".program p\nirq set 3\n") == 0xC003);
-static_assert(text(".program p\nirq nowait 3\n") == 0xC003);
-static_assert(text(".program p\nirq wait 2\n") == 0xC022);
-static_assert(text(".program p\nirq clear 7\n") == 0xC047);
-static_assert(text(".program p\nirq 1 rel\n") == 0xC011);
-static_assert(text(".program p\n.pio_version 1\nirq prev 0\n") == 0xC008);
-static_assert(text(".program p\n.pio_version 1\nirq next wait 5\n")
-              == 0xC03D);   // 0x20 | 11<<3 | 5
+static_assert(one([](Asm& a) { a.irq(3); }) == 0xC003);
+static_assert(one([](Asm& a) { a.irqWait(2); }) == 0xC022);
+static_assert(one([](Asm& a) { a.irqClear(7); }) == 0xC047);
+static_assert(one([](Asm& a) { a.irq(1, IrqMode::rel); }) == 0xC011);
+static_assert(one<1>([](Asm& a) { a.irq(0, IrqMode::prev); }) == 0xC008);
+static_assert(one<1>([](Asm& a) { a.irqWait(5, IrqMode::next); }) == 0xC03D);   // 0x20 | 11<<3 | 5
 static_assert(one<1>([](Asm& a) { a.irq(0, IrqMode::next); }) == 0xC018);
 
 // ---- SET, 11.4.12: 111 | destination | data --------------------------------------------------
-static_assert(text(".program p\nset pins, 1\n") == 0xE001);
-static_assert(text(".program p\nset x, 31\n") == 0xE03F);
-static_assert(text(".program p\nset y, 0\n") == 0xE040);
-static_assert(text(".program p\nset pindirs, 3\n") == 0xE083);      // 100
-static_assert(text(".program p\nset pindirs, 0x1f\n") == 0xE09F);   // = StateMachine's literal
-static_assert(text(".program p\n.word 0xbeef\n") == 0xBEEF);
+static_assert(one([](Asm& a) { a.set(Set::pins, 1); }) == 0xE001);
+static_assert(one([](Asm& a) { a.set(Set::x, 31); }) == 0xE03F);
+static_assert(one([](Asm& a) { a.set(Set::y, 0); }) == 0xE040);
+static_assert(one([](Asm& a) { a.set(Set::pindirs, 3); }) == 0xE083);   // 100
+static_assert(one([](Asm& a) { a.set(Set::pindirs, 0x1f); })
+              == 0xE09F);   // = StateMachine's literal
+static_assert(one([](Asm& a) { a.word(0xbeef); }) == 0xBEEF);
 
 // ---- which words only PIO v1 has --------------------------------------------------------------
 static_assert(isPioV1Only(0x20E0) && isPioV1Only(0x2063));     // wait jmppin
@@ -146,102 +142,95 @@ static_assert(isPioV1Only(0xC008) && isPioV1Only(0xC03D) && !isPioV1Only(0xC011)
 static_assert(!isPioV1Only(0x6421) && !isPioV1Only(0x00E0) && !isPioV1Only(0xE09F)
               && !isPioV1Only(0x4000));
 // .pio_version 1 alone does not make a program v1 (fan_tacho declares it and uses v0 only)
-static_assert(
-  !usesPioV1(parse(".pio_version 1\n.program p\njmp pin 0\nmov y, ~null\npush noblock\n").words));
+static_assert(!usesPioV1(assemble([](Asm& a) {
+                             a.pioVersion(1);
+                             a.jmp(Cond::pin, 0U);
+                             a.mov(MovDst::y, MovSrc::null, MovOp::invert);
+                             a.push(false, false);
+                         }).words));
 
 // ---- side-set and delay, 11.4.1: bits 12:8, side-set MSBs (enable first when opt) -----------
-static_assert(text(".program p\n.side_set 1\nnop side 1 [3]\n") == 0xB342);       // 1<<4 | 3
-static_assert(text(".program p\n.side_set 2 opt\nnop side 2 [1]\n") == 0xB942);   // 0x10 | 2<<2 | 1
-static_assert(text(".program p\n.side_set 2 opt\nnop [3]\n") == 0xA342);   // no side: enable 0
-static_assert(text(".program p\n.side_set 3 opt pindirs\nnop side 5 [1]\n")
+static_assert(one([](Asm& a) {
+                  a.sideSet(1);
+                  a.nop().side(1).delay(3);
+              })
+              == 0xB342);   // 1<<4 | 3
+static_assert(one([](Asm& a) {
+                  a.sideSet(2, true);
+                  a.nop().side(2).delay(1);
+              })
+              == 0xB942);   // 0x10 | 2<<2 | 1
+static_assert(one([](Asm& a) {
+                  a.sideSet(2, true);
+                  a.nop().delay(3);
+              })
+              == 0xA342);   // no side: enable 0
+static_assert(one([](Asm& a) {
+                  a.sideSet(3, true, true);
+                  a.nop().side(5).delay(1);
+              })
               == 0xBB42);   // 0x10 | 5<<1 | 1
-static_assert(text(".program p\n.side_set 5\nnop side 31\n") == 0xBF42);
-static_assert(text(".program p\nnop [31]\n") == 0xBF42);
-static_assert(text(".program p\n.side_set 1\nnop [2] side 1\n") == 0xB242);   // either order
-static_assert(parse(".program p\n.side_set 3 opt pindirs\nnop side 5\n").sidesetPindirs);
-static_assert(parse(".program p\n.side_set 3 opt pindirs\nnop side 5\n").sidesetCount == 3);
+static_assert(one([](Asm& a) {
+                  a.sideSet(5);
+                  a.nop().side(31);
+              })
+              == 0xBF42);
+static_assert(one([](Asm& a) { a.nop().delay(31); }) == 0xBF42);
+static_assert(one([](Asm& a) {
+                  a.sideSet(1);
+                  a.nop().delay(2).side(1);
+              })
+              == 0xB242);   // either order
+constexpr auto pindirsSide = assemble([](Asm& a) {
+    a.sideSet(3, true, true);
+    a.nop().side(5);
+});
+static_assert(pindirsSide.sidesetPindirs && pindirsSide.sidesetCount == 3);
 
 // ---- wrap, labels, defines, programs ---------------------------------------------------------
-constexpr auto three = parse(".program p\nnop\nnop\nnop\n");
+constexpr auto three = assemble([](Asm& a) {
+    a.nop();
+    a.nop();
+    a.nop();
+});
 static_assert(three.wrapTarget == 0 && three.wrap == 2 && three.length == 3);
-constexpr auto wrapped = parse(".program p\nnop\n.wrap_target\nnop\n.wrap\nnop\n");
+constexpr auto wrapped = assemble([](Asm& a) {
+    a.nop();
+    a.wrapTarget();
+    a.nop();
+    a.wrap();
+    a.nop();
+});
 static_assert(wrapped.wrapTarget == 1 && wrapped.wrap == 1);
-constexpr auto labels = parse(".program p\n  jmp later\nloop: nop\npublic later:\n  jmp loop\n");
+constexpr auto labels = assemble([](Asm& a) {
+    a.jmp("later");
+    a.label("loop");
+    a.nop();
+    a.label("later", true);
+    a.jmp("loop");
+});
 static_assert(labels.words[0] == 0x0002 && labels.words[2] == 0x0001);
 static_assert(labels.find("later")->isPublic && !labels.find("loop")->isPublic);
-// several programs: the one named is assembled, global defines reach all of them
-constexpr std::string_view two
-  = ".define public G 4\n.program a\nset x, G\n.program b\nset y, (G + 1)\n";
-static_assert(parse(two,
-                    {},
-                    "a")
-                  .words[0]
-                == 0xE024
-              && parse(two,
-                       {},
-                       "b")
-                     .words[0]
-                   == 0xE045);
-// values from C++, and the pioasm expression grammar (parser.yy's %left order: & | ^ bind
-// tightest, then * /, + -, << >>; unary - as binary -, :: loosest)
-constexpr auto ex = parse(
-  ".program p\n.define A 1 + 2 * 3 & 1\n.define B -2*3+1\n.define C ::1 + 1\n"
-  ".define D 1 << 2 + 1\n.define E (0b101 ^ 0x3) | one\n.define F T - 1\nnop\n",
-  {
-    {"T", 9}
+constexpr auto defined = assemble([](Asm& a) {
+    a.define("T", 9, true);
+    a.define("U", -5);
+    a.nop();
 });
-static_assert(ex.find("A")->value == 3 && ex.find("B")->value == -5
-              && ex.find("C")->value == 0x40000000);
-static_assert(ex.find("D")->value == 8 && ex.find("E")->value == 7 && ex.find("F")->value == 8);
-static_assert(ex.find("T")->value == 9 && ex.find("T")->isPublic);
-// comments, a c-sdk block, upper case, CRLF
-constexpr auto noise
-  = parse("; a\r\n.PROGRAM p // b\r\n/* c\r\n d */ JMP PIN 0\r\n% c-sdk {\r\nint x; %%\r\n%}\r\n");
-static_assert(noise.ok() && noise.words[0] == 0x00C0 && noise.length == 1);
+static_assert(defined.find("T")->value == 9 && defined.find("T")->isPublic);
+static_assert(defined.find("U")->value == -5 && !defined.find("U")->isPublic);
+static_assert(assemble([](Asm& a) {
+                  a.clockDiv(2, 128);
+                  a.nop();
+              }).clockDivInt
+                == 2
+              && assemble([](Asm& a) {
+                     a.clockDiv(2, 128);
+                     a.nop();
+                 }).clockDivFrac
+                   == 128);
 
-// ---- a .pio file by #embed: straight into parse(), or through an unsigned char / char array
-#if defined(__clang__)
-_Pragma("clang diagnostic ignored \"-Wc23-extensions\"")   // #embed in C++
-#endif
-  // clang-format off
-struct Direct : Program<parse({
-#embed "pio/many.pio"
-}, {}, "SECOND")> {};
-constexpr unsigned char manyBytes[] = {
-#embed "pio/many.pio"
-};
-constexpr char manyChars[] = {
-#embed "pio/many.pio"
-};
-// clang-format on
-static_assert(Direct::Instructions.size() == 15 && Direct::Origin == 0
-              && Direct::offset("entry") == 0);
-static_assert(Program<parse(manyBytes,
-                            {},
-                            "SECOND")>::Instructions
-              == Direct::Instructions);
-static_assert(Program<parse(manyChars,
-                            {},
-                            "first")>::Instructions.size()
-              == 3);
-// a string literal: its terminating NUL is not part of the text
-static_assert(parse(".program p\nset x, 1\n").length == 1);
-
-// ---- the builder writes what the text says -----------------------------------------------------
-constexpr std::string_view ws2812Text  = R"pio(
-.program ws2812
-.side_set 1
-.wrap_target
-bitloop:
-    out x, 1       side 0 [4]
-    jmp !x do_zero side 1 [2]
-do_one:
-    jmp  bitloop   side 1 [3]
-do_zero:
-    nop            side 0 [3]
-.wrap
-)pio";
-constexpr auto             ws2812Built = assemble([](Asm& a) {
+// ---- whole programs: the words pioasm (pico-sdk 2.3.1) made of the same text, recorded ---------
+constexpr auto ws2812Built = assemble([](Asm& a) {
     a.sideSet(1);
     a.wrapTarget();
     a.label("bitloop");
@@ -253,23 +242,7 @@ constexpr auto             ws2812Built = assemble([](Asm& a) {
     a.nop().side(0).delay(3);
     a.wrap();
 });
-
-constexpr std::string_view blinkText  = R"pio(
-.program blink
-.wrap_target
-    pull noblock
-    out x, 32
-    mov y, x
-    set pins, 1
-lp1:
-    jmp y-- lp1
-    mov y, x
-    set pins, 0
-lp2:
-    jmp y-- lp2
-.wrap
-)pio";
-constexpr auto             blinkBuilt = assemble([](Asm& a) {
+constexpr auto blinkBuilt  = assemble([](Asm& a) {
     a.wrapTarget();
     a.pull(false, false);
     a.out(Out::x, 32);
@@ -283,24 +256,7 @@ constexpr auto             blinkBuilt = assemble([](Asm& a) {
     a.jmp(Cond::yDec, "lp2");
     a.wrap();
 });
-
-constexpr std::string_view uartRxText  = R"pio(
-.program uart_rx
-.define public CyclesPerBit 8
-start:
-    wait 0 pin 0
-    set x, 7    [10]
-bitloop:
-    in pins, 1
-    jmp x-- bitloop [CyclesPerBit - 2]
-    jmp pin good_stop
-    irq 4 rel
-    wait 1 pin 0
-    jmp start
-good_stop:
-    push
-)pio";
-constexpr auto             uartRxBuilt = assemble([](Asm& a) {
+constexpr auto uartRxBuilt = assemble([](Asm& a) {
     constexpr unsigned cyclesPerBit = 8;
     a.define("CyclesPerBit", cyclesPerBit, true);
     a.label("start");
@@ -317,27 +273,54 @@ constexpr auto             uartRxBuilt = assemble([](Asm& a) {
     a.push();
 });
 
-consteval bool sameProgram(Assembled const& a,
-                           Assembled const& b) {
-    if(!a.ok() || !b.ok() || a.length != b.length || a.wrap != b.wrap
-       || a.wrapTarget != b.wrapTarget)
-    {
-        return false;
+template<std::size_t N>
+consteval bool hasWords(Assembled const&     a,
+                        std::array<std::uint16_t,
+                                   N> const& w) {
+    if(!a.ok() || a.length != N) { return false; }
+    for(std::size_t i = 0; i < N; ++i) {
+        if(a.words[i] != w[i]) { return false; }
     }
-    for(std::size_t i = 0; i < a.length; ++i) {
-        if(a.words[i] != b.words[i]) { return false; }
-    }
-    return a.sidesetCount == b.sidesetCount && a.sidesetOpt == b.sidesetOpt;
+    return true;
 }
 
-static_assert(sameProgram(ws2812Built,
-                          parse(ws2812Text)));
-static_assert(sameProgram(blinkBuilt,
-                          parse(blinkText)));
-static_assert(sameProgram(uartRxBuilt,
-                          parse(uartRxText)));
-static_assert(ws2812Built.words[0] == 0x6421 && ws2812Built.words[1] == 0x1223
-              && ws2812Built.words[2] == 0x1300 && ws2812Built.words[3] == 0xA342);
+static_assert(hasWords(ws2812Built,
+                       std::array<std::uint16_t,
+                                  4>{0x6421,
+                                     0x1223,
+                                     0x1300,
+                                     0xA342}));
+static_assert(hasWords(blinkBuilt,
+                       std::array<std::uint16_t,
+                                  8>{0x8080,
+                                     0x6020,
+                                     0xA041,
+                                     0xE001,
+                                     0x0084,
+                                     0xA041,
+                                     0xE000,
+                                     0x0087}));
+static_assert(blinkBuilt.wrapTarget == 0 && blinkBuilt.wrap == 7);
+static_assert(hasWords(uartRxBuilt,
+                       std::array<std::uint16_t,
+                                  9>{0x2020,
+                                     0xEA27,
+                                     0x4001,
+                                     0x0642,
+                                     0x00C8,
+                                     0xC014,
+                                     0x20A0,
+                                     0x0000,
+                                     0x8020}));
+static_assert(uartRxBuilt.wrap == 8);
+
+// ---- Program<>: the members a pioasm header has ----------------------------------------------
+struct UartRx : Program<uartRxBuilt> {};
+
+static_assert(UartRx::offset("good_stop") == 8 && UartRx::offset("start") == 0);
+static_assert(UartRx::define("CyclesPerBit") == 8);
+static_assert(UartRx::origin == -1 && UartRx::pioVersion == 0 && UartRx::sidesetCount == 0);
+static_assert(Program<ws2812Built>::sidesetCount == 1 && !Program<ws2812Built>::sidesetOptional);
 
 // C++ loops make instructions: the builder's reason to exist
 template<unsigned Bits>
@@ -349,160 +332,8 @@ struct ShiftIn : Program<assemble([](Asm& a) {
     a.wrap();
 })> {};
 
-static_assert(ShiftIn<3>::Instructions.size() == 5 && ShiftIn<3>::Instructions[1] == 0x4101);
-static_assert(ShiftIn<3>::Wrap == 4);
-
-// ---- Program<>: the members a pioasm header has ----------------------------------------------
-template<unsigned T1, unsigned T2, unsigned T3>
-struct TextWs2812Program
-  : Program<parse(R"pio(
-.program ws2812
-.side_set 1
-.wrap_target
-bitloop:
-    out x, 1       side 0 [T3 - 1]
-    jmp !x do_zero side 1 [T1 - 1]
-do_one:
-    jmp  bitloop   side 1 [T2 - 1]
-do_zero:
-    nop            side 0 [T2 - 1]
-.wrap
-)pio",
-                  {
-                    {"T1", T1},
-                    {"T2", T2},
-                    {"T3", T3}
-})> {};
-
-static_assert(TextWs2812Program<3,
-                                4,
-                                5>::Instructions
-              == std::array<std::uint16_t,
-                            4>{0x6421,
-                               0x1223,
-                               0x1300,
-                               0xA342});
-static_assert(TextWs2812Program<3,
-                                4,
-                                5>::offset("do_zero")
-                == 3
-              && TextWs2812Program<3,
-                                   4,
-                                   5>::offset("bitloop")
-                   == 0);
-static_assert(TextWs2812Program<3,
-                                4,
-                                5>::define("T2")
-              == 4);
-static_assert(TextWs2812Program<3,
-                                4,
-                                5>::SidesetCount
-                == 1
-              && !TextWs2812Program<3,
-                                    4,
-                                    5>::SidesetOptional);
-static_assert(TextWs2812Program<3,
-                                4,
-                                5>::Origin
-                == -1
-              && TextWs2812Program<3,
-                                   4,
-                                   5>::PioVersion
-                   == 0);
-static_assert(TextWs2812Program<2,
-                                5,
-                                3>::Instructions[0]
-              == 0x6221);   // other cycles, other delays
-
-// ---- the messages: the line, and numbers that say what is wrong ------------------------------
-consteval bool says(Assembled const& a,
-                    std::string_view m) {
-    return a.message() == m;
-}
-
-static_assert(says(parse(".program p\n.side_set 1\nnop side 0\n  nop side 0 [16]\n"),
-                   "line 4: delay 16 does not fit: .side_set 1 leaves 4 delay bits (max 15)"));
-static_assert(says(parse(".program p\n.side_set 2 opt\nnop [8]\n"),
-                   "line 3: delay 8 does not fit: .side_set 2 opt leaves 2 delay bits (max 3)"));
-static_assert(says(parse(".program p\nnop [32]\n"),
-                   "line 2: delay 32 does not fit (max 31)"));
-static_assert(says(parse(".program p\n.side_set 5 opt\n"),
-                   "line 2: .side_set 5 opt needs 6 bits, there are 5"));
-static_assert(says(parse(".program p\n.side_set 1\nnop side 2\n"),
-                   "line 3: side 2 does not fit .side_set 1 (max 1)"));
-static_assert(says(parse(".program p\n.side_set 1\nnop side 0\nnop\n"),
-                   "line 4: side-set is not optional here (.side_set 1): 'side' missing"));
-static_assert(says(parse(".program p\nnop side 0\n"),
-                   "line 2: side 0 without .side_set"));
-static_assert(says(parse(".program p\nnop\n.side_set 1\n"),
-                   "line 3: .side_set after an instruction"));
-static_assert(says(parse(".program p\nout x, 33\n"),
-                   "line 2: out bit count 33 (1..32)"));
-static_assert(says(parse(".program p\nin x, 0\n"),
-                   "line 2: in bit count 0 (1..32)"));
-static_assert(says(parse(".program p\nset x, 32\n"),
-                   "line 2: set value 32 (0..31)"));
-static_assert(says(parse(".program p\nwait 1 irq 8\n"),
-                   "line 2: wait irq 8 (0..7)"));
-static_assert(says(parse(".program p\nwait 2 pin 0\n"),
-                   "line 2: wait polarity 2 (0 or 1)"));
-static_assert(says(parse(".program p\n.pio_version 1\nwait 1 jmppin + 4\n"),
-                   "line 3: wait jmppin + 4: offset 0..3"));
-static_assert(says(parse(".program p\nirq 8\n"),
-                   "line 2: irq 8 (0..7)"));
-static_assert(says(parse(".program p\n.pio_version 1\n.fifo putget\nmov rxfifo[4], isr\n"),
-                   "line 4: rxfifo index 4 (0..3)"));
-static_assert(says(parse(".program p\n.pio_version 1\nmov rxfifo[0], isr\n"),
-                   "line 3: mov rxfifo[], isr needs .fifo txput or putget"));
-static_assert(says(parse(".program p\njmp bitlop\n"),
-                   "line 2: undefined symbol 'bitlop'"));
-static_assert(says(parse(".program p\nnop\njmp 5\n"),
-                   "line 3: jmp target 5 is beyond the end of the program (2 instructions)"));
-static_assert(says(parse(".program p\na: nop\na: nop\n"),
-                   "line 3: 'a' is already defined, at line 2"));
-static_assert(says(parse(".program p\n.define set 1\n"),
-                   "line 2: 'set' is a keyword"));
-static_assert(says(parse(".program p\n.define T1 3\nnop [T1]\n",
-                         {
-                           {"T1",
-                            1}
-}),
-                   "line 2: 'T1' is given from C++ and defined here"));
-static_assert(says(parse(".program p\n.define a b\n.define b a+1\nnop [a]\n"),
-                   "line 3: circular dependency in the definition of 'a'"));
-static_assert(says(parse(".program p\nmov pindirs, x\n"),
-                   "line 2: 'mov pindirs' needs .pio_version 1 (RP2350)"));
-static_assert(says(parse(".program p\nwait 1 jmppin\n"),
-                   "line 2: expected irq, gpio or pin, found 'jmppin'")
-              || says(parse(".program p\nwait 1 jmppin\n"),
-                      "line 2: 'wait jmppin' needs .pio_version 1 (RP2350)"));
-static_assert(says(parse(".program p\nirq prev 1\n"),
-                   "line 2: 'irq prev' needs .pio_version 1 (RP2350)"));
-static_assert(says(parse(".program p\nin status, 1\n"),
-                   "line 2: in status: source 101 is reserved (RP2350 datasheet 11.4.4.2)"));
-static_assert(says(parse(".program p\nnop [1 / 0]\n"),
-                   "line 2: division by zero"));
-static_assert(says(parse(".program p\nnop @\n"),
-                   "line 2: an invalid character"));
-static_assert(says(parse(".program p\nfoo nop\n"),
-                   "line 2: expected ':' after a label, found 'nop'"));
-static_assert(says(parse(".program p\n.bogus 1\n"),
-                   "line 2: unknown directive .bogus"));
-static_assert(
-  says(parse(".program p\n.origin 30\nnop\nnop\nnop\n"),
-       "line 2: the program is 3 instructions at .origin 30: instruction memory has 32 slots"));
-static_assert(says(parse("nop\n"),
-                   "line 1: an instruction outside of a .program"));
-static_assert(says(parse(".program a\nnop\n.program b\nnop\n"),
-                   "line 3: the text holds more than one .program: name the one to assemble"));
-static_assert(says(parse(".program a\nnop\n",
-                         {},
-                         "b"),
-                   "no .program b in the text"));
-static_assert(says(parse(".program p\n"),
-                   "the program has no instructions"));
-static_assert(says(parse(".program p\n.wrap\n"),
-                   "line 2: .wrap before the first instruction"));
+static_assert(ShiftIn<3>::instructions.size() == 5 && ShiftIn<3>::instructions[1] == 0x4101);
+static_assert(ShiftIn<3>::wrap == 4);
 
 // ---- the builder's messages name the C++ call: <file>:<line>: ---------------------------------
 consteval bool builderSays(Assembled const& a,
@@ -571,144 +402,168 @@ consteval bool fails(Assembled const& a,
     return msg.size() >= m.size() && msg.substr(msg.size() - m.size()) == m;
 }
 
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo txput\n.in 5 left auto\nnop\n"),
-                    "line 4: autopush does not go with this .fifo configuration"));
-static_assert(fails(parse(".program p\n.clock_div 0.5\nnop\n"),
-                    "line 2: clock divider must be between 1 and 65535"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.sideSet(2, true);
+                        a.nop().delay(8);
+                    }),
+                    "delay 8 does not fit: .side_set 2 opt leaves 2 delay bits (max 3)"));
+static_assert(fails(assemble([](Asm& a) { a.nop().delay(32); }),
+                    "delay 32 does not fit (max 31)"));
+static_assert(fails(assemble([](Asm& a) { a.sideSet(5, true); }),
+                    ".side_set 5 opt needs 6 bits, there are 5"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.sideSet(1);
+                        a.nop().side(2);
+                    }),
+                    "side 2 does not fit .side_set 1 (max 1)"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.sideSet(1);
+                        a.nop().side(0);
+                        a.nop();
+                    }),
+                    "side-set is not optional here (.side_set 1): 'side' missing"));
+static_assert(fails(assemble([](Asm& a) { a.nop().side(0); }),
+                    "side 0 without .side_set"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.nop();
+                        a.sideSet(1);
+                    }),
+                    ".side_set after an instruction"));
+static_assert(fails(assemble([](Asm& a) { a.out(Out::x, 33); }),
+                    "out bit count 33 (1..32)"));
+static_assert(fails(assemble([](Asm& a) { a.in(In::x, 0); }),
+                    "in bit count 0 (1..32)"));
+static_assert(fails(assemble([](Asm& a) { a.set(Set::x, 32); }),
+                    "set value 32 (0..31)"));
+static_assert(fails(assemble([](Asm& a) { a.wait(1, Wait::irq, 8); }),
+                    "wait irq 8 (0..7)"));
+static_assert(fails(assemble([](Asm& a) { a.wait(2, Wait::pin, 0); }),
+                    "wait polarity 2 (0 or 1)"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.pioVersion(1);
+                        a.wait(1, Wait::jmppin, 4);
+                    }),
+                    "wait jmppin + 4: offset 0..3"));
+static_assert(fails(assemble([](Asm& a) { a.irq(8); }),
+                    "irq 8 (0..7)"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.pioVersion(1);
+                        a.fifo(Fifo::putget);
+                        a.movToRx(4);
+                    }),
+                    "rxfifo index 4 (0..3)"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.pioVersion(1);
+                        a.movToRx(0);
+                    }),
+                    "mov rxfifo[], isr needs .fifo txput or putget"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.nop();
+                        a.jmp(Cond::always, 5U);
+                    }),
+                    "jmp target 5 is beyond the end of the program (2 instructions)"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.label("a");
+                        a.nop();
+                        a.label("a");
+                        a.nop();
+                    }),
+                    "'a' is already defined as a label"));
+static_assert(fails(assemble([](Asm& a) { a.mov(MovDst::pindirs, MovSrc::x); }),
+                    "'mov pindirs' needs .pio_version 1 (RP2350)"));
+static_assert(fails(assemble([](Asm& a) { a.wait(1, Wait::jmppin, 0); }),
+                    "'wait jmppin' needs .pio_version 1 (RP2350)"));
+static_assert(fails(assemble([](Asm& a) { a.irq(1, IrqMode::prev); }),
+                    "'irq prev' needs .pio_version 1 (RP2350)"));
+static_assert(
+  fails(assemble([](Asm& a) {
+            a.origin(30);
+            a.nop();
+            a.nop();
+            a.nop();
+        }),
+        "the program is 3 instructions at .origin 30: instruction memory has 32 slots"));
+static_assert(fails(assemble([](Asm& a) { a.wrap(); }),
+                    ".wrap before the first instruction"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.pioVersion(1);
+                        a.fifo(Fifo::txput);
+                        a.inConfig(5, false, true);
+                        a.nop();
+                    }),
+                    "autopush does not go with this .fifo configuration"));
 static_assert(fails(assemble([](Asm& a) { a.clockDiv(0, 0); }),
                     ".clock_div 0: 1..65535"));
-static_assert(parse(".program p\n.clock_div 2.5\nnop\n").clockDivInt == 2
-              && parse(".program p\n.clock_div 2.5\nnop\n").clockDivFrac == 128);
-static_assert(fails(parse(".program p\n.pio_version 1\n.in 33\nnop\n"),
-                    "line 3: .in pin count 33 (1..32)"));
-static_assert(fails(parse(".program p\n.in 5\nnop\n"),
-                    "line 2: .in pin count 5: must be 32 for PIO version 0"));
-static_assert(fails(parse(".program p\n.in 32 left auto 33\nnop\n"),
-                    "line 2: .in threshold 33 (1..32)"));
-static_assert(fails(parse(".program p\n.out 33\nnop\n"),
-                    "line 2: .out pin count 33 (0..32)"));
-static_assert(fails(parse(".program p\n.out 8 right auto 0\nnop\n"),
-                    "line 2: .out threshold 0 (1..32)"));
-static_assert(fails(parse(".program p\n.set 6\nnop\n"),
-                    "line 2: .set pin count 6 (0..5)"));
-static_assert(fails(parse(".program p\n.mov_status txfifo < 32\nnop\n"),
-                    "line 2: .mov_status: FIFO level 32 (0..31)"));
-static_assert(fails(parse(".program p\n.mov_status irq set 8\nnop\n"),
-                    "line 2: .mov_status irq 8: an IRQ flag is 0..7"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.pioVersion(1);
+                        a.inConfig(33);
+                    }),
+                    ".in pin count 33 (1..32)"));
+static_assert(fails(assemble([](Asm& a) { a.inConfig(5); }),
+                    ".in pin count 5: must be 32 for PIO version 0"));
+static_assert(fails(assemble([](Asm& a) { a.inConfig(32, false, true, 33); }),
+                    ".in threshold 33 (1..32)"));
+static_assert(fails(assemble([](Asm& a) { a.outConfig(33); }),
+                    ".out pin count 33 (0..32)"));
+static_assert(fails(assemble([](Asm& a) { a.outConfig(8, true, true, 0); }),
+                    ".out threshold 0 (1..32)"));
+static_assert(fails(assemble([](Asm& a) { a.setConfig(6); }),
+                    ".set pin count 6 (0..5)"));
+static_assert(fails(assemble([](Asm& a) { a.movStatus(MovStatusKind::txLessThan, 32); }),
+                    ".mov_status: FIFO level 32 (0..31)"));
+static_assert(fails(assemble([](Asm& a) { a.movStatus(MovStatusKind::irqSet, 8); }),
+                    ".mov_status irq 8: an IRQ flag is 0..7"));
 static_assert(fails(assemble([](Asm& a) { a.movStatus(MovStatusKind::irqSet, 1, IrqMode::rel); }),
                     ".mov_status irq: no 'rel'"));
+// NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange) // the reserved value is what the test feeds it
 static_assert(fails(assemble([](Asm& a) { a.mov(MovDst::x, MovSrc::y, static_cast<MovOp>(3)); }),
                     "mov: operation 3 is reserved"));
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo txput\nmov osr, rxfifo[0]\n"),
-                    "line 4: mov osr, rxfifo[] needs .fifo txget or putget"));
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo tx\npush\n"),
-                    "line 4: push needs .fifo txrx or rx"));
-static_assert(fails(parse(".program p\nabcdefghijklmnopqrstuvwxyz0123456: nop\n"),
-                    "line 2: name 'abcdefghijklmnopqrstuvwxyz0123456': 1..31 characters"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.pioVersion(1);
+                        a.fifo(Fifo::txput);
+                        a.movFromRx(0);
+                    }),
+                    "mov osr, rxfifo[] needs .fifo txget or putget"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.pioVersion(1);
+                        a.fifo(Fifo::tx);
+                        a.push();
+                    }),
+                    "push needs .fifo txrx or rx"));
+static_assert(fails(assemble([](Asm& a) { a.label("abcdefghijklmnopqrstuvwxyz0123456"); }),
+                    "name 'abcdefghijklmnopqrstuvwxyz0123456': 1..31 characters"));
 static_assert(fails(assemble([](Asm& a) { a.sideSet(-1); }),
                     "side-set count -1 is negative"));
-static_assert(fails(parse(".program p\nwait 1 gpio 32\n"),
-                    "line 2: wait gpio 32: 0..31 (for GPIO 32..47 use the GPIO window, base 16)"));
+static_assert(fails(assemble([](Asm& a) { a.wait(1, Wait::gpio, 32); }),
+                    "wait gpio 32: 0..31 (for GPIO 32..47 use the GPIO window, base 16)"));
 static_assert(fails(assemble([](Asm& a) { a.wait(1, Wait::pin, 0, IrqMode::rel); }),
                     "wait: prev/next/rel belong to 'irq'"));
-static_assert(fails(parse(".program p\nnop\n.wrap\n.wrap\n"),
-                    "line 4: .wrap given twice"));
-static_assert(fails(parse(".program p\n.wrap_target\n.wrap_target\nnop\n"),
-                    "line 3: .wrap_target given twice"));
-static_assert(fails(parse(".program p\nnop\n.wrap_target\n"),
-                    "line 3: .wrap_target after the last instruction"));
-
-static_assert(fails(parse(".program p\nnop\n.program q\n",
-                          {},
-                          "q"),
-                    "the program has no instructions"));
-static_assert(fails(parse("loop: nop\n"),
-                    "line 1: a label outside of a .program"));
-static_assert(fails(parse(".program p\nset x, pins\n"),
-                    "line 2: expected a value, found 'pins'"));
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo putget\nmov x, rxfifo[0]\n"),
-                    "line 4: mov from rxfifo[]: the destination must be osr"));
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo putget\nmov rxfifo[0], x\n"),
-                    "line 4: mov rxfifo[]: the source must be isr"));
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo putget\nmov rxfifo[0], rxfifo[1]\n"),
-                    "line 4: mov rxfifo[] to rxfifo[]"));
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo putget\nmov rxfifo[0], !isr\n"),
-                    "line 4: mov to or from rxfifo[] takes no '!' or '::'"));
-static_assert(fails(parse(""),
-                    "no .program in the text"));
-static_assert(fails(parse(".program p\n.pio_version 1\nirq prev 1 rel\n"),
-                    "line 3: 'rel' does not go with 'irq prev' or 'irq next'"));
-static_assert(fails(parse(".program p\n.pio_version 1\nwait 1 irq next 1 rel\n"),
-                    "line 3: 'rel' does not go with 'irq prev' or 'irq next'"));
-static_assert(fails(parse(".program p\nnop [1 << 32]\n"),
-                    "line 2: shift by 32 (0..31)"));
-static_assert(fails(parse(".program p\n.side_set 1\nnop side -1\n"),
-                    "line 3: expected a value, found '-'"));
-static_assert(fails(parse(".program p\n.side_set 1\nnop side (-1)\n"),
-                    "line 3: side-set value -1 is negative"));
-static_assert(fails(parse(".program p\n.word 0 [1]\n"),
-                    "line 2: expected the end of the line, found '['"));
-// pioasm's grammar: a label goes before an instruction, and `.word` is a directive
-static_assert(fails(parse(".program p\nw: .word 0\n"),
-                    "line 2: expected an instruction after the label, found '.word'"));
-static_assert(fails(parse(".program p\n.side_set 1 opt\n.word 0 side 1\n"),
-                    "line 3: expected the end of the line, found 'side'"));
-
-// the syntax errors: what was expected, and what came instead
-static_assert(fails(parse(".program p\nnop [(1 + 2]\n"),
-                    "line 2: expected ')', found ']'"));
-static_assert(fails(parse(".program p\n.mov_status txfifo 3\nnop\n"),
-                    "line 2: expected '<', found '3'"));
-static_assert(fails(parse(".program p\nnop [1\n"),
-                    "line 2: expected ']' before the end of the line"));
-static_assert(fails(parse(".program p\n.pio_version x\n"),
-                    "line 2: expected 0, 1, rp2040 or rp2350, found 'x'"));
-static_assert(fails(parse(".program p\n.clock_div x\n"),
-                    "line 2: expected a clock divider, found 'x'"));
-static_assert(fails(parse(".program p\nmov null, x\n"),
-                    "line 2: expected a mov destination, found 'null'"));
-static_assert(fails(parse(".program p\nmov x, pc\n"),
-                    "line 2: expected a mov source, found 'pc'"));
-static_assert(fails(parse(".program p\n.define 3 4\n"),
-                    "line 2: expected a name, found '3'"));
-static_assert(fails(parse(".program 7\n"),
-                    "line 1: expected a program name, found '7'"));
-static_assert(fails(parse(".program p\nin pc, 1\n"),
-                    "line 2: expected pins, x, y, null, isr or osr, found 'pc'"));
-static_assert(fails(parse(".program p\nout status, 1\n"),
-                    "line 2: expected pins, x, y, null, pindirs, pc, isr or exec, found 'status'"));
-static_assert(fails(parse(".program p\nset isr, 1\n"),
-                    "line 2: expected pins, x, y or pindirs, found 'isr'"));
-static_assert(fails(parse(".program p\n.mov_status osr\n"),
-                    "line 2: expected 'txfifo < N', 'rxfifo < N' or 'irq set N', found 'osr'"));
-static_assert(fails(parse(".program p\n.fifo both\n"),
-                    "line 2: expected txrx, tx, rx, txput, txget or putget, found 'both'"));
-static_assert(fails(parse(".program p\njmp !pin 0\n"),
-                    "line 2: expected x, y or osre after '!', found 'pin'"));
-static_assert(fails(parse(".program p\njmp x!=x 0\n"),
-                    "line 2: expected y after 'x!=', found 'x'"));
-static_assert(fails(parse(".program p\njmp x 0\n"),
-                    "line 2: expected '--' or '!=' after x, found '0'"));
-static_assert(fails(parse(".program p\njmp y!=x 0\n"),
-                    "line 2: expected '--' after y, found '!='"));
-static_assert(fails(parse(".program p\n.pio_version 1\nwait 1 status\n"),
-                    "line 3: expected irq, gpio, pin or jmppin, found 'status'"));
-static_assert(fails(parse(".program p\n.mov_status irq next 3\n"),
-                    "line 2: expected 'set', found '3'"));
-static_assert(fails(parse(".program p\n.pio_version 1\n.fifo putget\nmov osr, rxfifo 1\n"),
-                    "line 4: expected '[', found '1'"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.nop();
+                        a.wrap();
+                        a.wrap();
+                    }),
+                    ".wrap given twice"));
+static_assert(fails(assemble([](Asm& a) {
+                        a.wrapTarget();
+                        a.wrapTarget();
+                        a.nop();
+                    }),
+                    ".wrap_target given twice"));
+static_assert(fails(assemble([](Asm& a) { a.word(0x10000); }),
+                    ".word 65536: a 16-bit value"));
 
 // ---- the chip package's programs, written with the builder -------------------------------------
 // The words are what pioasm (-o kvasir, pico-sdk 2.3.1) made of the .pio files they replaced
 // (clockout.pio, i2s.pio, PioQspi.pio, pico-examples' ws2812.pio), recorded before those were
 // deleted; the firmware images built from both were byte-identical.
 using W = std::uint16_t;
-static_assert(ClockOutProgram::Instructions
+static_assert(ClockOutProgram::instructions
                 == std::array<W,
                               2>{0xE001,
                                  0xE000}
-              && ClockOutProgram::Wrap == 1);
-static_assert(I2sOutMasterProgram::Instructions
+              && ClockOutProgram::wrap == 1);
+static_assert(I2sOutMasterProgram::instructions
                 == std::array<W,
                               9>{0xE02E,
                                  0x6001,
@@ -719,9 +574,9 @@ static_assert(I2sOutMasterProgram::Instructions
                                  0x1845,
                                  0x6001,
                                  0xE82E}
-              && I2sOutMasterProgram::WrapTarget == 1 && I2sOutMasterProgram::Wrap == 8
-              && I2sOutMasterProgram::SidesetCount == 2 && !I2sOutMasterProgram::SidesetOptional);
-static_assert(I2sOutSlaveProgram::Instructions
+              && I2sOutMasterProgram::wrapTarget == 1 && I2sOutMasterProgram::wrap == 8
+              && I2sOutMasterProgram::sidesetCount == 2 && !I2sOutMasterProgram::sidesetOptional);
+static_assert(I2sOutSlaveProgram::instructions
                 == std::array<W,
                               16>{0x20A1,
                                   0x80A0,
@@ -739,9 +594,9 @@ static_assert(I2sOutSlaveProgram::Instructions
                                   0x6001,
                                   0x20A0,
                                   0x004C}
-              && I2sOutSlaveProgram::WrapTarget == 1 && I2sOutSlaveProgram::Wrap == 15);
+              && I2sOutSlaveProgram::wrapTarget == 1 && I2sOutSlaveProgram::wrap == 15);
 using Qspi = Kvasir::Display::QspiPanelProgram;
-static_assert(Qspi::Instructions
+static_assert(Qspi::instructions
                 == std::array<W,
                               10>{0x6001,
                                   0x1000,
@@ -753,11 +608,11 @@ static_assert(Qspi::Instructions
                                   0x5001,
                                   0x0047,
                                   0x0009}
-              && Qspi::Wrap == 9 && Qspi::SidesetCount == 1 && Qspi::offset("single") == 0
+              && Qspi::wrap == 9 && Qspi::sidesetCount == 1 && Qspi::offset("single") == 0
               && Qspi::offset("quad") == 2 && Qspi::offset("read") == 4);
 static_assert(Ws2812Program<3,
                             4,
-                            5>::Instructions
+                            5>::instructions
                 == std::array<W,
                               4>{0x6421,
                                  0x1223,
@@ -765,30 +620,16 @@ static_assert(Ws2812Program<3,
                                  0xA342}
               && Ws2812Program<3,
                                4,
-                               5>::Wrap
+                               5>::wrap
                    == 3
               && Ws2812Program<3,
                                4,
-                               5>::CyclesPerBit
+                               5>::cyclesPerBit
                    == 12);
-static_assert(sameProgram(Ws2812Program<3,
-                                        4,
-                                        5>::assembled(),
-                          parse(ws2812Text)));
 }   // namespace
 
 int main() {
     std::printf(
-      "pio asm: encodings, packing, builder == parser and messages checked at compile time\n");
-    std::printf("pio asm: %d programs from %d .pio files equal to pioasm's output:\n",
-                crosscheck::Programs,
-                crosscheck::Files);
-    for(auto const& c : crosscheck::Compared) {
-        std::printf("  %.*s\n", static_cast<int>(c.size()), c.data());
-    }
-    std::printf("pio asm: left out of the comparison:\n");
-    for(auto const& c : crosscheck::LeftOut) {
-        std::printf("  %.*s\n", static_cast<int>(c.size()), c.data());
-    }
+      "pio asm: encodings, packing, labels, programs and messages checked at compile time\n");
     return 0;
 }

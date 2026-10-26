@@ -1,18 +1,27 @@
 cmake_minimum_required(VERSION 3.28)
 
-# Host tests of the constexpr PIO assembler (pio/Asm.hpp, pio/AsmParse.hpp). Standalone, not part of any firmware tree:
+# Host tests of the chip_rp_common parts that run without a chip. Standalone, not part of any firmware tree:
 #
 # cmake -S tests -B tests/build -G Ninja && cmake --build tests/build && ctest --test-dir tests/build
 #
-# * asm_encoding_test.cpp: every instruction form by hand from the RP2350 datasheet 11.4, side-set and delay packing,
-#   the builder against the parser, and the error messages.
-# * the cross-check against pioasm, the oracle: every .pio file below the roots listed further down (the pico-sdk and
-#   pico-examples checkouts, tests/pio) is assembled by pioasm (-o kvasir -v 0) AND by parse(), and gen_crosscheck.py
-#   writes one file per .pio that static_asserts both agree. Building is the test; the test program prints what was
-#   compared. A root that does not exist is left out with a note; a file pioasm refuses fails the build (pioasm's own
-#   error), it is never dropped.
+# * asm_encoding_test.cpp: the constexpr PIO assembler (pio/Asm.hpp): every instruction form by hand from the RP2350
+#   datasheet 11.4, side-set and delay packing, labels, whole programs, the chip package's programs and the error
+#   messages. Building is the test (static_assert).
 # * uart_stream_cursor_test.cpp: UartStream's RX cursor arithmetic driven by a simulated DMA channel.
-# * bad/*.cpp: programs that must NOT compile, each with the message it must fail with (first line `// expect: ...`).
+# * pwm_math_test.cpp: the PWM divider/TOP search (PwmMath.hpp), in constant and in run-time evaluation.
+# * adc_math_test.cpp: the ADC pacer divider and the channel-attribution check (AdcMath.hpp).
+# * reset_cause_test.cpp: the reset-cause decision (ResetCauseRules.hpp): a SYSRESETREQ after a RUN-pin reset is not
+#   "RUN".
+# * pin_function_test.cpp: the pin-function formulas and the drivers' pin check (PinConfig.hpp functionSelect,
+#   isValidPin, the refusal's text) against RP2040 Table 2 / RP2350 Table 645.
+# * register_alias_test.cpp, pll_search_test.cpp: the RP alias backend on the Kvasir SDK's register mock, the PLL search
+#   against an exhaustive exact search (the SDK's headers and test support: the sibling checkout, else fetched).
+# * dma_crc_hold_test.cpp: the DMA CRC sniffer's debug check (DmaCrcHold.hpp) at debug-check levels 2 and 0.
+# * i2c_math_test.cpp, watchdog_math_test.cpp, flash_timing_math_test.cpp: the I2C SCL counts (I2CMath.hpp), the
+#   watchdog tick and LOAD incl. RP2040-E1 (WatchdogMath.hpp), the QMI flash timing (FlashTimingMath.hpp) against the
+#   datasheets' rules.
+# * bad/*.cpp: programs (and PWM configs, refused pins) that must NOT compile, each with the message it must fail with
+#   (first line `// expect: ...`).
 #
 # clang++ unless the caller names a compiler (CXX / -DCMAKE_CXX_COMPILER): the firmware's compiler.
 if(NOT CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
@@ -33,31 +42,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 get_filename_component(_chip_rp_common "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 get_filename_component(_siblings "${_chip_rp_common}/.." ABSOLUTE)
 
-# pioasm, built for the host, with its pioasm_generate(): the checkout next to this one, else fetched, so a lone
-# checkout of this repository (CI) builds the tests too. pioasm fetches cmake_helpers; a sibling checkout serves.
 include(FetchContent)
-if(NOT PIOASM_ROOT AND EXISTS "${_siblings}/pioasm/CMakeLists.txt")
-    set(PIOASM_ROOT "${_siblings}/pioasm")
-endif()
-if(NOT FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS AND EXISTS "${_siblings}/cmake_helpers/BuildOptions.cmake")
-    set(FETCHCONTENT_SOURCE_DIR_CMAKE_HELPERS "${_siblings}/cmake_helpers")
-endif()
-if(PIOASM_ROOT)
-    add_subdirectory(${PIOASM_ROOT} pioasm)
-else()
-    FetchContent_Declare(
-        pioasm
-        GIT_REPOSITORY https://github.com/dominicpoeschko/pioasm.git
-        GIT_TAG master
-        GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(pioasm)
-endif()
-# clang 23's [[clang::lifetimebound]] suggestions (-Weverything) on pioasm's verbatim pico-sdk/bison sources: advice,
-# not findings, and not ours to edit. The group takes the intra-/cross-TU (constructor) suggestions alike; clang 22 does
-# not know it, hence -Wno-unknown-warning-option.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(pioasm PRIVATE -Wno-unknown-warning-option -Wno-lifetime-safety-suggestions)
-endif()
 
 set(_warnings -Wall -Wextra -Wpedantic -Werror)
 # clang: the firmware trees' set (cmake_helpers, as in their compile_commands.json), so a warning the chip headers would
@@ -97,8 +82,7 @@ endif()
 # ---- the encoding test and the test program
 # ---------------------------------------------------------------------------
 add_executable(pio_asm_tests asm_encoding_test.cpp)
-target_include_directories(pio_asm_tests PRIVATE ${_chip_rp_common} ${CMAKE_CURRENT_LIST_DIR}
-                                                 ${CMAKE_CURRENT_BINARY_DIR}/crosscheck)
+target_include_directories(pio_asm_tests PRIVATE ${_chip_rp_common})
 target_compile_options(pio_asm_tests PRIVATE ${_warnings})
 add_test(NAME pio_asm_tests COMMAND pio_asm_tests)
 
@@ -108,91 +92,93 @@ target_include_directories(uart_stream_cursor_test PRIVATE ${_chip_rp_common})
 target_compile_options(uart_stream_cursor_test PRIVATE ${_warnings})
 add_test(NAME uart_stream_cursor_test COMMAND uart_stream_cursor_test)
 
-# ---- the cross-check against pioasm
-# -----------------------------------------------------------------------------------
-# pico-sdk and pico-examples: the checkouts in ~/repos, else fetched (shallow, no submodules, nothing of them is built)
-# unless PIO_FETCH_CORPUS is OFF. Only read when PIO_CORPUS_ROOTS is not in the cache yet.
-option(PIO_FETCH_CORPUS "fetch pico-sdk and pico-examples for the cross-check when ~/repos has no checkout" ON)
-set(_corpus_defaults "pio=${CMAKE_CURRENT_LIST_DIR}/pio")
-if(NOT DEFINED CACHE{PIO_CORPUS_ROOTS})
-    foreach(_repo sdk:pico-sdk examples:pico-examples)
-        string(REPLACE ":" ";" _repo ${_repo})
-        list(GET _repo 0 _label)
-        list(GET _repo 1 _name)
-        if(EXISTS "$ENV{HOME}/repos/${_name}")
-            list(APPEND _corpus_defaults "${_label}=$ENV{HOME}/repos/${_name}")
-        elseif(PIO_FETCH_CORPUS)
-            FetchContent_Declare(
-                ${_name}
-                GIT_REPOSITORY https://github.com/raspberrypi/${_name}.git
-                GIT_TAG master
-                GIT_SHALLOW TRUE
-                GIT_SUBMODULES "" SOURCE_SUBDIR no_cmake_here)
-            FetchContent_MakeAvailable(${_name})
-            list(APPEND _corpus_defaults "${_label}=${${_name}_SOURCE_DIR}")
-        endif()
-    endforeach()
-endif()
-set(PIO_CORPUS_ROOTS
-    ${_corpus_defaults}
-    CACHE STRING "label=root pairs; every .pio below each root is cross-checked")
+# ---- the PWM divider/TOP search (PwmMath.hpp): values, refusal reasons, constant and run-time evaluation alike
+add_executable(pwm_math_test pwm_math_test.cpp)
+target_include_directories(pwm_math_test PRIVATE ${_chip_rp_common})
+target_compile_options(pwm_math_test PRIVATE ${_warnings})
+add_test(NAME pwm_math_test COMMAND pwm_math_test)
 
-# Random programs (gen_random_pio.py): every instruction form, side-set shape, directive and operator in combinations
-# nobody writes by hand, assembled by both pioasm and parse() like the rest of the corpus. Deterministic per seed; a new
-# seed is a new set.
-set(PIO_RANDOM_SEED
-    2026
-    CACHE STRING "seed of the random .pio programs")
-set(PIO_RANDOM_FILES
-    100
-    CACHE STRING "how many random .pio files (1 to 3 programs each); 0 for none")
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/gen_random_pio.py ${CMAKE_CURRENT_BINARY_DIR}/random_pio
-            ${PIO_RANDOM_SEED} ${PIO_RANDOM_FILES} RESULT_VARIABLE _rc)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "gen_random_pio.py failed")
-endif()
-set_property(
-    DIRECTORY
-    APPEND
-    PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/gen_random_pio.py)
-list(APPEND PIO_CORPUS_ROOTS "random=${CMAKE_CURRENT_BINARY_DIR}/random_pio")
+# ---- the ADC pacer divider (AdcMath.hpp): no paced period of 96 clocks, the rounding at the top rate.
+add_executable(adc_math_test adc_math_test.cpp)
+target_include_directories(adc_math_test PRIVATE ${_chip_rp_common})
+target_compile_options(adc_math_test PRIVATE ${_warnings})
+add_test(NAME adc_math_test COMMAND adc_math_test)
 
-# One generated file per .pio, written at configure time; a .pio added under a root needs a re-configure.
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/gen_crosscheck.py ${CMAKE_CURRENT_BINARY_DIR}/crosscheck
-            ${PIO_CORPUS_ROOTS}
-    OUTPUT_VARIABLE _cases
-    RESULT_VARIABLE _rc)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "gen_crosscheck.py failed")
-endif()
-set_property(
-    DIRECTORY
-    APPEND
-    PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/gen_crosscheck.py)
+# ---- the reset-cause decision (ResetCauseRules.hpp) of both chips, the chip-reset mark
+add_executable(reset_cause_test reset_cause_test.cpp)
+target_include_directories(reset_cause_test PRIVATE ${_chip_rp_common})
+target_compile_options(reset_cause_test PRIVATE ${_warnings})
+add_test(NAME reset_cause_test COMMAND reset_cause_test)
 
-string(REPLACE "\n" ";" _cases "${_cases}")
-set(_count 0)
-foreach(_case IN LISTS _cases)
-    if(_case STREQUAL "")
-        continue()
-    endif()
-    string(REPLACE "\t" ";" _fields "${_case}")
-    list(GET _fields 0 _id)
-    list(GET _fields 1 _pio)
-    set(_target xc_${_id})
-    # -v 0: the version a program declares with .pio_version is the one it gets, as parse() does
-    pioasm_generate(${_target} INPUT_FILE ${_pio} PIO_VERSION 0)
-    target_sources(pio_asm_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/crosscheck/${_target}.cpp)
-    target_link_libraries(pio_asm_tests PRIVATE ${_target})
-    set_property(
-        SOURCE ${CMAKE_CURRENT_BINARY_DIR}/crosscheck/${_target}.cpp
-        APPEND
-        PROPERTY OBJECT_DEPENDS ${_pio})
-    math(EXPR _count "${_count} + 1")
+# ---- the pin-function formulas (PinConfig.hpp) against the datasheets' tables, for all three variants: building is the
+# test (static_assert). PinConfig.hpp wants a chip identity; the test names the variants itself.
+add_executable(pin_function_test pin_function_test.cpp)
+target_include_directories(pin_function_test PRIVATE ${_chip_rp_common})
+target_compile_definitions(pin_function_test PRIVATE KVASIR_CHIP_RP2350 KVASIR_CHIP_RP2350A)
+target_compile_options(pin_function_test PRIVATE ${_warnings})
+add_test(NAME pin_function_test COMMAND pin_function_test)
+
+# ---- the RP parts that run on the Kvasir SDK's register mock and Prescaler: the alias backend (RegisterAlias.hpp) and
+# the PLL search (PllSearch.hpp) against the one it replaced. The SDK: the checkout next to this one, else fetched
+# (headers and tests/ only: no submodules), so a lone checkout of this repository (CI) builds them too. The fetch takes
+# the SDK's master: an SDK change these tests need reaches it first.
+if(NOT KVASIR_ROOT AND EXISTS "${_chip_rp_common}/../Kvasir_SDK/cmake/kvasir_locate.cmake")
+    get_filename_component(KVASIR_ROOT "${_chip_rp_common}/../Kvasir_SDK" ABSOLUTE)
+elseif(NOT KVASIR_ROOT)
+    include(FetchContent)
+    FetchContent_Declare(
+        kvasir_sdk
+        GIT_REPOSITORY https://github.com/kvasir-io/Kvasir_SDK.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE
+        GIT_SUBMODULES "" SOURCE_SUBDIR fetch-only)
+    FetchContent_MakeAvailable(kvasir_sdk)
+    set(KVASIR_ROOT "${kvasir_sdk_SOURCE_DIR}")
+endif()
+include("${KVASIR_ROOT}/cmake/kvasir_locate.cmake")
+include(${KVASIR_ROOT}/cmake/kvasir_sdk_targets.cmake) # kvasir::base, kvasir::test_support
+
+# the mock's Recorder is a global by design (the SDK's tests/kvasir_test.hpp)
+set(_sdk_test_warnings ${_warnings} $<$<CXX_COMPILER_ID:Clang>:-Wno-global-constructors -Wno-exit-time-destructors>)
+
+add_executable(register_alias_test register_alias_test.cpp)
+target_link_libraries(register_alias_test PRIVATE kvasir::test_support)
+# the seam as an image gets it (chip_rp20x0 cmake/chip.cmake): Register/Exec.hpp includes RegisterAlias.hpp at its end
+target_compile_definitions(register_alias_test PRIVATE KVASIR_REGISTER_MOCK
+                                                       [[KVASIR_CHIP_REGISTER_SEAM="RegisterAlias.hpp"]])
+target_include_directories(register_alias_test PRIVATE ${_chip_rp_common})
+target_compile_options(register_alias_test PRIVATE ${_sdk_test_warnings})
+add_test(NAME register_alias_test COMMAND register_alias_test)
+
+add_executable(pll_search_test pll_search_test.cpp)
+target_link_libraries(pll_search_test PRIVATE kvasir::test_support) # test_harness.hpp
+target_include_directories(pll_search_test PRIVATE ${_chip_rp_common})
+target_compile_options(pll_search_test PRIVATE ${_sdk_test_warnings})
+add_test(NAME pll_search_test COMMAND pll_search_test)
+
+# the RP constexpr maths, register-free: the I2C SCL counts (I2CMath.hpp, with the SDK's Prescaler), the watchdog tick
+# and LOAD incl. RP2040-E1 (WatchdogMath.hpp), the QMI flash timing (FlashTimingMath.hpp); refusals in bad/
+add_executable(i2c_math_test i2c_math_test.cpp)
+target_link_libraries(i2c_math_test PRIVATE kvasir::base)
+target_include_directories(i2c_math_test PRIVATE ${_chip_rp_common})
+target_compile_options(i2c_math_test PRIVATE ${_warnings})
+add_test(NAME i2c_math_test COMMAND i2c_math_test)
+foreach(_t watchdog_math_test flash_timing_math_test)
+    add_executable(${_t} ${_t}.cpp)
+    target_include_directories(${_t} PRIVATE ${_chip_rp_common})
+    target_compile_options(${_t} PRIVATE ${_warnings})
+    add_test(NAME ${_t} COMMAND ${_t})
 endforeach()
-message(STATUS "pio cross-check: ${_count} .pio files against pioasm")
+
+# the DMA CRC sniffer's debug check (DmaCrcHold.hpp), at the debug variants' level and with debug checks off
+foreach(_level 2 0)
+    add_executable(dma_crc_hold_test_${_level} dma_crc_hold_test.cpp)
+    target_link_libraries(dma_crc_hold_test_${_level} PRIVATE kvasir::test_support) # harness/PanicCatcher.hpp
+    target_compile_definitions(dma_crc_hold_test_${_level} PRIVATE KVASIR_DCHECK_LEVEL=${_level})
+    target_include_directories(dma_crc_hold_test_${_level} PRIVATE ${_chip_rp_common})
+    target_compile_options(dma_crc_hold_test_${_level} PRIVATE ${_sdk_test_warnings})
+    add_test(NAME dma_crc_hold_test_${_level} COMMAND dma_crc_hold_test_${_level})
+endforeach()
 
 # ---- programs that must not compile
 # -----------------------------------------------------------------------------------
@@ -215,6 +201,9 @@ foreach(_file IN LISTS _bad)
     set(_target bad_${_name})
     add_library(${_target} OBJECT EXCLUDE_FROM_ALL ${_file})
     target_include_directories(${_target} PRIVATE ${_chip_rp_common})
+    target_link_libraries(${_target} PRIVATE kvasir::base) # I2CMath.hpp: the SDK's Prescaler
+    # PinConfig.hpp wants a chip (the pin cases name their part themselves)
+    target_compile_definitions(${_target} PRIVATE KVASIR_CHIP_RP2350 KVASIR_CHIP_RP2350A)
     add_test(NAME ${_target} COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${_target})
     # the build must fail, and for the reason named: a plain WILL_FAIL would pass a failure for any reason. Each case
     # runs a build of this very tree: two at once (ctest -j) corrupt its .ninja_deps.
@@ -223,6 +212,14 @@ endforeach()
 
 # ---- the same sources with gcc: gcc firmware trees build the chip headers too ----------------------------------------
 get_target_property(_sources pio_asm_tests SOURCES)
+list(
+    APPEND
+    _sources
+    pwm_math_test.cpp
+    adc_math_test.cpp
+    reset_cause_test.cpp
+    watchdog_math_test.cpp
+    flash_timing_math_test.cpp)
 set(_abs_sources)
 foreach(_s IN LISTS _sources)
     get_filename_component(_s ${_s} ABSOLUTE BASE_DIR ${CMAKE_CURRENT_LIST_DIR})
@@ -235,12 +232,6 @@ foreach(_gcc g++ arm-none-eabi-g++)
         continue()
     endif()
     string(MAKE_C_IDENTIFIER ${_gcc} _id)
-    add_test(
-        NAME gcc_${_id}
-        COMMAND
-            ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/gcc_check.py ${_gcc_path_${_gcc}} ${_chip_rp_common}
-            ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_BINARY_DIR}/crosscheck
-            ${CMAKE_CURRENT_BINARY_DIR}/pioasm_generated -- ${_abs_sources})
-    # the cross-check files include pioasm's headers, which the build makes
-    set_tests_properties(gcc_${_id} PROPERTIES DEPENDS pio_asm_tests)
+    add_test(NAME gcc_${_id} COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/gcc_check.py
+                                     ${_gcc_path_${_gcc}} ${_chip_rp_common} -- ${_abs_sources})
 endforeach()

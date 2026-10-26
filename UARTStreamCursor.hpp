@@ -38,4 +38,29 @@ namespace Kvasir { namespace UART { namespace Detail {
         std::uint32_t const at = readTotal & (ring - 1U);
         return {at, std::min(written - readTotal, ring - at)};
     }
+
+    /// Where a dead receive channel starts again (UartStream's receive watch), with the ring emptied: the next whole
+    /// segment after the one that was running - its slots may hold what the channel wrote before it died, and a run
+    /// the reader still holds lies before it - or, for a stalled ring, the segment it waited for. The reader's total
+    /// moves there too: nothing is left to read.
+    struct Restart {
+        std::uint32_t segDone;     // segments counted: the new channel writes segment segDone
+        std::uint32_t readTotal;   // segDone * seg
+    };
+
+    constexpr Restart restart(std::uint32_t segDone,
+                              bool          stalled,
+                              std::uint32_t seg) {
+        std::uint32_t const s = stalled ? segDone : segDone + 1U;
+        return {s, s * seg};
+    }
+
+    /// What a restart throws away that the reader had been shown (writtenTotal() at its last look) and not
+    /// committed: at most a ring (a total the reader never saw counts nothing).
+    constexpr std::uint32_t dropped(std::uint32_t shown,
+                                    std::uint32_t readTotal,
+                                    std::uint32_t ring) {
+        std::uint32_t const d = shown - readTotal;
+        return d <= ring ? d : 0U;
+    }
 }}}   // namespace Kvasir::UART::Detail

@@ -1,9 +1,9 @@
 #pragma once
-#if !__has_include("chip/rp2350.hpp")
-    #error \
-      "the QMI exists on the RP2350 only; the RP2040 has the SSI (flash_do_cmd in bootrom_functions.hpp)"
+#ifndef KVASIR_CHIP_RP2350
+    #error                                                                                         \
+      "the QMI exists on the RP2350 only; the RP2040 has the SSI (flash_do_cmd in XipControl.hpp)"
 #endif
-#include "bootrom_functions.hpp"
+#include "XipControl.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Util/attributes.hpp"
@@ -41,7 +41,7 @@ namespace Kvasir { namespace Qmi {
                                                             std::size_t      rxSize,
                                                             std::uint32_t    clkdiv) {
             KVASIR_RAM_FUNC_MARK();
-            Kvasir::detail::XipGuard guard{xip};
+            Kvasir::detail::XipGuard const guard{xip};
             Kvasir::detail::directTransaction(txData, txSize, rxData, rxSize, clkdiv);
         }
     }   // namespace detail
@@ -50,9 +50,9 @@ namespace Kvasir { namespace Qmi {
     /// are stored (byte i is what came in while byte i of `tx` went out), the rest dropped.
     inline void direct(std::span<std::byte const> tx,
                        std::span<std::byte>       rx,
-                       std::uint32_t              clkdiv = 6) {
-        Kvasir::detail::FlashXipDisabler                   xip{};
-        Kvasir::Nvic::InterruptGuard<Kvasir::Nvic::Global> guard{};
+                       std::uint32_t              clkdiv = Kvasir::detail::directCommandClkdiv) {
+        Kvasir::detail::FlashXipDisabler xip{};
+        Kvasir::Core::IrqGuard const     guard{};
         detail::transfer(xip,
                          tx.data(),
                          tx.size(),
@@ -71,6 +71,8 @@ namespace Kvasir { namespace Qmi {
         }
     };
 
+    // The commands below are NOT const: a const local array with a constant initialiser is a constant of the image,
+    // placed in flash, and directTransaction() reads `tx` with XIP off (a bus fault: the core locks up).
     [[nodiscard]] inline JedecId jedecId() {
         std::byte tx[4]{std::byte{0x9F}};
         std::byte rx[4]{};

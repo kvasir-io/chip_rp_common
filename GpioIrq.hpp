@@ -1,15 +1,15 @@
 #pragma once
 #include "PinConfig.hpp"
 #include "chip/Interrupt.hpp"
+#include "chip/PinConfig.hpp"
 #include "core/Nvic.hpp"
-#include "kvasir/Io/Types.hpp"
+#include "kvasir/Io/Claims.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/StartUp/Resources.hpp"
 #include "kvasir/StartUp/SharedIsr.hpp"
 
 #include <cstdint>
 #include <peripherals/IO_BANK0.hpp>
-#include <tuple>
 #include <type_traits>
 
 // GPIO edge interrupts through IO_BANK0, one Startup entry per pin (GpioPinEdges / GpioPinIrq,
@@ -33,7 +33,7 @@ namespace detail {
     struct GpioNumber;
 
     template<int Port, int Pin>
-    struct GpioNumber<Register::PinLocation<Port, Pin>> {
+    struct GpioNumber<PinLocation<Port, Pin>> {
         static_assert(Port == 0,
                       "IO_BANK0 has one port");
         static constexpr unsigned value = static_cast<unsigned>(Pin);
@@ -43,84 +43,68 @@ namespace detail {
     // edge_high, in that order, at 4 * (gpio % 8). The generated header spells them out per
     // pin (gpio22_edge_low is bit 26 of the *2 registers); computing them is what lets one
     // template cover any pin.
-    inline constexpr unsigned EdgeLow  = 2;
-    inline constexpr unsigned EdgeHigh = 3;
+    inline constexpr unsigned edgeLow  = 2;
+    inline constexpr unsigned edgeHigh = 3;
 
     constexpr std::uint32_t irqBit(unsigned gpio,
                                    unsigned kind) {
         return 1U << (4U * (gpio % 8U) + kind);
     }
 
+    // IO_BANK0's interrupt registers, one per group of eight GPIOs: the raw status (shared), and each core's
+    // enable and masked status (RP2040 four groups, RP2350 six).
+    struct IoBankIrqGroups {
+        using R = Kvasir::Peripheral::IO_BANK0::Registers<>;
+#ifdef KVASIR_CHIP_RP2040
+        using Intr = brigand::list<R::INTR0, R::INTR1, R::INTR2, R::INTR3>;
+        using Inte = brigand::list<
+          brigand::list<R::PROC0_INTE0, R::PROC0_INTE1, R::PROC0_INTE2, R::PROC0_INTE3>,
+          brigand::list<R::PROC1_INTE0, R::PROC1_INTE1, R::PROC1_INTE2, R::PROC1_INTE3>>;
+        using Ints = brigand::list<
+          brigand::list<R::PROC0_INTS0, R::PROC0_INTS1, R::PROC0_INTS2, R::PROC0_INTS3>,
+          brigand::list<R::PROC1_INTS0, R::PROC1_INTS1, R::PROC1_INTS2, R::PROC1_INTS3>>;
+#else
+        using Intr = brigand::list<R::INTR0, R::INTR1, R::INTR2, R::INTR3, R::INTR4, R::INTR5>;
+        using Inte = brigand::list<brigand::list<R::PROC0_INTE0,
+                                                 R::PROC0_INTE1,
+                                                 R::PROC0_INTE2,
+                                                 R::PROC0_INTE3,
+                                                 R::PROC0_INTE4,
+                                                 R::PROC0_INTE5>,
+                                   brigand::list<R::PROC1_INTE0,
+                                                 R::PROC1_INTE1,
+                                                 R::PROC1_INTE2,
+                                                 R::PROC1_INTE3,
+                                                 R::PROC1_INTE4,
+                                                 R::PROC1_INTE5>>;
+        using Ints = brigand::list<brigand::list<R::PROC0_INTS0,
+                                                 R::PROC0_INTS1,
+                                                 R::PROC0_INTS2,
+                                                 R::PROC0_INTS3,
+                                                 R::PROC0_INTS4,
+                                                 R::PROC0_INTS5>,
+                                   brigand::list<R::PROC1_INTS0,
+                                                 R::PROC1_INTS1,
+                                                 R::PROC1_INTS2,
+                                                 R::PROC1_INTS3,
+                                                 R::PROC1_INTS4,
+                                                 R::PROC1_INTS5>>;
+#endif
+    };
+
     template<unsigned Group, unsigned Core>
     struct IoBankIrqRegs {
-        // Dependent on Group so the groups 4 and 5 (RP2350 only) are not looked up on the
-        // RP2040's registers.
-        using R = Kvasir::Peripheral::IO_BANK0::Registers<Group * 0>;
-        static_assert(Group < (PinConfig::ChipTraits<PinConfig::CurrentChip>::pinCount + 7U) / 8U,
+        static_assert(Group < (PinConfig::ChipTraits<Chip::part>::pinCount + 7U) / 8U,
                       "IO_BANK0 has one interrupt group per eight GPIOs");
         static_assert(Core < 2,
                       "two cores");
 
-        static constexpr auto pick() {
-            if constexpr(Core == 0) {
-                if constexpr(Group == 0) {
-                    return std::type_identity<std::tuple<typename R::INTR0,
-                                                         typename R::PROC0_INTE0,
-                                                         typename R::PROC0_INTS0>>{};
-                } else if constexpr(Group == 1) {
-                    return std::type_identity<std::tuple<typename R::INTR1,
-                                                         typename R::PROC0_INTE1,
-                                                         typename R::PROC0_INTS1>>{};
-                } else if constexpr(Group == 2) {
-                    return std::type_identity<std::tuple<typename R::INTR2,
-                                                         typename R::PROC0_INTE2,
-                                                         typename R::PROC0_INTS2>>{};
-                } else if constexpr(Group == 3) {
-                    return std::type_identity<std::tuple<typename R::INTR3,
-                                                         typename R::PROC0_INTE3,
-                                                         typename R::PROC0_INTS3>>{};
-                } else if constexpr(Group == 4) {
-                    return std::type_identity<std::tuple<typename R::INTR4,
-                                                         typename R::PROC0_INTE4,
-                                                         typename R::PROC0_INTS4>>{};
-                } else {
-                    return std::type_identity<std::tuple<typename R::INTR5,
-                                                         typename R::PROC0_INTE5,
-                                                         typename R::PROC0_INTS5>>{};
-                }
-            } else {
-                if constexpr(Group == 0) {
-                    return std::type_identity<std::tuple<typename R::INTR0,
-                                                         typename R::PROC1_INTE0,
-                                                         typename R::PROC1_INTS0>>{};
-                } else if constexpr(Group == 1) {
-                    return std::type_identity<std::tuple<typename R::INTR1,
-                                                         typename R::PROC1_INTE1,
-                                                         typename R::PROC1_INTS1>>{};
-                } else if constexpr(Group == 2) {
-                    return std::type_identity<std::tuple<typename R::INTR2,
-                                                         typename R::PROC1_INTE2,
-                                                         typename R::PROC1_INTS2>>{};
-                } else if constexpr(Group == 3) {
-                    return std::type_identity<std::tuple<typename R::INTR3,
-                                                         typename R::PROC1_INTE3,
-                                                         typename R::PROC1_INTS3>>{};
-                } else if constexpr(Group == 4) {
-                    return std::type_identity<std::tuple<typename R::INTR4,
-                                                         typename R::PROC1_INTE4,
-                                                         typename R::PROC1_INTS4>>{};
-                } else {
-                    return std::type_identity<std::tuple<typename R::INTR5,
-                                                         typename R::PROC1_INTE5,
-                                                         typename R::PROC1_INTS5>>{};
-                }
-            }
-        }
-
-        using Tuple = typename decltype(pick())::type;
-        using Intr  = std::tuple_element_t<0, Tuple>;   // raw status, edge bits write-1-to-clear
-        using Inte  = std::tuple_element_t<1, Tuple>;   // this core's enable
-        using Ints  = std::tuple_element_t<2, Tuple>;   // this core's masked status
+        using Intr
+          = brigand::at_c<IoBankIrqGroups::Intr, Group>;   // raw status, edge bits write-1-to-clear
+        using Inte = brigand::at_c<brigand::at_c<IoBankIrqGroups::Inte, Core>,
+                                   Group>;   // this core's enable
+        using Ints = brigand::at_c<brigand::at_c<IoBankIrqGroups::Ints, Core>,
+                                   Group>;   // this core's masked status
     };
 }   // namespace detail
 
@@ -143,12 +127,12 @@ struct GpioPinEdgesOn {
 
     using Irq = std::decay_t<decltype(Kvasir::Interrupt::io_bank0)>;
 
-    static constexpr unsigned Gpio = detail::GpioNumber<Pin>::value;
-    using Regs                     = detail::IoBankIrqRegs<Gpio / 8U, Core_>;
+    static constexpr unsigned gpio = detail::GpioNumber<Pin>::value;
+    using Regs                     = detail::IoBankIrqRegs<gpio / 8U, Core_>;
 
     template<unsigned Kind, void (*F)()>
     struct EdgeIrq {
-        static constexpr std::uint32_t mask = detail::irqBit(Gpio, Kind);
+        static constexpr std::uint32_t mask = detail::irqBit(gpio, Kind);
 
         // this core's masked status, the shared raw status (edges write-one-to-clear), this
         // core's enable: the pin's bit in each
@@ -170,8 +154,8 @@ struct GpioPinEdgesOn {
                                  Priority>;
     };
 
-    using Falling = EdgeIrq<detail::EdgeLow, OnFalling>;
-    using Rising  = EdgeIrq<detail::EdgeHigh, OnRising>;
+    using Falling = EdgeIrq<detail::edgeLow, OnFalling>;
+    using Rising  = EdgeIrq<detail::edgeHigh, OnRising>;
 
     using SubIsrs = brigand::append<std::conditional_t<!Nvic::isNullHandler<OnFalling>,
                                                        brigand::list<typename Falling::Sub>,

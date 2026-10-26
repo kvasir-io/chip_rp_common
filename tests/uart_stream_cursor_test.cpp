@@ -6,6 +6,9 @@
 //   - the channel never overwrites an unread element
 //   - the ISR stalls exactly when the next segment would overwrite unread data
 //   - readCommit() resumes a stalled ring as soon as a segment fits again
+// A channel that dies (a DMA reset: its count and CTRL gone) is restarted by the reader's watch when the reader finds
+// nothing new (restart(), dropped()): the reader never sees an element of the dead segment as new, nothing it was
+// shown and had not committed goes uncounted, and the restarted channel continues the same checks.
 #include "UARTStreamCursor.hpp"
 
 #include <cstdint>
@@ -41,6 +44,11 @@ struct Sim {
     bool          stalled{};
     std::uint32_t readTotal;
     std::uint32_t stalls{};
+    // a dead channel (kill()) and the watch's restarts
+    bool          dead{};
+    std::uint32_t shown;   // writtenTotal() at the reader's last look
+    std::uint32_t restarts{};
+    std::uint32_t dropped{};
 
     Sim(std::uint32_t r,
         std::uint32_t s,
@@ -52,7 +60,16 @@ struct Sim {
       , wpos{startSegments * s}
       , tc{s}
       , segDone{startSegments}
-      , readTotal{startSegments * s} {}
+      , readTotal{startSegments * s}
+      , shown{startSegments * s} {}
+
+    // the DMA reset under the ring: the channel stops, its count reads 0, a completion it had raised is gone
+    void kill() {
+        active  = false;
+        pending = false;
+        dead    = true;
+        tc      = 0;
+    }
 
     void dma(std::uint32_t step) {   // one character arrives and is moved
         if(!active) { return; }
@@ -85,12 +102,35 @@ struct Sim {
     // read what the cursor offers, take `take` of it (0 = a paused reader)
     void read(std::uint32_t take,
               std::uint32_t step) {
-        std::uint32_t const w = D::writtenTotal(segDone, stalled, tc, seg);
+        // the driver shows nothing new while the channel cannot say what it wrote (UartStream's writtenTotal_())
+        std::uint32_t const w = dead ? shown : D::writtenTotal(segDone, stalled, tc, seg);
         check(w - readTotal <= wpos - readTotal, "writtenTotal ahead of the channel", step);
-        check(w == wpos,
+        check(dead || w == wpos,
               "writtenTotal misses written elements",
               step);   // TRANS_COUNT is exact here
+        shown          = w;
         auto const run = D::readable(w, readTotal, ring);
+        if(
+          run.len == 0
+          && dead) {   // the watch: nothing new and the channel dead - restart it, the ring emptied
+            auto const d = D::dropped(shown, readTotal, ring);
+            check(d == shown - readTotal, "a restart drops less than the reader was shown", step);
+            dropped += d;
+            auto const r = D::restart(segDone, stalled, seg);
+            check(r.readTotal == r.segDone * seg && r.readTotal - readTotal <= ring + seg,
+                  "a restart starts past the reader by more than a ring",
+                  step);
+            segDone   = r.segDone;
+            readTotal = r.readTotal;
+            shown     = r.readTotal;
+            wpos      = r.readTotal;
+            stalled   = false;
+            dead      = false;
+            tc        = seg;
+            active    = true;
+            ++restarts;
+            return;
+        }
         check(run.at + run.len <= ring, "a run past the ring's end", step);
         check(run.len == 0 || run.len == std::min(w - readTotal, ring - run.at),
               "a run shorter than offered",
@@ -103,7 +143,7 @@ struct Sim {
         }
         take = std::min(take, run.len);
         readTotal += take;
-        if(stalled && D::mayRearm(segDone, readTotal, seg, ring)) {
+        if(stalled && !dead && D::mayRearm(segDone, readTotal, seg, ring)) {
             stalled = false;
             tc      = seg;
             active  = true;
@@ -116,14 +156,17 @@ void randomRun(std::uint32_t ring,
                std::uint32_t startSegments,
                std::uint32_t seed,
                std::uint32_t steps,
-               bool          slowReader) {
+               bool          slowReader,
+               bool          kills = false) {
     Sim                                s{ring, ring / segs, startSegments};
     std::mt19937                       rng{seed};
     std::uniform_int_distribution<int> op{0, 9};
     std::uint32_t                      readSteps = 0;
     for(std::uint32_t i = 0; i != steps; ++i) {
         int const o = op(rng);
-        if(o < 5) {
+        if(kills && (rng() % 5000) == 0) {
+            s.kill();
+        } else if(o < 5) {
             s.dma(i);
         } else if(o < 7) {
             s.isr(i);
@@ -135,14 +178,17 @@ void randomRun(std::uint32_t ring,
             s.read(static_cast<std::uint32_t>(rng() % (s.seg + 1)), i);
         }
         // a stalled ring holds a full ring of unread elements up to the next segment
-        if(s.stalled) {
+        if(s.stalled && !s.dead) {
             check(s.segDone * s.seg + s.seg - s.readTotal > s.ring,
                   "stalled although a segment fits",
                   i);
         }
     }
+    if(kills) { check(s.restarts != 0, "no channel died in a run with kills", steps); }
     std::printf(
-      "ring %u x %u from segment %u, %s reader: %u steps, %u reads, %u elements, %u stalls\n",
+      "ring %u x %u from segment %u, %s reader: %u steps, %u reads, %u elements, %u stalls, %u "
+      "restarts (%u "
+      "dropped)\n",
       ring,
       segs,
       startSegments,
@@ -150,7 +196,9 @@ void randomRun(std::uint32_t ring,
       steps,
       readSteps,
       s.wpos - startSegments * (ring / segs),
-      s.stalls);
+      s.stalls,
+      s.restarts,
+      s.dropped);
 }
 }   // namespace
 
@@ -172,6 +220,16 @@ int main() {
     randomRun(256, 4, static_cast<std::uint32_t>(nearWrap64), 3, 2'000'000, true);
     randomRun(64, 2, static_cast<std::uint32_t>((0x1'0000'0000ULL - 64) / 32), 4, 1'000'000, true);
     randomRun(2048, 8, 0, 5, 2'000'000, true);
+    // a channel that dies now and then, restarted by the reader's watch
+    static_assert(D::restart(5, false, 64).segDone == 6
+                    && D::restart(5, false, 64).readTotal == 6 * 64,
+                  "past the segment that was running");
+    static_assert(D::restart(5, true, 64).segDone == 5,
+                  "a stalled ring: the segment it waited for");
+    static_assert(D::dropped(300, 290, 256) == 10 && D::dropped(290, 300, 256) == 0);
+    randomRun(256, 4, 0, 6, 2'000'000, false, true);
+    randomRun(256, 4, 0, 7, 2'000'000, true, true);
+    randomRun(256, 4, static_cast<std::uint32_t>(nearWrap64), 8, 2'000'000, true, true);
     if(failures != 0) {
         std::printf("%d failure(s)\n", failures);
         return 1;

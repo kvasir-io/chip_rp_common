@@ -1,6 +1,9 @@
 #pragma once
+#include "Io.hpp"
 #include "PinConfig.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "kvasir/StartUp/Resources.hpp"
+#include "peripherals/RESETS.hpp"
 
 #include <array>
 #include <bit>
@@ -47,7 +50,7 @@ namespace Kvasir { namespace Pio {
     // drivers that share an instance and disagree are then a build error rather than one of
     // them driving the wrong pad. A driver whose pins all sit in 16..31 fits either window
     // and derives 0; sharing an instance with a driver that needs 16 is what
-    // `static constexpr unsigned GpioBase = 16;` in its config is for.
+    // `static constexpr unsigned gpioBase = 16;` in its config is for.
     struct GpioBaseTag {
         static constexpr bool coreLocal      = false;
         static constexpr bool mergeIdentical = true;
@@ -110,20 +113,6 @@ namespace Kvasir { namespace Pio {
         }
     }
 
-    template<unsigned Instance>
-    static constexpr auto getEnable() {
-        static_assert(Instance < PinConfig::pioCount(PinConfig::CurrentChip),
-                      "the RP2350 has PIO0..PIO2, the RP2040 PIO0 and PIO1");
-        using Reset = typename Peripheral::RESETS::Registers<Instance * 0>::RESET;
-        if constexpr(Instance == 0) {
-            return clear(Reset::pio0);
-        } else if constexpr(Instance == 1) {
-            return clear(Reset::pio1);
-        } else {
-            return clear(Reset::pio2);
-        }
-    }
-
     // A program's identity for the resource check: FNV-1a over its instructions and wrap
     // points. Two programs with the same words at the same offset are the same program.
     template<typename Program>
@@ -133,9 +122,9 @@ namespace Kvasir { namespace Pio {
             h ^= v;
             h *= 0x100000001b3ULL;
         };
-        for(auto const w : Program::Instructions) { mix(w); }
-        mix(static_cast<unsigned long long>(Program::WrapTarget));
-        mix(static_cast<unsigned long long>(Program::Wrap));
+        for(auto const w : Program::instructions) { mix(w); }
+        mix(static_cast<unsigned long long>(Program::wrapTarget));
+        mix(static_cast<unsigned long long>(Program::wrap));
         return h;
     }
 
@@ -156,12 +145,12 @@ namespace Kvasir { namespace Pio {
              typename Program,
              unsigned GpioBase = 0>
     struct ProvidesFor {
-        static constexpr std::size_t Length = Program::Instructions.size();
-        static_assert(Instance < PinConfig::pioCount(PinConfig::CurrentChip),
+        static constexpr std::size_t length = Program::instructions.size();
+        static_assert(Instance < PinConfig::pioCount(Chip::part),
                       "the RP2350 has PIO0..PIO2, the RP2040 PIO0 and PIO1");
         static_assert(Sm < 4,
                       "a PIO instance has four state machines");
-        static_assert(Offset + Length <= 32,
+        static_assert(Offset + length <= 32,
                       "a PIO program must fit the instance's 32 instruction slots from its "
                       "offset");
         using type = brigand::append<
@@ -169,7 +158,7 @@ namespace Kvasir { namespace Pio {
           typename Detail::Instructions<Instance,
                                         Offset,
                                         programId<Program>(),
-                                        std::make_index_sequence<Length>>::type>;
+                                        std::make_index_sequence<length>>::type>;
     };
 
     // `using Provides = Kvasir::Pio::Provides<Instance, Sm, Offset, Program, GpioBase>;`
@@ -198,24 +187,13 @@ namespace Kvasir { namespace Pio {
         return action(Kvasir::Io::Action::PinFunction<pinFunction<Instance>>{}, Pin{});
     }
 
-    // An input with the pad's pull-up, for a line that idles high (a UART's RX, an encoder).
-    template<unsigned Instance,
-             typename Pin>
-    static constexpr auto getPinConfigPullUp(Pin) {
-        return action(Kvasir::Io::Action::PinFunctionDrive<pinFunction<Instance>,
-                                                           Io::DriveStrength::mA_4,
-                                                           false,
-                                                           Io::PullConfiguration::PullUp>{},
-                      Pin{});
-    }
-
     // CLKDIV is 16.8 fixed point: INT in [31:16] (0 means 65536), FRAC in [15:8]. The
     // integer part is not narrowed below the field's width, so a divider of 256 or more
     // (a slow bus from a fast clk_sys) keeps its value instead of wrapping.
     static constexpr auto getDiv(double div) {
-        std::uint16_t div_int  = static_cast<std::uint16_t>(div);
-        std::uint8_t  div_frac = static_cast<std::uint8_t>((div - div_int) * 256.0);
-        return std::pair<std::uint16_t, std::uint8_t>(div_int, div_frac);
+        std::uint16_t divInt  = static_cast<std::uint16_t>(div);
+        std::uint8_t  divFrac = static_cast<std::uint8_t>((div - divInt) * 256.0);
+        return std::pair<std::uint16_t, std::uint8_t>(divInt, divFrac);
     }
 
     // The range every PIO driver's divider has to be in: at least 1.0, below what the INT
@@ -224,8 +202,7 @@ namespace Kvasir { namespace Pio {
     template<typename SM>
     static constexpr bool divInRange(double div) {
         constexpr unsigned intBits = static_cast<unsigned>(
-          std::popcount(Kvasir::Register::Detail::GetMask<
-                        std::remove_cvref_t<decltype(SM::CLKDIV::_int)>>::value));
+          std::popcount(std::remove_cvref_t<decltype(SM::CLKDIV::_int)>::mask));
         return div >= 1.0 && div < static_cast<double>(1ULL << intBits);
     }
 
@@ -239,40 +216,6 @@ namespace Kvasir { namespace Pio {
 
         return list(write(SM::CLKDIV::_int, Kvasir::Register::value<std::get<0>(divs)>()),
                     write(SM::CLKDIV::frac, Kvasir::Register::value<std::get<1>(divs)>()));
-    }
-
-    template<typename Dma,
-             unsigned PioInstance,
-             unsigned SmInstance>
-    static constexpr typename Dma::TriggerSource getTxDmaTrigger() {
-        if constexpr(PioInstance == 0) {
-            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio0_tx0; }
-            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio0_tx1; }
-            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio0_tx2; }
-            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio0_tx3; }
-        } else {
-            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio1_tx0; }
-            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio1_tx1; }
-            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio1_tx2; }
-            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio1_tx3; }
-        }
-    }
-
-    template<typename Dma,
-             unsigned PioInstance,
-             unsigned SmInstance>
-    static constexpr typename Dma::TriggerSource getRxDmaTrigger() {
-        if constexpr(PioInstance == 0) {
-            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio0_rx0; }
-            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio0_rx1; }
-            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio0_rx2; }
-            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio0_rx3; }
-        } else {
-            if constexpr(SmInstance == 0) { return Dma::TriggerSource::pio1_rx0; }
-            if constexpr(SmInstance == 1) { return Dma::TriggerSource::pio1_rx1; }
-            if constexpr(SmInstance == 2) { return Dma::TriggerSource::pio1_rx2; }
-            if constexpr(SmInstance == 3) { return Dma::TriggerSource::pio1_rx3; }
-        }
     }
 
 }}   // namespace Kvasir::Pio

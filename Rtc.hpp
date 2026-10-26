@@ -1,8 +1,10 @@
 #pragma once
-#if !__has_include("chip/rp2040.hpp")
+#ifndef KVASIR_CHIP_RP2040
     #error "the RTC exists on the RP2040 only; the RP2350 has the always-on timer (Powman.hpp)"
 #endif
 #include "Clocks.hpp"
+#include "WaitBounds.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "chip/Interrupt.hpp"
 #include "core/Nvic.hpp"
 #include "kvasir/Register/Register.hpp"
@@ -23,8 +25,14 @@
 //   using Rtc   = Kvasir::Rtc::Rtc<HW::CrystalSpeed>;
 //   using Alarm = Kvasir::Rtc::Alarm<Rtc, &onAlarm>;
 //   Startup<..., Rtc, Alarm>;
-//   Rtc::set(Kvasir::Rtc::DateTime::fromUnixSeconds(BuildEpoch));
+//   if(!Rtc::set(Kvasir::Rtc::DateTime::fromUnixSeconds(BuildEpoch))) { /* clk_rtc stopped: try later */ }
 //   Alarm::armAt(Rtc::now().plus(std::chrono::seconds{2}));
+//
+// set() waits for the block to stop and to start again, bounded: a write takes 2 clk_rtc periods to arrive (RP2040
+// datasheet 4.8.4 note, md l.25727), and a clk_rtc that does not run (stopped by another owner of CLOCKS, or a dead
+// crystal) never lets RTC_ACTIVE change. On a timeout it sets clk_rtc up again (clockSetup, the clock half of
+// powerClockEnable) and tries once more; false if that did not help either - nothing waits for ever, and the next
+// set() tries again. clockRestarts() counts the set-ups it needed.
 namespace Kvasir { namespace Rtc {
 
     struct DateTime {
@@ -76,7 +84,8 @@ namespace Kvasir { namespace Rtc {
         }
 
         [[nodiscard]] constexpr std::int64_t toUnixSeconds() const {
-            return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+            return daysFromCivil(year, month, day) * 86400
+                 + static_cast<std::int64_t>(hour * 3600 + minute * 60 + second);
         }
 
         [[nodiscard]] constexpr DateTime plus(std::chrono::seconds s) const {
@@ -92,45 +101,69 @@ namespace Kvasir { namespace Rtc {
     /// divider brings that down to the 1 Hz the calendar counts.
     template<auto CrystalHz>
     struct Rtc {
-        using Regs   = Kvasir::Peripheral::RTC::Registers<>;
-        using Clk    = Kvasir::Peripheral::CLOCKS::Registers<>;
-        using Resets = Kvasir::Peripheral::RESETS::Registers<>;
+        using Regs = Kvasir::Peripheral::RTC::Registers<>;
+        using Clk  = Kvasir::Peripheral::CLOCKS::Registers<>;
 
-        static constexpr std::uint32_t ClkRtcDiv = 256;
-        static_assert(CrystalHz % ClkRtcDiv == 0,
+        static constexpr std::uint32_t clkRtcDiv = 256;
+        static_assert(CrystalHz % clkRtcDiv == 0,
                       "the crystal must divide by 256");
-        static constexpr std::uint32_t ClkRtcHz = static_cast<std::uint32_t>(CrystalHz / ClkRtcDiv);
-        static_assert(ClkRtcHz - 1 < 65536,
+        static constexpr std::uint32_t clkRtcHz = static_cast<std::uint32_t>(CrystalHz / clkRtcDiv);
+        static_assert(clkRtcHz - 1 < 65536,
                       "CLKDIV_M1 is 16 bits: the crystal is too fast");
 
         using Provides = brigand::list<Startup::Resource<TimerTag, 0>>;
-        using Claims   = Clocks::Claim<Clocks::ClkRef, CrystalHz>;   // clk_ref is the crystal
+        using Claims   = Hal::Claim<Clocks::ClkRef, CrystalHz>;   // clk_ref is the crystal
 
-        // clk_rtc from the crystal through /256, set up while the RTC is still in reset. No glitchless mux:
-        // disable, source, enable as separate writes (RP2040 datasheet 2.15.3.2, Table 234); divider before the
-        // enable, as the datasheet asks when the ratio grows. A previous image may have left clk_rtc running.
-        static constexpr auto powerClockEnable = list(
+        // clk_rtc from the crystal through /256. No glitchless mux: disable, source, enable as separate writes
+        // (RP2040 datasheet 2.15.3.2, Table 234); divider before the enable, as the datasheet asks when the ratio
+        // grows. A previous image may have left clk_rtc running. set() runs it again for a clk_rtc that stopped.
+        static constexpr auto clockSetup = list(
           clear(Clk::CLK_RTC_CTRL::enable),
           Register::sequencePoint,
-          write(Clk::CLK_RTC_DIV::_int, Register::value<ClkRtcDiv>()),
+          write(Clk::CLK_RTC_DIV::_int, Register::value<clkRtcDiv>()),
           write(Clk::CLK_RTC_DIV::frac, Register::value<0>()),
           Clk::CLK_RTC_CTRL::overrideDefaults(write(Clk::CLK_RTC_CTRL::AUXSRCValC::xosc_clksrc)),
           Register::sequencePoint,
-          set(Clk::CLK_RTC_CTRL::enable),
-          Register::sequencePoint,
-          clear(Resets::RESET::rtc));
+          set(Clk::CLK_RTC_CTRL::enable));
+
+        // clk_rtc set up while the RTC is still in reset, then the block out of reset
+        static constexpr auto powerClockEnable
+          = list(clockSetup, Register::sequencePoint, clear(Rp::Block<Regs>::reset));
+
+        // RTC_ACTIVE after an RTC_ENABLE write: the write "will take 2 clk_rtc clock periods to arrive, additional
+        // to the clk_sys domain" (RP2040 datasheet 4.8.4 note, md l.25727); the way back is not given - as long
+        // again (unchecked), x2: 8 clk_rtc periods.
+        using SyncBound = Register::MicrosecondsBound<8ULL * 1'000'000 / clkRtcHz + 1>;
 
         // the block's 1 Hz divider
         static constexpr auto initStepPeripheryConfig
-          = list(write(Regs::CLKDIV_M1::clkdiv_m1, Register::value<ClkRtcHz - 1>()));
+          = list(write(Regs::CLKDIV_M1::clkdiv_m1, Register::value<clkRtcHz - 1>()));
 
-        [[nodiscard]] static bool running() { return apply(read(Regs::CTRL::active)); }
+        [[nodiscard]] static bool running() { return apply(read(Regs::CTRL::active)) != 0; }
 
-        /// Load a calendar time and start counting. Blocks for a few clk_rtc cycles while the
-        /// block stops and restarts.
-        static void set(DateTime const& t) {
+        /// Load a calendar time and start counting. Blocks for a few clk_rtc cycles while the block stops and
+        /// restarts; false if it did not answer within SyncBound, also after clk_rtc was set up again (header
+        /// comment). The RTC is stopped then: call it again later.
+        [[nodiscard]] static bool set(DateTime const& t) {
+            if(load(t)) { return true; }
+            apply(clockSetup);
+            clockRestarts_ = clockRestarts_ + 1;
+            return load(t);
+        }
+
+        /// The clk_rtc set-ups set() needed since boot (its RTC_ACTIVE did not change in time).
+        [[nodiscard]] static std::uint32_t clockRestarts() { return clockRestarts_; }
+
+    private:
+        inline static std::uint32_t volatile clockRestarts_{};
+
+        // stop, load, start: false where RTC_ACTIVE did not follow
+        static bool load(DateTime const& t) {
+            using Register::OnTimeout::Report;
             apply(write(Regs::CTRL::enable, Register::value<0>()));
-            while(running()) {}
+            if(!Register::waitUntil<SyncBound, Report>(Register::isClear(Regs::CTRL::active))) {
+                return false;
+            }
             apply(write(Regs::SETUP_0::year, static_cast<std::uint32_t>(t.year)),
                   write(Regs::SETUP_0::month, static_cast<std::uint32_t>(t.month)),
                   write(Regs::SETUP_0::day, static_cast<std::uint32_t>(t.day)));
@@ -140,9 +173,11 @@ namespace Kvasir { namespace Rtc {
                   write(Regs::SETUP_1::sec, static_cast<std::uint32_t>(t.second)));
             apply(write(Regs::CTRL::load, Register::value<1>()));
             apply(write(Regs::CTRL::enable, Register::value<1>()));
-            while(!running()) {}
+            return static_cast<bool>(
+              Register::waitUntil<SyncBound, Report>(Register::isSet(Regs::CTRL::active)));
         }
 
+    public:
         /// The calendar now. RTC_0 has to be read first: it latches RTC_1.
         [[nodiscard]] static DateTime now() {
             auto const r0 = apply(read(Regs::_0::dotw),
@@ -183,11 +218,11 @@ namespace Kvasir { namespace Rtc {
         }
 
         [[nodiscard]] static bool matchEnabled() {
-            return apply(read(Regs::IRQ_SETUP_0::match_ena));
+            return apply(read(Regs::IRQ_SETUP_0::match_ena)) != 0;
         }
 
         [[nodiscard]] static bool matching() {
-            return apply(read(Regs::IRQ_SETUP_0::match_active));
+            return apply(read(Regs::IRQ_SETUP_0::match_active)) != 0;
         }
     };
 
@@ -227,7 +262,7 @@ namespace Kvasir { namespace Rtc {
             Callback();
         }
 
-        static constexpr Nvic::Isr<std::addressof(onIsr), NvicIndex> isr{};
+        using Isr = Nvic::Isr<std::addressof(onIsr), NvicIndex>;
     };
 
 }}   // namespace Kvasir::Rtc

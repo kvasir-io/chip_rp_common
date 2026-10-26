@@ -4,8 +4,12 @@
 #include "DMA.hpp"
 #include "Io.hpp"
 #include "PinConfig.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "core/Nvic.hpp"
+#include "kvasir/Hal/Owns.hpp"
+#include "kvasir/Hal/Spi.hpp"
 #include "kvasir/Io/Types.hpp"
+#include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/Prescaler.hpp"
 #include "peripherals/SPI.hpp"
 
@@ -17,17 +21,6 @@
 
 namespace Kvasir { namespace SPI {
 
-    // Startup resource: the SPI block itself. Two drivers on one instance would each
-    // configure it (kvasir/StartUp/Resources.hpp).
-    struct InstanceTag {};
-
-    enum class Mode {
-        _0,   //CPOL0_CPHA0
-        _1,   //CPOL0_CPHA1
-        _2,   //CPOL1_CPHA0
-        _3    //CPOL1_CPHA1
-    };
-
     namespace Detail {
 
         // Use chip-agnostic pin configuration
@@ -36,147 +29,33 @@ namespace Kvasir { namespace SPI {
         struct Config {
             using Regs = Kvasir::Peripheral::SPI::Registers<Instance>;
 
-            static constexpr bool isValidPinLocationMISO(Io::NotUsed<>) { return true; }
-
-            template<int Port,
-                     int Pin>
-            static constexpr bool isValidPinLocationMISO(Kvasir::Register::PinLocation<Port,
-                                                                                       Pin>) {
-                return Instance == 0 ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Rx0)
-                                     : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Rx1);
-            }
-
-            static constexpr bool isValidPinLocationMOSI(Io::NotUsed<>) { return true; }
-
-            template<int Port,
-                     int Pin>
-            static constexpr bool isValidPinLocationMOSI(Kvasir::Register::PinLocation<Port,
-                                                                                       Pin>) {
-                return Instance == 0 ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Tx0)
-                                     : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Tx1);
-            }
-
-            template<int Port,
-                     int Pin>
-            static constexpr bool isValidPinLocationSCLK(Kvasir::Register::PinLocation<Port,
-                                                                                       Pin>) {
-                return Instance == 0 ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Sck0)
-                                     : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Sck1);
-            }
-
-            static constexpr bool isValidPinLocationCS(Io::NotUsed<>) { return true; }
-
-            template<int Port,
-                     int Pin>
-            static constexpr bool isValidPinLocationCS(Kvasir::Register::PinLocation<Port,
-                                                                                     Pin>) {
-                return Instance == 0 ? PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Cs0)
-                                     : PinConfig::isValidSpiPin<PinConfig::CurrentChip, Instance>(
-                                         Pin,
-                                         PinConfig::SpiPinType::Cs1);
-            }
-
             // MOSI/SCLK/CS are push-pull outputs: 4 mA with slow slew (the pad
             // default) is plenty up to ~8 MHz; faster clocks get 8 mA with fast
             // slew. Only the default - an SPIConfig may override both, since on
             // fast buses a stronger drive trades timing margin against ringing
             // depending on the wiring.
-            static constexpr Io::DriveStrength spiDrive(std::uint32_t f_baud) {
-                return f_baud <= 8'000'000 ? Io::DriveStrength::mA_4 : Io::DriveStrength::mA_8;
+            static constexpr Io::DriveStrength spiDrive(std::uint32_t fBaud) {
+                return fBaud <= 8'000'000 ? Io::DriveStrength::mA4 : Io::DriveStrength::mA8;
             }
 
-            static constexpr bool spiSlewFast(std::uint32_t f_baud) { return f_baud > 8'000'000; }
+            static constexpr bool spiSlewFast(std::uint32_t fBaud) { return fBaud > 8'000'000; }
 
-            // SPIConfig::misoPull (default none): an SD card releases MISO when not selected
-            // (SD spec 7.2.4), and the RP2350's reset pull-down would read that as 0x00 = "no error".
-            template<typename MISOPIN, Io::PullConfiguration Pull = Io::PullConfiguration::PullNone>
-            struct GetMISOPinConfig;
-
-            template<typename dummy, Io::PullConfiguration Pull>
-            struct GetMISOPinConfig<Io::NotUsed<dummy>, Pull> {
-                using pinConfig = brigand::list<>;
-            };
-
-            template<int Port, int Pin, Io::PullConfiguration Pull>
-            struct GetMISOPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Pull> {
-                using pinConfig
-                  = decltype(action(Kvasir::Io::Action::PinFunction<1,
-                                                                    Io::OutputType::PushPull,
-                                                                    Io::OutputSpeed::Low,
-                                                                    Io::OutputInit::Low,
-                                                                    Pull>{},
-                                    Register::PinLocation<Port, Pin>{}));
-            };
-            template<typename CSPIN, Io::DriveStrength Drive, bool SlewFast>
-            struct GetCSPinConfig;
-
-            template<typename dummy, Io::DriveStrength Drive, bool SlewFast>
-            struct GetCSPinConfig<Io::NotUsed<dummy>, Drive, SlewFast> {
-                using pinConfig = brigand::list<>;
-            };
-
-            template<int Port, int Pin, Io::DriveStrength Drive, bool SlewFast>
-            struct GetCSPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Drive, SlewFast> {
-                using pinConfig
-                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<1, Drive, SlewFast>{},
-                                    Register::PinLocation<Port, Pin>{}));
-            };
-
-            template<typename MOSIPIN, Io::DriveStrength Drive, bool SlewFast>
-            struct GetMOSIPinConfig;
-
-            template<typename dummy, Io::DriveStrength Drive, bool SlewFast>
-            struct GetMOSIPinConfig<Io::NotUsed<dummy>, Drive, SlewFast> {
-                using pinConfig = brigand::list<>;
-            };
-
-            template<int Port, int Pin, Io::DriveStrength Drive, bool SlewFast>
-            struct GetMOSIPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Drive, SlewFast> {
-                using pinConfig
-                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<1, Drive, SlewFast>{},
-                                    Register::PinLocation<Port, Pin>{}));
-            };
-
-            template<typename SCLKPIN, Io::DriveStrength Drive, bool SlewFast>
-            struct GetSCLKPinConfig;
-
-            template<int Port, int Pin, Io::DriveStrength Drive, bool SlewFast>
-            struct GetSCLKPinConfig<Kvasir::Register::PinLocation<Port, Pin>, Drive, SlewFast> {
-                using pinConfig
-                  = decltype(action(Kvasir::Io::Action::PinFunctionDrive<1, Drive, SlewFast>{},
-                                    Register::PinLocation<Port, Pin>{}));
-            };
-
-            template<Mode mode>
+            template<Hal::ClockMode Mode>
             struct GetModeConfig {
                 static constexpr auto config_ = []() {
-                    if constexpr(mode == Mode::_0) {
+                    if constexpr(Mode == Hal::ClockMode::mode0) {
                         return brigand::list<
                           decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<0>())),
                           decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<0>()))>{};
-                    } else if constexpr(mode == Mode::_1) {
+                    } else if constexpr(Mode == Hal::ClockMode::mode1) {
                         return brigand::list<
                           decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<0>())),
                           decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<1>()))>{};
-                    } else if constexpr(mode == Mode::_2) {
+                    } else if constexpr(Mode == Hal::ClockMode::mode2) {
                         return brigand::list<
                           decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<1>())),
                           decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<0>()))>{};
-                    } else if constexpr(mode == Mode::_3) {
+                    } else if constexpr(Mode == Hal::ClockMode::mode3) {
                         return brigand::list<
                           decltype(write(Regs::SSPCR0::spo, Kvasir::Register::value<1>())),
                           decltype(write(Regs::SSPCR0::sph, Kvasir::Register::value<1>()))>{};
@@ -197,22 +76,22 @@ namespace Kvasir { namespace SPI {
             // Per CPSDVSR only the two SCRs around the ideal divisor can win (the rate falls with
             // SCR), so the search sees 2 x 127 candidates instead of 32 512, in the same order:
             // the result is the full grid's (util_prescaler_tests compares the two).
-            static constexpr auto baudDivider(std::uint32_t f_clockSpeed,
-                                              std::uint32_t f_baud) {
+            static constexpr auto baudDivider(std::uint32_t fClockSpeed,
+                                              std::uint32_t fBaud) {
                 auto const candidates
                   = std::views::iota(0U, 127U * 2U) | std::views::transform([=](std::uint32_t i) {
-                        std::uint64_t const cps  = 2 * (i / 2 + 1);
-                        std::uint64_t const den  = cps * f_baud;
-                        std::uint64_t const q    = f_clockSpeed / den;   // 1 + SCR, floor
-                        std::uint64_t const ceil = q + (f_clockSpeed % den != 0 ? 1 : 0);
+                        std::uint64_t const cps  = std::uint64_t{i / 2 + 1} * 2;
+                        std::uint64_t const den  = cps * fBaud;
+                        std::uint64_t const q    = fClockSpeed / den;   // 1 + SCR, floor
+                        std::uint64_t const ceil = q + (fClockSpeed % den != 0 ? 1 : 0);
                         std::uint64_t const n    = i % 2 == 0 ? q : ceil;
                         auto const          scr
                           = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(n, 1, 256) - 1);
                         return (i / 2) * 256 + scr;
                     });
                 return Prescaler::search(
-                  f_clockSpeed,
-                  f_baud,
+                  fClockSpeed,
+                  fBaud,
                   candidates,
                   [](std::uint32_t i) {
                       auto const [scr, cps] = decodeDivider(i);
@@ -223,16 +102,16 @@ namespace Kvasir { namespace SPI {
 
             static constexpr std::pair<std::uint8_t,
                                        std::uint8_t>
-            calcBaudRegs(std::uint32_t f_clockSpeed,
-                         std::uint32_t f_baud) {
-                auto const [scr, cps] = decodeDivider(baudDivider(f_clockSpeed, f_baud).setting);
+            calcBaudRegs(std::uint32_t fClockSpeed,
+                         std::uint32_t fBaud) {
+                auto const [scr, cps] = decodeDivider(baudDivider(fClockSpeed, fBaud).setting);
                 return {static_cast<std::uint8_t>(scr), static_cast<std::uint8_t>(cps)};
             }
 
-            template<std::uint32_t f_clockSpeed,
-                     std::uint32_t f_baud>
+            template<std::uint32_t FClockSpeed,
+                     std::uint32_t FBaud>
             static constexpr auto getBaudConfig() {
-                constexpr auto baudRegs = calcBaudRegs(f_clockSpeed, f_baud);
+                constexpr auto baudRegs = calcBaudRegs(FClockSpeed, FBaud);
                 return list(
                   write(Regs::SSPCR0::scr, Register::value<std::get<0>(baudRegs)>()),
                   write(Regs::SSPCPSR::cpsdvsr, Register::value<std::get<1>(baudRegs)>()));
@@ -240,88 +119,20 @@ namespace Kvasir { namespace SPI {
         };
     }   // namespace Detail
 
-    namespace Traits { namespace SPI {
-        template<unsigned Instance>
-        static constexpr auto getIsrIndexs() {
-            static_assert(Instance < 2, "invalid SPI instance");
-            if constexpr(Instance == 0) {
-                return brigand::list<decltype(Kvasir::Interrupt::spi0)>{};
-            } else if constexpr(Instance == 1) {
-                return brigand::list<decltype(Kvasir::Interrupt::spi1)>{};
-            }
-        }
-
-        template<unsigned Instance>
-        static constexpr auto getEnable() {
-            static_assert(Instance < 2, "invalid SPI instance");
-            if constexpr(Instance == 0) {
-                return clear(Peripheral::RESETS::Registers<>::RESET::spi0);
-            } else if constexpr(Instance == 1) {
-                return clear(Peripheral::RESETS::Registers<>::RESET::spi1);
-            }
-        }
-
-        template<unsigned Instance>
-        static constexpr auto DmaRX_Trigger() {
-            static_assert(Instance < 2, "invalid SPI instance");
-            if constexpr(Instance == 0) {
-                return DMA::TriggerSource::spi0_rx;
-            } else if constexpr(Instance == 1) {
-                return DMA::TriggerSource::spi1_rx;
-            }
-        }
-
-        template<unsigned Instance>
-        static constexpr auto DmaTX_Trigger() {
-            static_assert(Instance < 2, "invalid SPI instance");
-            if constexpr(Instance == 0) {
-                return DMA::TriggerSource::spi0_tx;
-            } else if constexpr(Instance == 1) {
-                return DMA::TriggerSource::spi1_tx;
-            }
-        }
-
-    }}   // namespace Traits::SPI
-
     template<typename SPIConfig_>
     struct SPIBase {
         struct SPIConfig : SPIConfig_ {
-            static constexpr auto userConfigOverride = [] {
-                if constexpr(requires { SPIConfig_::userConfigOverride; }) {
-                    return SPIConfig_::userConfigOverride;
-                } else {
-                    return brigand::list<>{};
-                }
-            }();
+            static constexpr auto userConfigOverride
+              = KVASIR_CONFIG_OR(SPIConfig_, userConfigOverride, brigand::list<>{});
 
-            static constexpr auto maxBaudRateError = [] {
-                if constexpr(requires { SPIConfig_::maxBaudRateError; }) {
-                    return SPIConfig_::maxBaudRateError;
-                } else {
-                    return std::ratio<1, 100>{};
-                }
-            }();
-            static constexpr auto misoPinLocation = [] {
-                if constexpr(requires { SPIConfig_::misoPinLocation; }) {
-                    return SPIConfig_::misoPinLocation;
-                } else {
-                    return Io::NotUsed<>{};
-                }
-            }();
-            static constexpr auto mosiPinLocation = [] {
-                if constexpr(requires { SPIConfig_::mosiPinLocation; }) {
-                    return SPIConfig_::mosiPinLocation;
-                } else {
-                    return Io::NotUsed<>{};
-                }
-            }();
-            static constexpr auto csPinLocation = [] {
-                if constexpr(requires { SPIConfig_::csPinLocation; }) {
-                    return SPIConfig_::csPinLocation;
-                } else {
-                    return Io::NotUsed<>{};
-                }
-            }();
+            static constexpr auto maxBaudRateError
+              = KVASIR_CONFIG_OR(SPIConfig_, maxBaudRateError, std::ratio<1, 100>{});
+            static constexpr auto misoPinLocation
+              = KVASIR_CONFIG_OR(SPIConfig_, misoPinLocation, Io::NotUsed<>{});
+            static constexpr auto mosiPinLocation
+              = KVASIR_CONFIG_OR(SPIConfig_, mosiPinLocation, Io::NotUsed<>{});
+            static constexpr auto csPinLocation
+              = KVASIR_CONFIG_OR(SPIConfig_, csPinLocation, Io::NotUsed<>{});
         };
 
         // needed config
@@ -334,25 +145,25 @@ namespace Kvasir { namespace SPI {
         // sclkPinLocation
         // csPinLocation
         // userConfigOverride
-        static constexpr auto Instance = SPIConfig::instance;
-        static_assert(Instance < 2,
+        static constexpr auto instance = SPIConfig::instance;
+        static_assert(instance < 2,
                       "invalid SPI instance");
-        using Regs = Kvasir::Peripheral::SPI::Registers<Instance>;
+        using Regs = Kvasir::Peripheral::SPI::Registers<instance>;
 
-        using InterruptIndexs = decltype(Traits::SPI::getIsrIndexs<Instance>());
+        using InterruptIndexs = typename Rp::Block<Regs>::Irqs;
 
         // Startup: this block, and the clock the baud divisor is computed from (the PL022
         // counts clk_peri).
-        using Provides = brigand::list<Startup::Resource<InstanceTag, Instance>>;
-        using Claims   = Clocks::Claim<Clocks::ClkPeri, SPIConfig::clockSpeed>;
+        using Provides = brigand::list<Hal::Owns<Regs>>;
+        using Claims   = Hal::Claim<Clocks::ClkPeri, SPIConfig::clockSpeed>;
 
-        using Config = Detail::Config<Instance>;
+        using Config = Detail::Config<instance>;
 
-        static constexpr auto RxDmaTrigger = Traits::SPI::DmaRX_Trigger<Instance>();
-        static constexpr auto TxDmaTrigger = Traits::SPI::DmaTX_Trigger<Instance>();
+        static constexpr auto rxDmaTrigger = Rp::Block<Regs>::dreqRx;
+        static constexpr auto txDmaTrigger = Rp::Block<Regs>::dreqTx;
 
         // the achieved SCK against maxBaudRateError; a failure prints wanted, got and ppm
-        static constexpr bool BaudInTolerance = [] {
+        static constexpr bool baudInTolerance = [] {
             Prescaler::assertInTolerance<
               Config::baudDivider(SPIConfig::clockSpeed, SPIConfig::baudRate).achieved,
               SPIConfig::baudRate,
@@ -362,78 +173,76 @@ namespace Kvasir { namespace SPI {
         }();
         // a static data member of a class template is initialised only when used: this use is
         // what runs the check
-        static_assert(BaudInTolerance);
-        static_assert(Config::isValidPinLocationMISO(SPIConfig::misoPinLocation),
-                      "invalid MISOPin");
-        static_assert(Config::isValidPinLocationMOSI(SPIConfig::mosiPinLocation),
-                      "invalid MOSIPin");
-        static_assert(Config::isValidPinLocationSCLK(SPIConfig::sclkPinLocation),
-                      "invalid SCLKPin");
-        static_assert(Config::isValidPinLocationCS(SPIConfig::csPinLocation),
-                      "invalid CSPin");
+        static_assert(baudInTolerance);
+        static_assert(Io::pinServes<PinConfig::Function::spiRx,
+                                    instance>(SPIConfig::misoPinLocation));
+        static_assert(Io::pinServes<PinConfig::Function::spiTx,
+                                    instance>(SPIConfig::mosiPinLocation));
+        static_assert(Io::pinServes<PinConfig::Function::spiSck,
+                                    instance>(SPIConfig::sclkPinLocation));
+        static_assert(Io::pinServes<PinConfig::Function::spiCs,
+                                    instance>(SPIConfig::csPinLocation));
 
-        static_assert(!Io::Detail::PinLocationEqual(SPIConfig::misoPinLocation,
-                                                    SPIConfig::mosiPinLocation),
+        static_assert(!Io::pinLocationEqual(SPIConfig::misoPinLocation,
+                                            SPIConfig::mosiPinLocation),
                       "MISO and MOSI are the same pin");
-        static_assert(!Io::Detail::PinLocationEqual(SPIConfig::misoPinLocation,
-                                                    SPIConfig::sclkPinLocation),
+        static_assert(!Io::pinLocationEqual(SPIConfig::misoPinLocation,
+                                            SPIConfig::sclkPinLocation),
                       "MISO and SCLK are the same pin");
-        static_assert(!Io::Detail::PinLocationEqual(SPIConfig::misoPinLocation,
-                                                    SPIConfig::csPinLocation),
+        static_assert(!Io::pinLocationEqual(SPIConfig::misoPinLocation,
+                                            SPIConfig::csPinLocation),
                       "MISO and CS are the same pin");
-        static_assert(!Io::Detail::PinLocationEqual(SPIConfig::mosiPinLocation,
-                                                    SPIConfig::sclkPinLocation),
+        static_assert(!Io::pinLocationEqual(SPIConfig::mosiPinLocation,
+                                            SPIConfig::sclkPinLocation),
                       "MOSI and SCLK are the same pin");
-        static_assert(!Io::Detail::PinLocationEqual(SPIConfig::mosiPinLocation,
-                                                    SPIConfig::csPinLocation),
+        static_assert(!Io::pinLocationEqual(SPIConfig::mosiPinLocation,
+                                            SPIConfig::csPinLocation),
                       "MOSI and CS are the same pin");
-        static_assert(!Io::Detail::PinLocationEqual(SPIConfig::sclkPinLocation,
-                                                    SPIConfig::csPinLocation),
+        static_assert(!Io::pinLocationEqual(SPIConfig::sclkPinLocation,
+                                            SPIConfig::csPinLocation),
                       "SCLK and CS are the same pin");
 
-        static constexpr auto powerClockEnable = list(Traits::SPI::getEnable<Instance>());
+        static constexpr auto powerClockEnable = list(clear(Rp::Block<Regs>::reset));
 
         // Pad drive/slew for the output pins: optional `driveStrength` /
         // `slewFast` members override the rate-tiered default from
         // Detail::Config::spiDrive.
-        static constexpr Io::DriveStrength pinDrive = [] {
-            if constexpr(requires { SPIConfig::driveStrength; }) {
-                return SPIConfig::driveStrength;
-            } else {
-                return Config::spiDrive(SPIConfig::baudRate);
-            }
-        }();
-        static constexpr bool pinSlewFast = [] {
-            if constexpr(requires { SPIConfig::slewFast; }) {
-                return SPIConfig::slewFast;
-            } else {
-                return Config::spiSlewFast(SPIConfig::baudRate);
-            }
-        }();
+        static constexpr Io::DriveStrength pinDrive
+          = KVASIR_CONFIG_OR(SPIConfig, driveStrength, Config::spiDrive(SPIConfig::baudRate));
+        static constexpr bool pinSlewFast
+          = KVASIR_CONFIG_OR(SPIConfig, slewFast, Config::spiSlewFast(SPIConfig::baudRate));
 
-        static constexpr Io::PullConfiguration misoPull = [] {
-            if constexpr(requires { SPIConfig::misoPull; }) {
-                return SPIConfig::misoPull;
-            } else {
-                return Io::PullConfiguration::PullNone;
-            }
-        }();
+        static constexpr Io::PullConfiguration misoPull
+          = KVASIR_CONFIG_OR(SPIConfig, misoPull, Io::PullConfiguration::pullNone);
 
-        static constexpr auto initStepPinConfig = list(
-          typename Config::template GetMISOPinConfig<
-            std::decay_t<decltype(SPIConfig::misoPinLocation)>,
-            misoPull>::pinConfig{},
-          typename Config::template GetMOSIPinConfig<
-            std::decay_t<decltype(SPIConfig::mosiPinLocation)>,
-            pinDrive,
-            pinSlewFast>::pinConfig{},
-          typename Config::template GetSCLKPinConfig<
-            std::decay_t<decltype(SPIConfig::sclkPinLocation)>,
-            pinDrive,
-            pinSlewFast>::pinConfig{},
-          typename Config::template GetCSPinConfig<std::decay_t<decltype(SPIConfig::csPinLocation)>,
-                                                   pinDrive,
-                                                   pinSlewFast>::pinConfig{});
+        // MISO: SPIConfig::misoPull (default none) - an SD card releases MISO when not selected (SD spec 7.2.4), and
+        // the RP2350's reset pull-down would read that as 0x00 = "no error"
+        template<typename Location,
+                 PinConfig::Function   F,
+                 Io::DriveStrength     Drive,
+                 bool                  Slew,
+                 Io::PullConfiguration Pull = Io::PullConfiguration::pullNone>
+        using PinSetUp = typename Io::Detail::
+          PinConfigFor<std::decay_t<Location>, F, instance, Drive, Slew, Pull>::type;
+
+        static constexpr auto initStepPinConfig
+          = list(PinSetUp<decltype(SPIConfig::misoPinLocation),
+                          PinConfig::Function::spiRx,
+                          Io::DriveStrength::mA4,
+                          false,
+                          misoPull>{},
+                 PinSetUp<decltype(SPIConfig::mosiPinLocation),
+                          PinConfig::Function::spiTx,
+                          pinDrive,
+                          pinSlewFast>{},
+                 PinSetUp<decltype(SPIConfig::sclkPinLocation),
+                          PinConfig::Function::spiSck,
+                          pinDrive,
+                          pinSlewFast>{},
+                 PinSetUp<decltype(SPIConfig::csPinLocation),
+                          PinConfig::Function::spiCs,
+                          pinDrive,
+                          pinSlewFast>{});
 
         static constexpr auto initStepPeripheryConfig
           = list(Config::template getBaudConfig<SPIConfig::clockSpeed, SPIConfig::baudRate>(),
@@ -447,11 +256,6 @@ namespace Kvasir { namespace SPI {
                  clear(Regs::SSPCR1::sse),
                  clear(Regs::SSPCR1::lbm),
 
-                 /*clear(Regs::SSPIMSC::txim),
-          clear(Regs::SSPIMSC::rxim),
-          clear(Regs::SSPIMSC::rtim),
-          clear(Regs::SSPIMSC::rorim),*/
-
                  set(Regs::SSPDMACR::txdmae),
                  set(Regs::SSPDMACR::rxdmae),
                  SPIConfig::userConfigOverride);
@@ -460,9 +264,7 @@ namespace Kvasir { namespace SPI {
           = list(Nvic::makeSetPriority<SPIConfig::isrPriority>(InterruptIndexs{}),
                  Nvic::makeClearPending(InterruptIndexs{}));
 
-        static constexpr auto initStepPeripheryEnable = list(set(Regs::SSPCR1::sse)
-                                                             //, Nvic::makeEnable(InterruptIndexs{})
-        );
+        static constexpr auto initStepPeripheryEnable = list(set(Regs::SSPCR1::sse));
     };
 
     template<typename SPIConfig, typename Dma, typename DMAConfig>
@@ -470,12 +272,12 @@ namespace Kvasir { namespace SPI {
         using base = SPIBase<SPIConfig>;
         using Regs = typename base::Regs;
 
-        static constexpr auto DmaChannelA = DMAConfig::ChannelA;
-        static constexpr auto DmaChannelB = DMAConfig::ChannelB;
-        static constexpr auto DmaPriority = DMAConfig::Priority;
+        static constexpr auto dmaChannelA = DMAConfig::channelA;
+        static constexpr auto dmaChannelB = DMAConfig::channelB;
+        static constexpr auto dmaPriority = DMAConfig::priority;
 
         using Claims = brigand::append<typename base::Claims,
-                                       Kvasir::DMA::Claims<Dma, DmaChannelA, DmaChannelB>>;
+                                       Kvasir::DMA::Claims<Dma, dmaChannelA, dmaChannelB>>;
 
         enum class OperationState { succeeded, failed, ongoing };
 
@@ -534,10 +336,10 @@ namespace Kvasir { namespace SPI {
                     .sspBusy        = static_cast<bool>(get<0>(apply(read(Regs::SSPSR::bsy)))),
                     .rxFifoNotEmpty = static_cast<bool>(get<0>(apply(read(Regs::SSPSR::rne)))),
                     .rxOverrun      = static_cast<bool>(get<0>(apply(read(Regs::SSPRIS::rorris)))),
-                    .txDmaRemaining = Dma::template remaining<DmaChannelA>(),
-                    .rxDmaRemaining = Dma::template remaining<DmaChannelB>(),
-                    .txDmaBusy      = !Dma::template ready<DmaChannelA>(),
-                    .rxDmaBusy      = !Dma::template ready<DmaChannelB>()};
+                    .txDmaRemaining = Dma::template remaining<dmaChannelA>(),
+                    .rxDmaRemaining = Dma::template remaining<dmaChannelB>(),
+                    .txDmaBusy      = !Dma::template ready<dmaChannelA>(),
+                    .rxDmaBusy      = !Dma::template ready<dmaChannelB>()};
         }
 
         // Abandon an in-flight transfer and leave the bus usable. Without it a
@@ -545,8 +347,8 @@ namespace Kvasir { namespace SPI {
         // `busy` is never cleared by a completion nobody is listening for, and
         // every later transfer inherits a channel that is still live.
         static void abortTransfer() {
-            Dma::template abort<DmaChannelA>();
-            Dma::template abort<DmaChannelB>();
+            Dma::template abort<dmaChannelA>();
+            Dma::template abort<dmaChannelB>();
             busy.store(false, std::memory_order_relaxed);
             error.store(false, std::memory_order_relaxed);
             // Leftovers in the RX FIFO would be read as the first bytes of the
@@ -558,81 +360,79 @@ namespace Kvasir { namespace SPI {
             }
         }
 
-        static void send_nocopy(std::span<std::byte const> inData) {
-            send_nocopy_impl<true>(inData.data(), inData.size(), std::nullopt);
+        static void sendNocopy(std::span<std::byte const> inData) {
+            sendNocopyImpl<true>(inData.data(), inData.size(), std::nullopt);
         }
 
         template<typename F>
-        static void send_nocopy(std::span<std::byte const> inData,
-                                F                          f) {
-            send_nocopy_impl<true>(inData.data(), inData.size(), f);
+        static void sendNocopy(std::span<std::byte const> inData,
+                               F                          f) {
+            sendNocopyImpl<true>(inData.data(), inData.size(), f);
         }
 
-        static void send_nocopy_static(std::byte const* staticValue,
-                                       std::size_t      size) {
-            send_nocopy_impl<false>(staticValue, size, std::nullopt);
-        }
-
-        template<typename F>
-        static void send_nocopy_static(std::byte const* staticValue,
-                                       std::size_t      size,
-                                       F                f) {
-            send_nocopy_impl<false>(staticValue, size, f);
-        }
-
-        static void send_receive_nocopy(std::span<std::byte> inOutData) {
-            send_receive_nocopy(inOutData, inOutData, std::nullopt);
+        static void sendNocopyStatic(std::byte const* staticValue,
+                                     std::size_t      size) {
+            sendNocopyImpl<false>(staticValue, size, std::nullopt);
         }
 
         template<typename F>
-        static void send_receive_nocopy(std::span<std::byte> inOutData,
-                                        F                    f) {
-            send_receive_nocopy(inOutData, inOutData, f);
+        static void sendNocopyStatic(std::byte const* staticValue,
+                                     std::size_t      size,
+                                     F                f) {
+            sendNocopyImpl<false>(staticValue, size, f);
         }
 
-        static void send_receive_nocopy_static(std::byte const*     staticValue,
-                                               std::span<std::byte> outData) {
-            send_receive_nocopy_impl<false>(staticValue,
-                                            outData.data(),
-                                            outData.size(),
-                                            std::nullopt);
+        static void sendReceiveNocopy(std::span<std::byte> inOutData) {
+            sendReceiveNocopy(inOutData, inOutData, std::nullopt);
         }
 
         template<typename F>
-        static void send_receive_nocopy_static(std::byte const*     staticValue,
-                                               std::span<std::byte> outData,
-                                               F                    f) {
-            send_receive_nocopy_impl<false>(staticValue, outData.data(), outData.size(), f);
+        static void sendReceiveNocopy(std::span<std::byte> inOutData,
+                                      F                    f) {
+            sendReceiveNocopy(inOutData, inOutData, f);
         }
 
-        static void send_receive_nocopy(std::span<std::byte const> inData,
-                                        std::span<std::byte>       outData) {
+        static void sendReceiveNocopyStatic(std::byte const*     staticValue,
+                                            std::span<std::byte> outData) {
+            sendReceiveNocopyImpl<false>(staticValue, outData.data(), outData.size(), std::nullopt);
+        }
+
+        template<typename F>
+        static void sendReceiveNocopyStatic(std::byte const*     staticValue,
+                                            std::span<std::byte> outData,
+                                            F                    f) {
+            sendReceiveNocopyImpl<false>(staticValue, outData.data(), outData.size(), f);
+        }
+
+        static void sendReceiveNocopy(std::span<std::byte const> inData,
+                                      std::span<std::byte>       outData) {
             assert(inData.size() == outData.size());
-            send_receive_nocopy_impl<true>(inData.data(),
-                                           outData.data(),
-                                           inData.size(),
-                                           std::nullopt);
+            sendReceiveNocopyImpl<true>(inData.data(), outData.data(), inData.size(), std::nullopt);
         }
 
         template<typename F>
-        static void send_receive_nocopy(std::span<std::byte const> inData,
-                                        std::span<std::byte>       outData,
-                                        F                          f) {
+        static void sendReceiveNocopy(std::span<std::byte const> inData,
+                                      std::span<std::byte>       outData,
+                                      F                          f) {
             assert(inData.size() == outData.size());
-            send_receive_nocopy_impl<true>(inData.data(), outData.data(), inData.size(), f);
+            sendReceiveNocopyImpl<true>(inData.data(), outData.data(), inData.size(), f);
         }
 
     private:
-        template<bool increment,
+        template<bool Increment,
                  typename F>
-        static void send_nocopy_impl(std::byte const* first,
-                                     std::size_t      size,
-                                     F                f) {
+        static void sendNocopyImpl(std::byte const* first,
+                                   std::size_t      size,
+                                   F                f) {
             assert(!busy);
 
             // Drain any stale data left in the RX FIFO. The RX FIFO keeps filling during a
             // transmit-only transfer (rxdmae is enabled but no RX channel is armed), so clearing
-            // it here keeps a later send_receive from reading garbage.
+            // it here keeps a later send_receive from reading garbage. Bounded by the block: it is
+            // master only (SSPCR1.MS clear), so no frame arrives without the core's TX data; with
+            // `busy` clear at most the 8-deep RX FIFO is full and up to 8 TX entries plus the one
+            // in the shifter still clock out - 17 reads at most (PL022 FIFOs "8-locations deep":
+            // RP2040 datasheet 4.4.2.5 md l.23438, RP2350 12.3.3.5 md l.51333).
             while(apply(read(Regs::SSPSR::rne))) { apply(read(Regs::SSPDR::data)); }
 
             error.store(false, std::memory_order_relaxed);
@@ -641,32 +441,34 @@ namespace Kvasir { namespace SPI {
 
             std::atomic_signal_fence(std::memory_order_release);
 
-            Dma::template start<DmaChannelA,
-                                DmaPriority,
-                                base::TxDmaTrigger,
-                                Dma::TransferSize::_8,
-                                false,
-                                increment>(Regs::SSPDR::Addr::value,
-                                           reinterpret_cast<std::uint32_t>(first),
-                                           size,
-                                           [f]() {
-                                               busy = false;
-                                               if constexpr(!std::is_same_v<F, std::nullopt_t>) {
-                                                   f();
-                                               } else {
-                                                   (void)f;
-                                               }
-                                           });
+            Dma::template start<dmaChannelA,
+                                ::Kvasir::DMA::ChannelConfig{.priority = dmaPriority,
+                                                             .trigger  = base::txDmaTrigger,
+                                                             .size     = Dma::TransferSize::size8,
+                                                             .incrementRead  = Increment,
+                                                             .incrementWrite = false}>(
+              Regs::SSPDR::Addr::value,
+              reinterpret_cast<std::uint32_t>(first),
+              size,
+              [f]() {
+                  busy = false;
+                  if constexpr(!std::is_same_v<F, std::nullopt_t>) {
+                      f();
+                  } else {
+                      (void)f;
+                  }
+              });
         }
 
-        template<bool increment,
+        template<bool Increment,
                  typename F>
-        static void send_receive_nocopy_impl(std::byte const* first,
-                                             std::byte*       firstOut,
-                                             std::size_t      size,
-                                             F                f) {
+        static void sendReceiveNocopyImpl(std::byte const* first,
+                                          std::byte*       firstOut,
+                                          std::size_t      size,
+                                          F                f) {
             assert(!busy);
 
+            // Bounded like send_nocopy_impl's drain: master only, at most 17 reads.
             while(apply(read(Regs::SSPSR::rne))) { apply(read(Regs::SSPDR::data)); }
 
             error.store(false, std::memory_order_relaxed);
@@ -678,46 +480,38 @@ namespace Kvasir { namespace SPI {
 
             // Arm the RX channel (B) before the TX channel (A) so the receiver is ready before
             // the SSP starts clocking out data and filling the RX FIFO.
-            Dma::template start<DmaChannelB,
-                                DmaPriority,
-                                base::RxDmaTrigger,
-                                Dma::TransferSize::_8,
-                                true,
-                                false>(reinterpret_cast<std::uint32_t>(firstOut),
-                                       Regs::SSPDR::Addr::value,
-                                       size,
-                                       [f]() {
-                                           if(get<0>(apply(read(Regs::SSPRIS::rorris)))) {
-                                               error.store(true, std::memory_order_relaxed);
-                                               apply(set(Regs::SSPICR::roric));
-                                           }
-                                           busy = false;
+            Dma::template start<dmaChannelB,
+                                ::Kvasir::DMA::ChannelConfig{.priority = dmaPriority,
+                                                             .trigger  = base::rxDmaTrigger,
+                                                             .size     = Dma::TransferSize::size8,
+                                                             .incrementRead  = false,
+                                                             .incrementWrite = true}>(
+              reinterpret_cast<std::uint32_t>(firstOut),
+              Regs::SSPDR::Addr::value,
+              size,
+              [f]() {
+                  if(get<0>(apply(read(Regs::SSPRIS::rorris)))) {
+                      error.store(true, std::memory_order_relaxed);
+                      apply(set(Regs::SSPICR::roric));
+                  }
+                  busy = false;
 
-                                           if constexpr(!std::is_same_v<F, std::nullopt_t>) {
-                                               f();
-                                           } else {
-                                               (void)f;
-                                           }
-                                       });
+                  if constexpr(!std::is_same_v<F, std::nullopt_t>) {
+                      f();
+                  } else {
+                      (void)f;
+                  }
+              });
 
-            Dma::template start<DmaChannelA,
-                                DmaPriority,
-                                base::TxDmaTrigger,
-                                Dma::TransferSize::_8,
-                                false,
-                                increment>(Regs::SSPDR::Addr::value,
-                                           reinterpret_cast<std::uint32_t>(first),
-                                           size);
+            Dma::template start<dmaChannelA,
+                                ::Kvasir::DMA::ChannelConfig{.priority = dmaPriority,
+                                                             .trigger  = base::txDmaTrigger,
+                                                             .size     = Dma::TransferSize::size8,
+                                                             .incrementRead  = Increment,
+                                                             .incrementWrite = false}>(
+              Regs::SSPDR::Addr::value,
+              reinterpret_cast<std::uint32_t>(first),
+              size);
         }
-
-        /*        static void onIsr() {
-        }
-
-        template<typename... Ts>
-        static constexpr auto makeIsr(brigand::list<Ts...>) {
-            return brigand::list<
-              Kvasir::Nvic::Isr<std::addressof(onIsr), Nvic::Index<Ts::value>>...>{};
-        }
-        using Isr = decltype(makeIsr(typename base::InterruptIndexs{}));*/
     };
 }}   // namespace Kvasir::SPI

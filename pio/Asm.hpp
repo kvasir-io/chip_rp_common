@@ -1,7 +1,6 @@
 #pragma once
-// A PIO assembler that runs in the compiler: the program is a C++ value, built by `Asm` (this
-// file) or parsed from pioasm text (`parse()`, AsmParse.hpp), and `Program<...>` turns it into
-// the type every PIO driver takes - the same members a pioasm `-o kvasir` header has
+// A PIO assembler that runs in the compiler: the program is a C++ value, built by `Asm`, and
+// `Program<...>` turns it into the type every PIO driver takes - the same members a pioasm `-o kvasir` header has
 // (Instructions, WrapTarget, Wrap, ...), so StateMachine, Provides and programId need nothing new.
 //
 //   template<unsigned Bits>
@@ -14,17 +13,17 @@
 //       a.wrap();
 //   })> {};
 //
-// A mistake is a compile error that names the line (text) or the instruction (builder):
-//   static assertion failed: line 6: delay 16 does not fit: .side_set 1 leaves 4 delay bits (max 15)
+// A mistake is a compile error that names the builder call:
+//   static assertion failed: blink.hpp:12: delay 16 does not fit: .side_set 1 leaves 4 delay bits (max 15)
 //
 // Name the program with a struct that derives from Program<...>, as above: the struct's name is
 // what appears in symbols and error messages, instead of the whole assembled value.
 //
 // Standalone on purpose (std headers only): a host compiler checks it without the chip package.
 // Encodings: RP2350 datasheet 11.4 (Table 980 and 11.4.2-11.4.12); the RP2040's PIO (RP2040
-// datasheet 3.4) has the same encodings minus the forms marked v1 below. pioasm (../pioasm,
-// pico-sdk 2.3.1) is the reference for the syntax and the checks, and the host tests compare
-// every .pio file they can find with it (chip_rp_common/tests).
+// datasheet 3.4) has the same encodings minus the forms marked v1 below. pioasm (pico-sdk 2.3.1)
+// is the model for the directives, the names and the checks; the host tests (chip_rp_common/tests)
+// check every form against the datasheet.
 
 #include <algorithm>
 #include <array>
@@ -177,7 +176,7 @@ namespace Kvasir { namespace Pio {
         char         text[32]{};
         std::uint8_t size{};
 
-        constexpr std::string_view view() const { return {text, size}; }
+        [[nodiscard]] constexpr std::string_view view() const { return {text, size}; }
     };
 
     struct Symbol {
@@ -189,7 +188,7 @@ namespace Kvasir { namespace Pio {
 
     // What the assembler produces: a structural value, so it can be a template argument.
     struct Assembled {
-        static constexpr std::size_t MaxSymbols = 32;
+        static constexpr std::size_t maxSymbols = 32;
 
         std::array<std::uint16_t, 32> words{};
         std::uint8_t                  length{};
@@ -216,19 +215,19 @@ namespace Kvasir { namespace Pio {
         std::uint16_t                  clockDivInt{1};
         std::uint8_t                   clockDivFrac{};
         std::uint8_t                   usedGpioRanges{};
-        std::array<Symbol, MaxSymbols> symbols{};
+        std::array<Symbol, maxSymbols> symbols{};
         std::uint8_t                   symbolCount{};
         char                           error[192]{};   // empty = ok; the first error only
 
-        constexpr bool ok() const { return error[0] == 0; }
+        [[nodiscard]] constexpr bool ok() const { return error[0] == 0; }
 
-        constexpr std::string_view message() const {
+        [[nodiscard]] constexpr std::string_view message() const {
             std::size_t n = 0;
             while(n < sizeof(error) && error[n] != 0) { ++n; }
             return {error, n};
         }
 
-        constexpr Symbol const* find(std::string_view name) const {
+        [[nodiscard]] constexpr Symbol const* find(std::string_view name) const {
             for(std::size_t i = 0; i < symbolCount; ++i) {
                 if(symbols[i].name.view() == name) { return &symbols[i]; }
             }
@@ -237,7 +236,7 @@ namespace Kvasir { namespace Pio {
 
         // The symbol's index, symbolCount when there is none. For a lookup in a program that is a template argument:
         // gcc's -fsanitize=null cannot constant-evaluate "a pointer into that object != nullptr" (find()'s result).
-        constexpr std::size_t indexOf(std::string_view name) const {
+        [[nodiscard]] constexpr std::size_t indexOf(std::string_view name) const {
             for(std::size_t i = 0; i < symbolCount; ++i) {
                 if(symbols[i].name.view() == name) { return i; }
             }
@@ -253,7 +252,7 @@ namespace Kvasir { namespace Pio {
             std::size_t size{};
 
             constexpr void append(std::string_view s) {
-                for(char c : s) {
+                for(char const c : s) {
                     if(size + 1 < sizeof(text)) { text[size++] = c; }
                 }
             }
@@ -307,7 +306,6 @@ namespace Kvasir { namespace Pio {
             std::int16_t  target{};       // a JMP to an address
             bool          isJmp{};
             bool          isWord{};   // .word: taken as it is, no side-set or delay
-            std::uint16_t line{};     // the text line, 0 for the builder
             Site          site{};     // the builder's call, for messages
 
             constexpr Instr& side(unsigned v) {
@@ -321,22 +319,12 @@ namespace Kvasir { namespace Pio {
             }
         };
 
-        // The text line the next call belongs to; the parser sets it. The builder leaves it 0,
-        // and its messages name the C++ call instead (every call takes a std::source_location).
-        std::uint16_t currentLine = 0;
-        // set by the parser: a message without a line is about the whole text
-        bool fromText = false;
-
         // The first error wins: a mistake does not drag a cascade of others behind it.
         template<typename... Parts>
         constexpr void fail(Parts const&... parts) {
             if(failed()) { return; }
             detail::Message m{};
-            if(currentLine != 0) {
-                m.append("line ");
-                m.append(static_cast<long long>(currentLine));
-                m.append(": ");
-            } else if(!fromText && site_.file != nullptr) {
+            if(site_.file != nullptr) {
                 // the builder: the call that added the instruction, or the directive's
                 std::string_view file{site_.file};
                 if(auto const slash = file.find_last_of('/'); slash != std::string_view::npos) {
@@ -346,7 +334,7 @@ namespace Kvasir { namespace Pio {
                 m.append(":");
                 m.append(static_cast<long long>(site_.line));
                 m.append(": ");
-            } else if(!fromText) {
+            } else {
                 m.append("instruction ");
                 m.append(static_cast<long long>(
                   instrIndex_ >= 0 ? static_cast<std::size_t>(instrIndex_) : count_));
@@ -377,7 +365,6 @@ namespace Kvasir { namespace Pio {
             result_.sidesetCount   = static_cast<std::uint8_t>(count);
             result_.sidesetOpt     = opt;
             result_.sidesetPindirs = pindirs;
-            sidesetLine_           = currentLine;
         }
 
         constexpr void wrapTarget(std::source_location const loc
@@ -386,7 +373,6 @@ namespace Kvasir { namespace Pio {
             if(haveWrapTarget_) { return fail(".wrap_target given twice"); }
             haveWrapTarget_    = true;
             result_.wrapTarget = static_cast<std::uint8_t>(count_);
-            wrapTargetLine_    = currentLine;
             wrapTargetSite_    = site_;
         }
 
@@ -406,7 +392,6 @@ namespace Kvasir { namespace Pio {
                 return fail(".origin ", o, ": instruction memory has 32 slots (0..31)");
             }
             result_.origin = static_cast<std::int8_t>(o);
-            originLine_    = currentLine;
             originSite_    = site_;
         }
 
@@ -466,7 +451,6 @@ namespace Kvasir { namespace Pio {
             result_.inRight     = right;
             result_.inAuto      = autoPush;
             result_.inThreshold = static_cast<std::uint8_t>(threshold);
-            inLine_             = currentLine;
             inSite_             = site_;
         }
 
@@ -729,15 +713,13 @@ namespace Kvasir { namespace Pio {
                 result_.wrap = static_cast<std::uint8_t>(count_ == 0 ? 0 : count_ - 1);
             }
             if(haveWrapTarget_ && result_.wrapTarget >= count_ && !failed()) {
-                currentLine = wrapTargetLine_;
-                site_       = wrapTargetSite_;
+                site_ = wrapTargetSite_;
                 fail(".wrap_target after the last instruction");
             }
             if(result_.origin >= 0 && static_cast<std::size_t>(result_.origin) + count_ > 32
                && !failed())
             {
-                currentLine = originLine_;
-                site_       = originSite_;
+                site_ = originSite_;
                 fail("the program is ",
                      static_cast<int>(count_),
                      " instructions at .origin ",
@@ -745,8 +727,7 @@ namespace Kvasir { namespace Pio {
                      ": instruction memory has 32 slots");
             }
             if(result_.inAuto && result_.fifo > static_cast<std::uint8_t>(Fifo::rx) && !failed()) {
-                currentLine = inLine_;
-                site_       = inSite_;
+                site_ = inSite_;
                 fail("autopush does not go with this .fifo configuration");
             }
 
@@ -757,8 +738,7 @@ namespace Kvasir { namespace Pio {
             int const delayMax = static_cast<int>((1U << (5U - ssBits)) - 1U);
             int const sideMax  = static_cast<int>((1U << result_.sidesetCount) - 1U);
             for(std::size_t n = 0; n < count_ && !failed(); ++n) {
-                auto& i       = code_[n];
-                currentLine   = i.line;
+                auto const& i = code_[n];
                 site_         = i.site;
                 instrIndex_   = static_cast<int>(n);
                 unsigned word = i.word;
@@ -831,17 +811,16 @@ namespace Kvasir { namespace Pio {
             return result_;
         }
 
-        constexpr bool failed() const { return result_.error[0] != 0; }
+        [[nodiscard]] constexpr bool failed() const { return result_.error[0] != 0; }
 
-        constexpr std::uint8_t pioVersionNow() const { return result_.pioVersion; }
+        [[nodiscard]] constexpr std::uint8_t pioVersionNow() const { return result_.pioVersion; }
 
-        constexpr std::size_t instructionCount() const { return count_; }
+        [[nodiscard]] constexpr std::size_t instructionCount() const { return count_; }
 
     private:
-        // Remembers the builder's call site for the messages of this call; the parser's calls
-        // leave it alone (their place is the text line).
+        // Remembers the builder's call site for the messages of this call.
         constexpr void at(std::source_location const& loc) {
-            if(!fromText) { site_ = Site{loc.file_name(), loc.line()}; }
+            site_ = Site{loc.file_name(), loc.line()};
         }
 
         constexpr Assembled failed_(detail::Message const& m) {
@@ -885,9 +864,9 @@ namespace Kvasir { namespace Pio {
                             "' is already defined as a ",
                             s->isLabel ? "label" : "value");
             }
-            if(result_.symbolCount == Assembled::MaxSymbols) {
+            if(result_.symbolCount == Assembled::maxSymbols) {
                 return fail("more than ",
-                            static_cast<int>(Assembled::MaxSymbols),
+                            static_cast<int>(Assembled::maxSymbols),
                             " labels and defines");
             }
             auto& s = result_.symbols[result_.symbolCount];
@@ -906,7 +885,6 @@ namespace Kvasir { namespace Pio {
             auto& i = code_[count_++];
             i       = Instr{};
             i.word  = word;
-            i.line  = currentLine;
             i.site  = site_;
             return i;
         }
@@ -949,10 +927,6 @@ namespace Kvasir { namespace Pio {
         bool                       haveSideset_{};
         bool                       haveWrapTarget_{};
         bool                       haveWrap_{};
-        std::uint16_t              sidesetLine_{};
-        std::uint16_t              wrapTargetLine_{};
-        std::uint16_t              inLine_{};
-        std::uint16_t              originLine_{};
         int                        instrIndex_{-1};
         Site                       site_{};
         Site                       wrapTargetSite_{};
@@ -971,47 +945,47 @@ namespace Kvasir { namespace Pio {
 
     // Called only when a program asks for a name it does not have: not constexpr, so the
     // compiler stops right there and shows the name.
-    inline std::uint8_t pio_program_has_no_label_of_that_name(std::string_view) { return 0; }
+    inline std::uint8_t pioProgramHasNoLabelOfThatName(std::string_view) { return 0; }
 
-    inline int pio_program_has_no_define_of_that_name(std::string_view) { return 0; }
+    inline int pioProgramHasNoDefineOfThatName(std::string_view) { return 0; }
 
     // The Program concept as a type: what a pioasm `-o kvasir` header provides, from a value.
     template<Assembled A>
     struct Program {
-        // As a named constant, so that clang's diagnostic reads "requirement 'Ok': line 6: ..."
+        // As a named constant, so that clang's diagnostic reads "requirement 'Ok': blink.hpp:12: ..."
         // instead of printing the whole assembled value first
-        static constexpr bool Ok = A.ok();
-        static_assert(Ok,
+        static constexpr bool ok = A.ok();
+        static_assert(ok,
                       A.message());
 
-        static constexpr std::array<std::uint16_t, A.length> Instructions = [] {
+        static constexpr std::array<std::uint16_t, A.length> instructions = [] {
             std::array<std::uint16_t, A.length> r{};
             std::copy_n(A.words.begin(), A.length, r.begin());
             return r;
         }();
-        static constexpr int  WrapTarget      = A.wrapTarget;
-        static constexpr int  Wrap            = A.wrap;
-        static constexpr int  PioVersion      = A.pioVersion;
-        static constexpr int  Origin          = A.origin;
-        static constexpr int  SidesetCount    = A.sidesetCount;
-        static constexpr bool SidesetOptional = A.sidesetOpt;
-        static constexpr bool SidesetPindirs  = A.sidesetPindirs;
+        static constexpr int  wrapTarget      = A.wrapTarget;
+        static constexpr int  wrap            = A.wrap;
+        static constexpr int  pioVersion      = A.pioVersion;
+        static constexpr int  origin          = A.origin;
+        static constexpr int  sidesetCount    = A.sidesetCount;
+        static constexpr bool sidesetOptional = A.sidesetOpt;
+        static constexpr bool sidesetPindirs  = A.sidesetPindirs;
         // pioasm's other fields, with its names
-        static constexpr int  ClockDivInt    = A.clockDivInt;
-        static constexpr int  ClockDivFrac   = A.clockDivFrac;
-        static constexpr int  FifoMode       = A.fifo;
-        static constexpr int  UsedGpioRanges = A.usedGpioRanges;
-        static constexpr int  MovStatusType  = A.movStatusType;
-        static constexpr int  MovStatusN     = A.movStatusN;
-        static constexpr int  SetCount       = A.setCount;
-        static constexpr int  InPinCount     = A.inPinCount;
-        static constexpr bool InRight        = A.inRight;
-        static constexpr bool InAutoP        = A.inAuto;
-        static constexpr int  InThreshold    = A.inThreshold;
-        static constexpr int  OutPinCount    = A.outPinCount;
-        static constexpr bool OutRight       = A.outRight;
-        static constexpr bool OutAutoP       = A.outAuto;
-        static constexpr int  OutThreshold   = A.outThreshold;
+        static constexpr int  clockDivInt    = A.clockDivInt;
+        static constexpr int  clockDivFrac   = A.clockDivFrac;
+        static constexpr int  fifoMode       = A.fifo;
+        static constexpr int  usedGpioRanges = A.usedGpioRanges;
+        static constexpr int  movStatusType  = A.movStatusType;
+        static constexpr int  movStatusN     = A.movStatusN;
+        static constexpr int  setCount       = A.setCount;
+        static constexpr int  inPinCount     = A.inPinCount;
+        static constexpr bool inRight        = A.inRight;
+        static constexpr bool inAutoP        = A.inAuto;
+        static constexpr int  inThreshold    = A.inThreshold;
+        static constexpr int  outPinCount    = A.outPinCount;
+        static constexpr bool outRight       = A.outRight;
+        static constexpr bool outAutoP       = A.outAuto;
+        static constexpr int  outThreshold   = A.outThreshold;
 
         static constexpr Assembled const& assembled() { return A; }
 
@@ -1019,16 +993,16 @@ namespace Kvasir { namespace Pio {
         static consteval std::uint8_t offset(std::string_view label) {
             auto const i = A.indexOf(label);
             if(i == A.symbolCount || !A.symbols[i].isLabel) {
-                return pio_program_has_no_label_of_that_name(label);
+                return pioProgramHasNoLabelOfThatName(label);
             }
             return static_cast<std::uint8_t>(A.symbols[i].value);
         }
 
-        // A `.define`'s value (or one given from C++ to parse()).
+        // A `define()`'s value.
         static consteval int define(std::string_view name) {
             auto const i = A.indexOf(name);
             if(i == A.symbolCount || A.symbols[i].isLabel) {
-                return pio_program_has_no_define_of_that_name(name);
+                return pioProgramHasNoDefineOfThatName(name);
             }
             return A.symbols[i].value;
         }

@@ -1,9 +1,14 @@
 #pragma once
 
 #include "PinConfig.hpp"
+#include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "chip/Interrupt.hpp"
+#include "chip/PinConfig.hpp"
 #include "core/core.hpp"
+#include "kvasir/Atomic/CriticalSection.hpp"
+#include "kvasir/Hal/Dma.hpp"
 #include "kvasir/StartUp/Resources.hpp"
+#include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 #include "peripherals/DMA.hpp"
 #include "peripherals/RESETS.hpp"
@@ -40,7 +45,7 @@ namespace Kvasir { namespace DMA {
 
     using TriggerSource = Kvasir::Peripheral::DMA::Registers<>::CH<0>::CTRL_TRIG::TREQ_SELVal;
 
-    enum class DMATransferSize { _8 = 0, _16 = 1, _32 = 2 };
+    enum class DMATransferSize { size8 = 0, size16 = 1, size32 = 2 };
 
     // An explicit channel set for a DmaBase instance: `static constexpr auto channels =
     // Channels<DMAChannel::ch0, DMAChannel::ch5>{};`. With it, the interrupt-enable mask is
@@ -57,21 +62,22 @@ namespace Kvasir { namespace DMA {
     // line(s) it answers; a driver claims the channels it starts transfers on. Startup then
     // refuses two instances that overlap, two drivers on one channel, a driver whose
     // instance is in no list, and a driver whose instance is in the other core's list.
-    struct ChannelResourceTag {
-        static constexpr char const* describeAs = "DMA channel";   // in a compile error
-    };
-
+    // The channels are the SDK's Hal::DmaChannel<the controller, channel> (kvasir/Hal/Dma.hpp);
+    // the lines are this chip's own (a SAM DMAC has one vector).
     struct LineResourceTag {
         static constexpr char const* describeAs = "DMA interrupt line";
     };
-
-    template<unsigned Channel>
-    using ChannelResource = Kvasir::Startup::Resource<ChannelResourceTag, Channel>;
 
     template<unsigned Line>
     using LineResource = Kvasir::Startup::Resource<LineResourceTag, Line>;
 
     namespace Detail {
+        // The counted layout as a channel set: the first N channels.
+        template<std::size_t... Is>
+        consteval auto firstChannels(std::index_sequence<Is...>) {
+            return Channels<static_cast<DMAChannel>(Is)...>{};
+        }
+
         template<std::uint32_t Mask, typename Seq>
         struct ChannelsFromMask;
 
@@ -79,7 +85,8 @@ namespace Kvasir { namespace DMA {
         struct ChannelsFromMask<Mask, std::index_sequence<Is...>> {
             using type = brigand::flatten<brigand::list<
               std::conditional_t<((Mask >> Is) & 1U) != 0,
-                                 brigand::list<ChannelResource<static_cast<unsigned>(Is)>>,
+                                 brigand::list<Hal::DmaChannel<Kvasir::Peripheral::DMA::Registers<>,
+                                                               static_cast<unsigned>(Is)>>,
                                  brigand::list<>>...>>;
         };
 
@@ -114,23 +121,24 @@ namespace Kvasir { namespace DMA {
         static_assert(Detail::allDistinct(std::array<unsigned,
                                                      sizeof...(Cs)>{static_cast<unsigned>(Cs)...}),
                       "a driver names the same DMA channel twice");
-        using type = brigand::list<ChannelResource<static_cast<unsigned>(Cs)>...>;
+        using type = brigand::list<
+          Hal::DmaChannel<Kvasir::Peripheral::DMA::Registers<>, static_cast<unsigned>(Cs)>...>;
     };
 
     template<typename Dma, typename Dma::Channel... Cs>
     using Claims = typename ClaimsFor<Dma, Cs...>::type;
 
-    // Everything a channel's CTRL register says, as one value: what start<>() takes as
-    // template parameters plus the parts it fixes - which channel to chain to when done
-    // (`chainTo`, -1 = none), whether completion raises the interrupt (`irqQuiet` inverts
-    // that: the interrupt comes from a null trigger instead, the end of a control-block
-    // chain), an address wrap (`ringBits` = log2 of the ring in bytes, on the read or the
+    // Everything a channel's CTRL register says, as one value, for every transfer: start<>(),
+    // retrigger<>(), configure<>() and control blocks take it - priority, pacing trigger, size,
+    // address increments, which channel to chain to when done (`chainTo`, -1 = none),
+    // whether completion raises the interrupt (`irqQuiet` inverts that: the interrupt comes
+    // from a null trigger instead, the end of a control-block chain), an address wrap (`ringBits` = log2 of the ring in bytes, on the read or the
     // write address), the sniffer, a byte swap. A structural type, so it can be a template
     // argument and a control block's CTRL word can be computed at compile time.
     struct ChannelConfig {
         DMAPriority     priority       = DMAPriority::low;
         TriggerSource   trigger        = TriggerSource::permanent;
-        DMATransferSize size           = DMATransferSize::_32;
+        DMATransferSize size           = DMATransferSize::size32;
         bool            incrementRead  = true;
         bool            incrementWrite = true;
         int             chainTo        = -1;
@@ -165,60 +173,43 @@ namespace Kvasir { namespace DMA {
         // numberOfChannels
 
         struct DMAConfig : DMAConfig_ {
-            static constexpr auto callbackFunctionSize = [] {
-                if constexpr(requires { DMAConfig_::callbackFunctionSize; }) {
-                    return DMAConfig_::callbackFunctionSize;
-                } else {
-                    return 0;
-                }
-            }();
+            static constexpr auto callbackFunctionSize
+              = KVASIR_CONFIG_OR(DMAConfig_, callbackFunctionSize, 0);
 
-            static constexpr auto isrPriority = [] {
-                if constexpr(requires { DMAConfig_::isrPriority; }) {
-                    return DMAConfig_::isrPriority;
-                } else {
-                    // 3, like every other driver's default; 0 would be level with SysTick.
-                    return 3;
-                }
-            }();
+            // 3, like every other driver's default; 0 would be level with SysTick.
+            static constexpr auto isrPriority = KVASIR_CONFIG_OR(DMAConfig_, isrPriority, 3);
 
-            // Either an explicit `channels` set or the legacy "first numberOfChannels".
+            // Either an explicit `channels` set or the counted layout, the first numberOfChannels, made into that set
+            // here: everything below reads `channels`.
             static constexpr bool hasChannels = requires { DMAConfig_::channels; };
+            static_assert(
+              hasChannels || requires { DMAConfig_::numberOfChannels; },
+              "DMA config needs numberOfChannels or channels");
 
-            static constexpr auto numberOfChannels = [] {
-                if constexpr(requires { DMAConfig_::numberOfChannels; }) {
-                    return DMAConfig_::numberOfChannels;
-                } else {
-                    static_assert(hasChannels, "DMA config needs numberOfChannels or channels");
-                    return std::remove_cvref_t<decltype(DMAConfig_::channels)>::count;
-                }
-            }();
+            static constexpr auto channels = KVASIR_CONFIG_OR(
+              DMAConfig_,
+              channels,
+              Detail::firstChannels(
+                std::make_index_sequence<std::size_t{DMAConfig_::numberOfChannels}>{}));
+
+            static constexpr auto numberOfChannels
+              = KVASIR_CONFIG_OR(DMAConfig_,
+                                 numberOfChannels,
+                                 std::remove_cvref_t<decltype(channels)>::count);
 
             // Which of the controller's interrupt lines (DMA_IRQ_0..3 on the RP2350) this
-            // instance owns. Absent means the legacy behaviour: INTE0 and every line.
+            // instance owns. Absent: INTE0 and every line (one instance for the whole controller).
             static constexpr bool hasInterruptInstance
               = requires { DMAConfig_::interruptInstance; };
 
-            static constexpr unsigned interruptInstance = [] {
-                if constexpr(hasInterruptInstance) {
-                    return static_cast<unsigned>(DMAConfig_::interruptInstance);
-                } else {
-                    return 0U;
-                }
-            }();
+            static constexpr unsigned interruptInstance
+              = static_cast<unsigned>(KVASIR_CONFIG_OR(DMAConfig_, interruptInstance, 0U));
 
-            static constexpr std::uint32_t interruptMask = [] {
-                if constexpr(hasChannels) {
-                    return std::remove_cvref_t<decltype(DMAConfig_::channels)>::mask;
-                } else {
-                    // Bits 0..N-1 (maskFromRange is inclusive at both ends).
-                    return static_cast<std::uint32_t>(
-                      Register::maskFromRange(DMAConfig_::numberOfChannels - 1, 0));
-                }
-            }();
+            static constexpr std::uint32_t interruptMask
+              = std::remove_cvref_t<decltype(channels)>::mask;
         };
 
-        using Traits = PinConfig::DmaTraits<PinConfig::CurrentChip>;
+        using Traits = PinConfig::DmaTraits<Chip::part>;
 
         static_assert(DMAConfig::numberOfChannels > 0,
                       "a DMA instance needs at least one channel");
@@ -229,15 +220,15 @@ namespace Kvasir { namespace DMA {
 
         static constexpr std::size_t numberOfChannels{DMAConfig::numberOfChannels};
 
-        // Whether this instance owns a channel: one of its explicit `channels`, or below
-        // numberOfChannels in the legacy layout. What a driver should assert about the
+        // Whether this instance owns a channel: one of its `channels` (explicit, or the first
+        // numberOfChannels). What a driver should assert about the
         // channel it is handed, since with an explicit set the channel numbers and the
         // count no longer say anything about each other.
         static constexpr bool ownsChannel(DMAChannel c) {
             return ((DMAConfig::interruptMask >> static_cast<unsigned>(c)) & 1U) != 0;
         }
 
-        // Callback slots are indexed by channel number. The legacy layout ("first N
+        // Callback slots are indexed by channel number. The counted layout ("first N
         // channels") needs exactly N; an explicit set can name any channel, so it gets one
         // slot per hardware channel.
         static constexpr std::size_t callbackSlots
@@ -252,34 +243,24 @@ namespace Kvasir { namespace DMA {
         using Regs = Kvasir::Peripheral::DMA::Registers<>;
 
     private:
-        // The interrupt-enable and status registers of one line. `R` keeps the lookup
-        // dependent so a chip with fewer lines (RP2040: two) never sees INTE2/INTE3.
-        template<unsigned N,
-                 typename R = Regs>
+        // The interrupt-enable and status registers of one line (INTEn / INTSn, one field each: inte<n> / ints<n>),
+        // as many as the chip has lines (RP2040 two, RP2350 four).
+#ifdef KVASIR_CHIP_RP2040
+        using LineEnables  = brigand::list<Regs::INTE0, Regs::INTE1>;
+        using LineStatuses = brigand::list<Regs::INTS0, Regs::INTS1>;
+#else
+        using LineEnables  = brigand::list<Regs::INTE0, Regs::INTE1, Regs::INTE2, Regs::INTE3>;
+        using LineStatuses = brigand::list<Regs::INTS0, Regs::INTS1, Regs::INTS2, Regs::INTS3>;
+#endif
+
+        template<unsigned N>
         static constexpr auto inteField() {
-            if constexpr(N == 0) {
-                return R::INTE0::inte0;
-            } else if constexpr(N == 1) {
-                return R::INTE1::inte1;
-            } else if constexpr(N == 2) {
-                return R::INTE2::inte2;
-            } else {
-                return R::INTE3::inte3;
-            }
+            return Register::fieldAt<0>(brigand::at_c<LineEnables, N>{});
         }
 
-        template<unsigned N,
-                 typename R = Regs>
+        template<unsigned N>
         static constexpr auto intsField() {
-            if constexpr(N == 0) {
-                return R::INTS0::ints0;
-            } else if constexpr(N == 1) {
-                return R::INTS1::ints1;
-            } else if constexpr(N == 2) {
-                return R::INTS2::ints2;
-            } else {
-                return R::INTS3::ints3;
-            }
+            return Register::fieldAt<0>(brigand::at_c<LineStatuses, N>{});
         }
 
     public:
@@ -289,23 +270,23 @@ namespace Kvasir { namespace DMA {
         using TransferSize  = ::Kvasir::DMA::DMATransferSize;
 
         // Helper to get chip-specific DMA interrupt list
-        template<PinConfig::ChipVariant Chip>
+        template<Chip::Part P>
         static constexpr auto getDmaInterrupts() {
-            return PinConfig::DmaTraits<Chip>::Interrupts;
+            return PinConfig::DmaTraits<P>::interrupts;
         }
 
-        using AllInterruptIndexs = decltype(getDmaInterrupts<PinConfig::CurrentChip>());
+        using AllInterruptIndexs = decltype(getDmaInterrupts<Chip::part>());
 
-        // Legacy: this instance answers every line. With interruptInstance: just its own,
+        // Without interruptInstance this instance answers every line; with it just its own,
         // so the line can be enabled in one core's NVIC and nothing else's.
         using InterruptIndexs = std::conditional_t<
           DMAConfig::hasInterruptInstance,
           brigand::list<brigand::at_c<AllInterruptIndexs, DMAConfig::interruptInstance>>,
           AllInterruptIndexs>;
 
-        // Startup resources: the owned channels and the answered line(s). A legacy instance
-        // provides every line, so a second instance next to it is a build error - the
-        // intended one, since its ISR would never reach the vector table.
+        // Startup resources: the owned channels and the answered line(s). An instance without
+        // interruptInstance provides every line, so a second instance next to it is a build
+        // error - the intended one, since its ISR would never reach the vector table.
         using Provides = brigand::append<
           typename Detail::ChannelsFromMask<DMAConfig::interruptMask,
                                             std::make_index_sequence<Traits::channelCount>>::type,
@@ -318,8 +299,7 @@ namespace Kvasir { namespace DMA {
 
         // Unconditional on purpose: FirstInitStep asserts the controller reset, and the
         // instance that clears it may well be the only one, on whichever core.
-        static constexpr auto powerClockEnable
-          = list(clear(Kvasir::Peripheral::RESETS::Registers<>::RESET::dma));
+        static constexpr auto powerClockEnable = list(clear(Rp::Block<Regs>::reset));
 
         // A full write, not a set of bits: Startup guarantees one instance per line
         // (Provides above), so nothing else's mask is in this register.
@@ -333,13 +313,46 @@ namespace Kvasir { namespace DMA {
 
         static constexpr auto initStepPeripheryEnable = list(Nvic::makeEnable(InterruptIndexs{}));
 
-        template<typename T>
-        struct Fail {
-            static_assert(!std::is_void_v<T>,
-                          "DMA callback not configured");
-        };
+        /// The controller set up again after a reset under its users: RESETS.DMA held, or pulsed, puts every channel
+        /// and INTEn back to their reset values (INTE0 resets to 0, RP2040 datasheet Table 138 md l.5531, RP2350
+        /// Table 1165 md l.55015: no completion interrupt any more). Out of reset (RESET_DONE
+        /// waited for) and this instance's interrupt enable written as at startup - except the bits an abort() holds
+        /// clear right now (RP2040-E13, abort()'s comment): enabled mid-abort, the late completion of an aborted
+        /// channel would reach its callback once more. True if it had to write. The transfers that ran are gone: each
+        /// user starts its own again (the UARTs' transmit watches call this; a reader's look only when the DMA is
+        /// held in reset or its own channel's bit is gone, completionEnabled()). The NVIC is no part of the block and
+        /// keeps its enable.
+        static bool setUpAgainIfReset() {
+            bool const reset = apply(read(Rp::Block<Regs>::reset)) != 0;
+            if(reset) {
+                apply(powerClockEnable);
+                Rp::Block<Regs>::waitResetDone();
+            }
+            return Kvasir::criticalSection<InteTag>([reset] {
+                constexpr auto      inte = inteField<DMAConfig::interruptInstance>();
+                std::uint32_t const want = DMAConfig::interruptMask & ~abortHeld_;
+                if(!reset && (get<0>(apply(read(inte))) & want) == want) { return false; }
+                // the held bits read 0 already: abort() cleared them in this section
+                apply(write(inte, want));
+                return true;
+            });
+        }
+
+        /// Whether `Channel`'s completion raises this instance's line: its bit in INTEn (a DMA reset clears it, so does
+        /// an abort() of the channel while it runs). The DMA must be out of reset.
+        template<DMAChannel Channel>
+        static bool completionEnabled() {
+            constexpr auto inte = inteField<DMAConfig::interruptInstance>();
+            return (get<0>(apply(read(inte))) & (1U << static_cast<unsigned>(Channel))) != 0;
+        }
 
     private:
+        // INTEn's read-modify-writes - abort()'s clear and restore, setUpAgainIfReset()'s repair - exclude each other
+        // under this tag, on both cores; abortHeld_ (guarded by it) names the channels an abort() holds out of INTEn.
+        struct InteTag {};
+
+        inline static std::uint32_t abortHeld_{};
+
         // Called right before every register write that can start a channel. The callback slot
         // and the buffers a transfer reads are plain memory, the trigger a volatile store, and
         // the compiler may move plain stores after a volatile one: clang put the invoker's store
@@ -348,94 +361,63 @@ namespace Kvasir { namespace DMA {
         // lost for good. One core: ordering the compiler is all it takes.
         static void beforeTrigger() { std::atomic_signal_fence(std::memory_order_seq_cst); }
 
-        // Register writes only, no callback state: shared tail of start() and retrigger().
-        template<DMAChannel      Channel,
-                 DMAPriority     Priority,
-                 TriggerSource   Trigger,
-                 DMATransferSize Size,
-                 bool            IncDest,
-                 bool            IncSource>
-        static void configureAndTrigger(std::uint32_t dest,
-                                        std::uint32_t source,
-                                        std::size_t   count) {
-            using CHRegs = Regs::CH<static_cast<int>(Channel)>;
+        // The callback slot of `Channel`: `f` published, or emptied for std::nullopt (shared by start() and
+        // configure()).
+        template<DMAChannel Channel,
+                 typename F>
+        static void installCallback(F&& f) {
+            if constexpr(!std::is_same_v<std::remove_cvref_t<F>, std::nullopt_t>) {
+                static_assert(DMAConfig::callbackFunctionSize > 0, "DMA callback not configured");
+                callbackFunctions[static_cast<std::size_t>(Channel)].publish(std::forward<F>(f));
+            } else if constexpr(DMAConfig::callbackFunctionSize > 0) {
+                callbackFunctions[static_cast<std::size_t>(Channel)].reset();
+            }
+        }
+
+        // Register writes only, no callback state: shared tail of start() and retrigger(). One apply per
+        // register keeps the program order; CTRL_TRIG, the trigger, is written last.
+        template<DMAChannel    Channel,
+                 ChannelConfig Cfg>
+        static void program(std::uint32_t dest,
+                            std::uint32_t source,
+                            std::size_t   count) {
+            using CHRegs = typename Regs::template CH<static_cast<unsigned>(Channel)>;
 
             beforeTrigger();
             apply(write(CHRegs::READ_ADDR::read_addr, source));
             apply(write(CHRegs::WRITE_ADDR::write_addr, dest));
-            apply(write(CHRegs::TRANS_COUNT::trans_count, count));
-
-            using ctrl = typename CHRegs::CTRL_TRIG;
-
-            apply(ctrl::overrideDefaults(
-              write(ctrl::treq_sel,
-                    Register::value<typename ctrl::TREQ_SELVal,
-                                    static_cast<typename ctrl::TREQ_SELVal>(Trigger)>()),
-              write(ctrl::chain_to, Register::value<static_cast<int>(Channel)>()),
-              set(ctrl::sniff_en),
-              write(ctrl::incr_write, Register::value<IncDest ? 1 : 0>()),
-              write(ctrl::incr_read, Register::value<IncSource ? 1 : 0>()),
-              write(ctrl::data_size,
-                    Register::value<typename ctrl::DATA_SIZEVal,
-                                    static_cast<typename ctrl::DATA_SIZEVal>(Size)>()),
-              write(ctrl::high_priority, Register::value<Priority == DMAPriority::high ? 1 : 0>()),
-              set(ctrl::en)));
+            apply(write(CHRegs::TRANS_COUNT::trans_count, static_cast<std::uint32_t>(count)));
+            apply(write(CHRegs::CTRL_TRIG::FULLREGISTER,
+                        Register::value<controlWord<Channel, Cfg>()>()));
         }
 
     public:
-        template<DMAChannel      Channel,
-                 DMAPriority     Priority,
-                 TriggerSource   Trigger,
-                 DMATransferSize Size,
-                 bool            IncDest,
-                 bool            IncSource,
+        /// Program `Channel` for `Cfg` and start it (CTRL_TRIG): `count` transfers from `source` to `dest`.
+        /// `f` runs on completion; std::nullopt clears the channel's callback.
+        template<DMAChannel    Channel,
+                 ChannelConfig Cfg,
                  typename F>
         static void start(std::uint32_t dest,
                           std::uint32_t source,
                           std::size_t   count,
                           F&&           f) {
-            if constexpr(!std::is_same_v<std::remove_cvref_t<F>, std::nullopt_t>) {
-                if constexpr(DMAConfig::callbackFunctionSize > 0) {
-                    callbackFunctions[static_cast<std::size_t>(Channel)].publish(
-                      std::forward<F>(f));
-                } else {
-                    Fail<void>{};
-                }
-            } else {
-                if constexpr(DMAConfig::callbackFunctionSize > 0) {
-                    callbackFunctions[static_cast<std::size_t>(Channel)].reset();
-                }
-            }
-
-            configureAndTrigger<Channel, Priority, Trigger, Size, IncDest, IncSource>(dest,
-                                                                                      source,
-                                                                                      count);
+            installCallback<Channel>(std::forward<F>(f));
+            program<Channel, Cfg>(dest, source, count);
         }
 
-        template<DMAChannel      Channel,
-                 DMAPriority     Priority,
-                 TriggerSource   Trigger,
-                 DMATransferSize Size,
-                 bool            IncDest,
-                 bool            IncSource>
+        template<DMAChannel    Channel,
+                 ChannelConfig Cfg>
         static void start(std::uint32_t dest,
                           std::uint32_t source,
                           std::size_t   count) {
-            start<Channel, Priority, Trigger, Size, IncDest, IncSource>(dest,
-                                                                        source,
-                                                                        count,
-                                                                        std::nullopt);
+            start<Channel, Cfg>(dest, source, count, std::nullopt);
         }
 
-        // Memory to memory with the buffers as spans: the count is the source's size, the
-        // element width is checked against Size, and the destination must hold the source.
-        // Returns false, with nothing started, when it does not.
-        template<DMAChannel      Channel,
-                 DMAPriority     Priority,
-                 TriggerSource   Trigger,
-                 DMATransferSize Size,
-                 bool            IncDest,
-                 bool            IncSource,
+        // With the buffers as spans: the count is the source's size, the element width is checked against
+        // Cfg.size, and the destination must hold the source. Returns false, with nothing started, when it
+        // does not.
+        template<DMAChannel    Channel,
+                 ChannelConfig Cfg,
                  typename T,
                  typename U,
                  typename F = std::nullopt_t>
@@ -443,44 +425,28 @@ namespace Kvasir { namespace DMA {
                                         std::span<U> source,
                                         F&&          f = std::nullopt) {
             static_assert(sizeof(T) == sizeof(U), "source and destination element widths differ");
-            static_assert(sizeof(T) == (1U << static_cast<unsigned>(Size)),
+            static_assert(sizeof(T) == (1U << static_cast<unsigned>(Cfg.size)),
                           "element width does not match the transfer size");
             if(dest.size() < source.size()) { return false; }
-            start<Channel, Priority, Trigger, Size, IncDest, IncSource>(
-              std::bit_cast<std::uint32_t>(dest.data()),
-              std::bit_cast<std::uint32_t>(source.data()),
-              source.size(),
-              std::forward<F>(f));
+            start<Channel, Cfg>(std::bit_cast<std::uint32_t>(dest.data()),
+                                std::bit_cast<std::uint32_t>(source.data()),
+                                source.size(),
+                                std::forward<F>(f));
             return true;
         }
 
         // Re-trigger without reinstalling the callback, for re-arming from inside
         // it. Needs a prior start(); abort() clears the callback.
-        template<DMAChannel      Channel,
-                 DMAPriority     Priority,
-                 TriggerSource   Trigger,
-                 DMATransferSize Size,
-                 bool            IncDest,
-                 bool            IncSource>
+        template<DMAChannel    Channel,
+                 ChannelConfig Cfg>
         static void retrigger(std::uint32_t dest,
                               std::uint32_t source,
                               std::size_t   count) {
-            configureAndTrigger<Channel, Priority, Trigger, Size, IncDest, IncSource>(dest,
-                                                                                      source,
-                                                                                      count);
+            program<Channel, Cfg>(dest, source, count);
         }
 
         // ---- channels as descriptors: chains, control blocks, ad hoc transfers ------------
 
-    private:
-        template<typename Field>
-        static constexpr std::uint32_t encode(std::uint32_t v) {
-            constexpr std::uint32_t mask
-              = Register::Detail::GetMask<std::remove_cvref_t<Field>>::value;
-            return (v << std::countr_zero(mask)) & mask;
-        }
-
-    public:
         /// The CTRL word of `Channel` for `Cfg`, with the enable bit set: what a control
         /// block that reprograms a channel's CTRL carries, and what configure() writes.
         template<DMAChannel    Channel,
@@ -492,19 +458,19 @@ namespace Kvasir { namespace DMA {
             static_assert(Cfg.ringBits <= 15, "a DMA address ring is at most 2^15 bytes");
             std::uint32_t const chain = Cfg.chainTo < 0 ? static_cast<std::uint32_t>(Channel)
                                                         : static_cast<std::uint32_t>(Cfg.chainTo);
-            return encode<decltype(ctrl::en)>(1U)
-                 | encode<decltype(ctrl::high_priority)>(Cfg.priority == DMAPriority::high ? 1U
-                                                                                           : 0U)
-                 | encode<decltype(ctrl::data_size)>(static_cast<std::uint32_t>(Cfg.size))
-                 | encode<decltype(ctrl::incr_read)>(Cfg.incrementRead ? 1U : 0U)
-                 | encode<decltype(ctrl::incr_write)>(Cfg.incrementWrite ? 1U : 0U)
-                 | encode<decltype(ctrl::ring_size)>(Cfg.ringBits)
-                 | encode<decltype(ctrl::ring_sel)>(Cfg.ringOnWrite ? 1U : 0U)
-                 | encode<decltype(ctrl::chain_to)>(chain)
-                 | encode<decltype(ctrl::treq_sel)>(static_cast<std::uint32_t>(Cfg.trigger))
-                 | encode<decltype(ctrl::irq_quiet)>(Cfg.irqQuiet ? 1U : 0U)
-                 | encode<decltype(ctrl::bswap)>(Cfg.byteSwap ? 1U : 0U)
-                 | encode<decltype(ctrl::sniff_en)>(Cfg.sniff ? 1U : 0U);
+            return Register::deposit(ctrl::en, 1U)
+                 | Register::deposit(ctrl::high_priority,
+                                     Cfg.priority == DMAPriority::high ? 1U : 0U)
+                 | Register::deposit(ctrl::data_size, static_cast<std::uint32_t>(Cfg.size))
+                 | Register::deposit(ctrl::incr_read, Cfg.incrementRead ? 1U : 0U)
+                 | Register::deposit(ctrl::incr_write, Cfg.incrementWrite ? 1U : 0U)
+                 | Register::deposit(ctrl::ring_size, Cfg.ringBits)
+                 | Register::deposit(ctrl::ring_sel, Cfg.ringOnWrite ? 1U : 0U)
+                 | Register::deposit(ctrl::chain_to, chain)
+                 | Register::deposit(ctrl::treq_sel, static_cast<std::uint32_t>(Cfg.trigger))
+                 | Register::deposit(ctrl::irq_quiet, Cfg.irqQuiet ? 1U : 0U)
+                 | Register::deposit(ctrl::bswap, Cfg.byteSwap ? 1U : 0U)
+                 | Register::deposit(ctrl::sniff_en, Cfg.sniff ? 1U : 0U);
         }
 
         /// Program `Channel` without starting it: addresses, count and CTRL through the
@@ -518,12 +484,7 @@ namespace Kvasir { namespace DMA {
                               std::size_t   count,
                               F&&           f) {
             using CHRegs = typename Regs::template CH<static_cast<unsigned>(Channel)>;
-            if constexpr(!std::is_same_v<std::remove_cvref_t<F>, std::nullopt_t>) {
-                static_assert(DMAConfig::callbackFunctionSize > 0, "DMA callback not configured");
-                callbackFunctions[static_cast<std::size_t>(Channel)].publish(std::forward<F>(f));
-            } else if constexpr(DMAConfig::callbackFunctionSize > 0) {
-                callbackFunctions[static_cast<std::size_t>(Channel)].reset();
-            }
+            installCallback<Channel>(std::forward<F>(f));
             beforeTrigger();   // AL1_CTRL enables it: a running channel may chain to it at once
             apply(write(CHRegs::READ_ADDR::read_addr, source));
             apply(write(CHRegs::WRITE_ADDR::write_addr, dest));
@@ -572,7 +533,7 @@ namespace Kvasir { namespace DMA {
             static_assert(Ctrl != Data, "a control channel cannot feed itself");
             constexpr ChannelConfig ctrlCfg{.priority       = DMAPriority::high,
                                             .trigger        = TriggerSource::permanent,
-                                            .size           = DMATransferSize::_32,
+                                            .size           = DMATransferSize::size32,
                                             .incrementRead  = true,
                                             .incrementWrite = true,
                                             .chainTo        = -1,
@@ -603,10 +564,21 @@ namespace Kvasir { namespace DMA {
             startControlBlocks<Ctrl, Data, DataCfg>(dest, blocks, std::nullopt);
         }
 
+        /// Whether `Channel` is idle (CTRL.BUSY clear): its transfer done or aborted, safe to start again.
         template<DMAChannel Channel>
         static bool ready() {
-            using CHRegs = Regs::CH<static_cast<int>(Channel)>;
+            using CHRegs = typename Regs::template CH<static_cast<unsigned>(Channel)>;
             return !apply(read(CHRegs::CTRL_TRIG::busy));
+        }
+
+        /// Whether `Channel`'s completion is raised on this instance's line and not handled yet: its bit in INTSn,
+        /// "active channel interrupt requests which are currently causing IRQ n to be asserted" (RP2040 datasheet
+        /// Table 140 md l.5577, RP2350 Table 1167 md l.55058). With interrupts held off, a finished transfer reads so
+        /// until onIsr() runs; a channel whose interrupt enable was lost never does.
+        template<DMAChannel Channel>
+        static bool completionPending() {
+            constexpr auto ints = intsField<DMAConfig::interruptInstance>();
+            return (get<0>(apply(read(ints))) & (1U << static_cast<unsigned>(Channel))) != 0;
         }
 
         // Transfers this channel still has to do. Diagnostic: busy with a
@@ -614,8 +586,47 @@ namespace Kvasir { namespace DMA {
         // shows.
         template<DMAChannel Channel>
         static std::uint32_t remaining() {
-            using CHRegs = Regs::CH<static_cast<int>(Channel)>;
+            using CHRegs = Regs::CH<static_cast<unsigned>(Channel)>;
             return get<0>(apply(read(CHRegs::TRANS_COUNT::trans_count)));
+        }
+
+        /// The next address `Channel` reads: READ_ADDR "updates automatically each time a read completes" (RP2040
+        /// datasheet Table 121 md l.5358, RP2350 Table 1148 md l.54800). After the last read of a sequence that
+        /// increments it, the sequence's end; 0 after a DMA reset (its reset value).
+        template<DMAChannel Channel>
+        static std::uint32_t readAddress() {
+            using CHRegs = Regs::CH<static_cast<unsigned>(Channel)>;
+            return get<0>(apply(read(CHRegs::READ_ADDR::read_addr)));
+        }
+
+        /// One read of `Channel`'s CTRL: EN, BUSY and RING_SIZE. A DMA reset puts RING_SIZE and EN to 0 (RP2040
+        /// datasheet Table 124 md l.5436 / l.5448, RP2350 Table 1151 md l.54890 / l.54915): a ring channel's RING_SIZE
+        /// then reads 0, which tells a channel that was reset from one that was only paused (EN cleared) or aborted.
+        struct ChannelState {
+            bool     enabled;
+            bool     busy;
+            unsigned ringBits;
+        };
+
+        template<DMAChannel Channel>
+        static ChannelState channelState() {
+            using ctrl   = typename Regs::template CH<static_cast<unsigned>(Channel)>::CTRL_TRIG;
+            auto const r = apply(read(ctrl::en, ctrl::busy, ctrl::ring_size));
+            return {static_cast<bool>(r.template get<0>()),
+                    static_cast<bool>(r.template get<1>()),
+                    static_cast<unsigned>(r.template get<2>())};
+        }
+
+        /// Whether `Channel`'s callback slot holds a function. abort() empties it; a driver that keeps one callback
+        /// for every transfer (retrigger) installs it again only then, so no slot is written while a completion of the
+        /// same channel may be calling it.
+        template<DMAChannel Channel>
+        static bool hasCallback() {
+            if constexpr(DMAConfig::callbackFunctionSize > 0) {
+                return static_cast<bool>(callbackFunctions[static_cast<std::size_t>(Channel)]);
+            } else {
+                return false;
+            }
         }
 
         /// Restart an idle `Channel` for `count` transfers from where its addresses are now (a ring channel goes on
@@ -625,14 +636,14 @@ namespace Kvasir { namespace DMA {
         /// TRANS_COUNT.MODE (31:28) to 0, NORMAL (12.6.2.2.1): `count` must stay below 2^28 there.
         template<DMAChannel Channel>
         static void rearm(std::uint32_t count) {
-            using CHRegs = Regs::CH<static_cast<int>(Channel)>;
+            using CHRegs = Regs::CH<static_cast<unsigned>(Channel)>;
             beforeTrigger();
             apply(write(CHRegs::AL1_TRANS_COUNT_TRIG::FULLREGISTER, count));
         }
 
         // The FIFOs drain in a few cycles; hitting this bound means the channel
         // is wedged beyond what an abort can fix.
-        static constexpr int AbortPollLimit = 10000;
+        static constexpr int abortPollLimit = 10000;
 
         // Terminate the transfer sequences in progress on `Cs` and leave them safe to
         // restart. Needed by any error, timeout or reset path: dropping a transfer does not
@@ -645,7 +656,10 @@ namespace Kvasir { namespace DMA {
         //   CHAN_ABORT clears before in-flight transfers land, and their completion then
         //   asserts the channel's interrupt. So the interrupt enable is cleared first,
         //   CTRL.BUSY is polled (not only CHAN_ABORT), the spurious flag is cleared, and
-        //   the enable restored.
+        //   the enable restored. The clear holds those bits (abortHeld_) until the restore, so no repair of INTEn
+        //   (setUpAgainIfReset(), from another context or core) enables them mid-abort, and the restore sets back the
+        //   aborted channels' bits only - another abort's held bits stay clear (one abort per channel at a time: a
+        //   channel's driver aborts it).
         // - RP2350-E5 (RP2350 datasheet 12.6.8.3 and errata, md l.54201, l.66506-66520): an
         //   aborted channel can fire its CHAIN_TO and be re-triggered on the last cycle of the
         //   abort. So EN is cleared and CHAIN_TO pointed at the channel itself ("prevents
@@ -657,21 +671,26 @@ namespace Kvasir { namespace DMA {
         template<DMAChannel... Cs>
         static bool abort() {
             static_assert(sizeof...(Cs) > 0);
-            constexpr std::uint32_t bits      = ((1U << static_cast<unsigned>(Cs)) | ...);
-            constexpr auto          inte      = inteField<DMAConfig::interruptInstance>();
-            constexpr std::uint32_t ownedBits = bits & DMAConfig::interruptMask;
+            constexpr std::uint32_t bits = ((1U << static_cast<unsigned>(Cs)) | ...);
+            // static: the sections' lambdas name them without a capture
+            static constexpr auto          inte      = inteField<DMAConfig::interruptInstance>();
+            static constexpr std::uint32_t ownedBits = bits & DMAConfig::interruptMask;
 
             std::uint32_t enabled{};
             if constexpr(ownedBits != 0) {
-                enabled = get<0>(apply(read(inte)));
-                apply(write(inte, enabled & ~ownedBits));
+                enabled = Kvasir::criticalSection<InteTag>([] {
+                    abortHeld_            = abortHeld_ | ownedBits;
+                    std::uint32_t const e = get<0>(apply(read(inte)));
+                    apply(write(inte, e & ~ownedBits));
+                    return e;
+                });
             }
             (pauseUnchained<Cs>(), ...);
             apply(write(Regs::CHAN_ABORT::chan_abort, bits));
             bool drained = false;
-            for(int i = 0; i < AbortPollLimit; ++i) {
+            for(int i = 0; i < abortPollLimit; ++i) {
                 if((get<0>(apply(read(Regs::CHAN_ABORT::chan_abort))) & bits) == 0
-                   && (idle<Cs>() && ...))
+                   && (ready<Cs>() && ...))
                 {
                     drained = true;
                     break;
@@ -680,7 +699,12 @@ namespace Kvasir { namespace DMA {
             // Drop a completion that raced the abort: left pending it would fire into the
             // callback the next start() installs.
             apply(write(Regs::INTR::intr, bits));
-            if constexpr(ownedBits != 0) { apply(write(inte, enabled)); }
+            if constexpr(ownedBits != 0) {
+                Kvasir::criticalSection<InteTag>([enabled] {
+                    apply(write(inte, get<0>(apply(read(inte))) | (enabled & ownedBits)));
+                    abortHeld_ = abortHeld_ & ~ownedBits;
+                });
+            }
             if constexpr(DMAConfig::callbackFunctionSize > 0) {
                 (callbackFunctions[static_cast<std::size_t>(Cs)].reset(), ...);
             }
@@ -694,12 +718,6 @@ namespace Kvasir { namespace DMA {
             using ctrl = typename Regs::template CH<static_cast<unsigned>(Channel)>::CTRL_TRIG;
             apply(clear(ctrl::en),
                   write(ctrl::chain_to, Register::value<static_cast<unsigned>(Channel)>()));
-        }
-
-        template<DMAChannel Channel>
-        static bool idle() {
-            using ctrl = typename Regs::template CH<static_cast<unsigned>(Channel)>::CTRL_TRIG;
-            return !apply(read(ctrl::busy));
         }
 
     public:
@@ -717,12 +735,6 @@ namespace Kvasir { namespace DMA {
             }
         }
 
-        template<typename... Ts>
-        static constexpr auto makeIsr(brigand::list<Ts...>) {
-            return brigand::list<
-              Kvasir::Nvic::Isr<std::addressof(onIsr), Nvic::Index<Ts::value>>...>{};
-        }
-
-        using Isr = decltype(makeIsr(InterruptIndexs{}));
+        using Isr = Nvic::IsrsFor<std::addressof(onIsr), InterruptIndexs>;
     };
 }}   // namespace Kvasir::DMA
