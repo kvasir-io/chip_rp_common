@@ -17,15 +17,24 @@ struct Kvasir::Register::CpuHzCeiling<Kvasir::Tag::User> {
 };
 
 namespace Kvasir::Chip {
-// XOSC.STATUS.stable: STARTUP.DELAY is never written by Kvasir; its reset value 0xc4 is "approx 50 000 cycles"
-// (RP2040 datasheet Table 262 md l.10613, RP2350 md l.27964): 4.2 ms at 12 MHz, 50 ms at a 1 MHz crystal, twice that.
+// Clocks::XoscDelay's startup delay, XOSC.STARTUP.DELAY (clock_config.hpp detail::enableCrystal): what STATUS.STABLE
+// waits for, since nothing in the XOSC measures the oscillation. 64 ms is pico-sdk's longest documented setting (1 ms
+// times PICO_XOSC_STARTUP_DELAY_MULTIPLIER 64, which boards with a slow-starting crystal use). The reset value, ~4 ms
+// at 12 MHz, was too short for a slow-starting crystal after a power-on or a RUN reset; the default,
+// Clocks::XoscMeasured, waits for the crystal itself instead.
+inline constexpr std::uint32_t xoscStartupMs = 64;
+// XOSC.STATUS.stable: the startup delay (Clocks::XoscStartupConfig's startupMs) counts
+// crystal periods, so it only runs once the crystal oscillates - three times the delay, and never less than the 100 ms
+// this bound always was, for a crystal that is slow to start at all.
 // The wait runs with clk_sys on clk_ref on the ROSC, which Clocks::onRingOscillator() (clock_config.hpp) divides to
 // Rp::ChipTraits::clkRefOnRoscHzCeiling at most (RP2040 12 MHz, RP2350 25 MHz - clk_ref's maximum), so its polls are
-// counted at that clock, not the core's 200 / 266 MHz: a missing crystal gives up after 0.1 s at it, longer at a
-// slower ROSC by the ratio and by a poll slower than minCyclesPerPoll (measured on an RP2350 A2, ROSC 11.5 MHz, a
-// DMA channel writing XOSC.CTRL every 16 cycles: ~0.85 s, about 8 cycles a poll).
-using XoscStableBound
-  = Register::Bound::Microseconds<100'000, Rp::ChipTraits::clkRefOnRoscHzCeiling>;
+// counted at that clock, not the core's 200 / 266 MHz: longer at a slower ROSC by the ratio and by a poll slower than
+// minCyclesPerPoll (measured on an RP2350 A2 with the 100 ms bound, ROSC 11.5 MHz, a DMA channel writing XOSC.CTRL
+// every 16 cycles: ~0.85 s, about 8 cycles a poll).
+template<std::uint32_t StartupMs>
+using XoscStableBoundFor
+  = Register::Bound::Microseconds<(3 * StartupMs < 100 ? 100 : 3 * StartupMs) * 1'000,
+                                  Rp::ChipTraits::clkRefOnRoscHzCeiling>;
 // PLL.CS.lock: neither datasheet gives a lock time (RP2040 2.18.3, RP2350 8.6.4: "wait for LOCK"); a choice, 10 ms. The
 // clock init waits with clk_sys on a known clock (PLL_SYS on the crystal, PLL_USB on PLL_SYS): ClkSysHz is that clock.
 template<std::uint64_t ClkSysHz>
