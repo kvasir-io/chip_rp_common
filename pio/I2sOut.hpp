@@ -19,7 +19,7 @@ namespace Kvasir { namespace Pio {
         slave
     };
 
-    namespace detail {
+    namespace Detail {
         // I2sOut's configuration, program choice, divider check and state machine, outside the
         // class so that the state machine can be I2sOut's base (StartupOf); I2sOut derives from it
         // too.
@@ -110,7 +110,7 @@ namespace Kvasir { namespace Pio {
             static_assert(!isMaster || (SmConfig::clockDiv >= 1.0 && SmConfig::clockDiv < 65536.0),
                           "sampleRate is not reachable from clockSpeed with a 16.8 PIO divider");
         };
-    }   // namespace detail
+    }   // namespace Detail
 
     /// I2S transmit from a PIO state machine, fed by DMA from two buffers in turn.
     ///
@@ -142,9 +142,9 @@ namespace Kvasir { namespace Pio {
              typename Dma::Priority DmaPriority,
              typename Config_>
     struct I2sOut
-      : detail::I2sOutParts<BclkPin, LrckPin, DataPin, Config_>
-      , StartupOf<typename detail::I2sOutParts<BclkPin, LrckPin, DataPin, Config_>::Sm> {
-        using Parts = detail::I2sOutParts<BclkPin, LrckPin, DataPin, Config_>;
+      : Detail::I2sOutParts<BclkPin, LrckPin, DataPin, Config_>
+      , StartupOf<typename Detail::I2sOutParts<BclkPin, LrckPin, DataPin, Config_>::Sm> {
+        using Parts = Detail::I2sOutParts<BclkPin, LrckPin, DataPin, Config_>;
         using Parts::bufferFrames;
         using typename Parts::Frame;
         using typename Parts::Sm;

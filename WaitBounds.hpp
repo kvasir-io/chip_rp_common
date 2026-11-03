@@ -33,7 +33,7 @@ inline constexpr std::uint32_t xoscStartupMs = 64;
 // every 16 cycles: ~0.85 s, about 8 cycles a poll).
 template<std::uint32_t StartupMs>
 using XoscStableBoundFor
-  = Register::Bound::Microseconds<(3 * StartupMs < 100 ? 100 : 3 * StartupMs) * 1'000,
+  = Register::Bound::Microseconds<(3 * StartupMs < 100 ? 100ULL : 3ULL * StartupMs) * 1'000,
                                   Rp::ChipTraits::clkRefOnRoscHzCeiling>;
 // PLL.CS.lock: neither datasheet gives a lock time (RP2040 2.18.3, RP2350 8.6.4: "wait for LOCK"); a choice, 10 ms. The
 // clock init waits with clk_sys on a known clock (PLL_SYS on the crystal, PLL_USB on PLL_SYS): ClkSysHz is that clock.

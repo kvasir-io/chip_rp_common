@@ -8,7 +8,7 @@
 #include <kvasir/Util/attributes.hpp>
 
 namespace Kvasir {
-namespace detail {
+namespace Detail {
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void flashEraseImpl(FlashXipDisabler& xipDisabler,
                                                                      void (*erase)(std::uint32_t,
                                                                                    std::size_t,
@@ -56,14 +56,14 @@ namespace detail {
         FlashXipDisabler xipDisabler{};
         flashWriteImpl(xipDisabler, write, offset, data, size);
     }
-}   // namespace detail
+}   // namespace Detail
 
 namespace Bootrom {
     /// Erase `blocks` 4096-byte sectors at flash `offset` (from the start of flash, not the
     /// XIP window). Runs with XIP disabled; mask interrupts around it.
     inline void flashErase(std::uint32_t offset,
                            std::size_t   blocks) {
-        detail::flashErase(offset, blocks);
+        Detail::flashErase(offset, blocks);
     }
 
     /// Program `size` bytes (a multiple of 256, page aligned `offset`) from `data`. Runs
@@ -71,7 +71,7 @@ namespace Bootrom {
     inline void flashWrite(std::uint32_t       offset,
                            std::uint8_t const* data,
                            std::size_t         size) {
-        detail::flashWrite(offset, data, size);
+        Detail::flashWrite(offset, data, size);
     }
 }   // namespace Bootrom
 }   // namespace Kvasir

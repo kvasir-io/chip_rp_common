@@ -111,7 +111,7 @@ namespace Kvasir { namespace Pio {
         bool rxGet{false};
     };
 
-    namespace detail {
+    namespace Detail {
         using Kvasir::Io::pinNumber;
 
         // The n-th set bit of Mask (n from 0).
@@ -329,10 +329,10 @@ namespace Kvasir { namespace Pio {
               = std::conditional_t<Kvasir::MPL::contains<T, Out>, Out, brigand::push_back<Out, T>>;
             using type = typename Unique<brigand::list<Ts...>, next>::type;
         };
-    }   // namespace detail
+    }   // namespace Detail
 
     template<typename Program, typename Config_>
-        requires detail::ProgramWithDirectives<Program> && detail::ProgramWithSideset<Program>
+        requires Detail::ProgramWithDirectives<Program> && Detail::ProgramWithSideset<Program>
     struct StateMachine {
         struct Config : Config_ {
             static constexpr auto   programOffset = KVASIR_CONFIG_OR(Config_, programOffset, 0);
@@ -348,33 +348,33 @@ namespace Kvasir { namespace Pio {
             static constexpr bool sidesetPindirs
               = KVASIR_CONFIG_OR(Config_, sidesetPindirs, Program::sidesetPindirs);
             static constexpr bool autopull
-              = KVASIR_CONFIG_OR(Config_, autopull, detail::programAutopull<Program>());
+              = KVASIR_CONFIG_OR(Config_, autopull, Detail::programAutopull<Program>());
             static constexpr unsigned pullThreshold = static_cast<unsigned>(
-              KVASIR_CONFIG_OR(Config_, pullThreshold, detail::programPullThreshold<Program>()));
+              KVASIR_CONFIG_OR(Config_, pullThreshold, Detail::programPullThreshold<Program>()));
             static constexpr bool outShiftRight
-              = KVASIR_CONFIG_OR(Config_, outShiftRight, detail::programOutShiftRight<Program>());
+              = KVASIR_CONFIG_OR(Config_, outShiftRight, Detail::programOutShiftRight<Program>());
             static constexpr bool autopush
-              = KVASIR_CONFIG_OR(Config_, autopush, detail::programAutopush<Program>());
+              = KVASIR_CONFIG_OR(Config_, autopush, Detail::programAutopush<Program>());
             static constexpr unsigned pushThreshold = static_cast<unsigned>(
-              KVASIR_CONFIG_OR(Config_, pushThreshold, detail::programPushThreshold<Program>()));
+              KVASIR_CONFIG_OR(Config_, pushThreshold, Detail::programPushThreshold<Program>()));
             static constexpr bool inShiftRight
-              = KVASIR_CONFIG_OR(Config_, inShiftRight, detail::programInShiftRight<Program>());
+              = KVASIR_CONFIG_OR(Config_, inShiftRight, Detail::programInShiftRight<Program>());
             static constexpr bool joinTx
-              = KVASIR_CONFIG_OR(Config_, joinTx, detail::programJoinTx<Program>());
+              = KVASIR_CONFIG_OR(Config_, joinTx, Detail::programJoinTx<Program>());
             static constexpr bool joinRx
-              = KVASIR_CONFIG_OR(Config_, joinRx, detail::programJoinRx<Program>());
+              = KVASIR_CONFIG_OR(Config_, joinRx, Detail::programJoinRx<Program>());
             static constexpr auto jmpPin   = KVASIR_CONFIG_OR(Config_, jmpPin, brigand::list<>{});
             static constexpr bool inPullUp = KVASIR_CONFIG_OR(Config_, inPullUp, false);
             static constexpr auto pinsInitialHigh
               = KVASIR_CONFIG_OR(Config_, pinsInitialHigh, brigand::list<>{});
             static constexpr bool      outSticky = KVASIR_CONFIG_OR(Config_, outSticky, false);
             static constexpr MovStatus movStatus
-              = KVASIR_CONFIG_OR(Config_, movStatus, detail::programMovStatus<Program>());
+              = KVASIR_CONFIG_OR(Config_, movStatus, Detail::programMovStatus<Program>());
             // .fifo txput / txget / putget (RP2350): the RX FIFO as random-access registers
             static constexpr bool rxFifoPut
-              = KVASIR_CONFIG_OR(Config_, rxFifoPut, detail::programRxFifoPut<Program>());
+              = KVASIR_CONFIG_OR(Config_, rxFifoPut, Detail::programRxFifoPut<Program>());
             static constexpr bool rxFifoGet
-              = KVASIR_CONFIG_OR(Config_, rxFifoGet, detail::programRxFifoGet<Program>());
+              = KVASIR_CONFIG_OR(Config_, rxFifoGet, Detail::programRxFifoGet<Program>());
             // pins: pulls beyond inPullUp, GPIO overrides, the input synchroniser
             static constexpr auto pullUpPins
               = KVASIR_CONFIG_OR(Config_, pullUpPins, brigand::list<>{});
@@ -396,7 +396,7 @@ namespace Kvasir { namespace Pio {
             // a driver that starts it itself at an entry point (PioQspi)
             static constexpr bool     startEnabled = KVASIR_CONFIG_OR(Config_, startEnabled, true);
             static constexpr unsigned movStatusN   = static_cast<unsigned>(
-              KVASIR_CONFIG_OR(Config_, movStatusN, detail::programMovStatusN<Program>()));
+              KVASIR_CONFIG_OR(Config_, movStatusN, Detail::programMovStatusN<Program>()));
         };
 
         static constexpr unsigned instance = Config::pioInstance;
@@ -412,26 +412,26 @@ namespace Kvasir { namespace Pio {
         static constexpr bool directivesAgree() {
             using P             = Program;
             using C             = Config;
-            constexpr bool out  = detail::programSaysOut<P>();
-            constexpr bool in   = detail::programSaysIn<P>();
-            constexpr bool fifo = detail::programSaysFifo<P>();
-            constexpr bool mov  = detail::programSaysMovStatus<P>();
+            constexpr bool out  = Detail::programSaysOut<P>();
+            constexpr bool in   = Detail::programSaysIn<P>();
+            constexpr bool fifo = Detail::programSaysFifo<P>();
+            constexpr bool mov  = Detail::programSaysMovStatus<P>();
             return (!out
-                    || (C::autopull == detail::programAutopull<P>()
-                        && C::pullThreshold == detail::programPullThreshold<P>()
-                        && C::outShiftRight == detail::programOutShiftRight<P>()))
+                    || (C::autopull == Detail::programAutopull<P>()
+                        && C::pullThreshold == Detail::programPullThreshold<P>()
+                        && C::outShiftRight == Detail::programOutShiftRight<P>()))
                 && (!in
-                    || (C::autopush == detail::programAutopush<P>()
-                        && C::pushThreshold == detail::programPushThreshold<P>()
-                        && C::inShiftRight == detail::programInShiftRight<P>()))
+                    || (C::autopush == Detail::programAutopush<P>()
+                        && C::pushThreshold == Detail::programPushThreshold<P>()
+                        && C::inShiftRight == Detail::programInShiftRight<P>()))
                 && (!fifo
-                    || (C::rxFifoPut == detail::programRxFifoPut<P>()
-                        && C::rxFifoGet == detail::programRxFifoGet<P>()
-                        && C::joinTx == detail::programJoinTx<P>()
-                        && C::joinRx == detail::programJoinRx<P>()))
+                    || (C::rxFifoPut == Detail::programRxFifoPut<P>()
+                        && C::rxFifoGet == Detail::programRxFifoGet<P>()
+                        && C::joinTx == Detail::programJoinTx<P>()
+                        && C::joinRx == Detail::programJoinRx<P>()))
                 && (!mov
-                    || (C::movStatus == detail::programMovStatus<P>()
-                        && C::movStatusN == detail::programMovStatusN<P>()));
+                    || (C::movStatus == Detail::programMovStatus<P>()
+                        && C::movStatusN == Detail::programMovStatusN<P>()));
         }
 
         static_assert(directivesAgree(),
@@ -453,10 +453,10 @@ namespace Kvasir { namespace Pio {
         static_assert(Config::pushThreshold >= 1 && Config::pushThreshold <= 32,
                       "push threshold is 1..32");
 
-        using SetPins  = detail::PinRange<std::remove_cvref_t<decltype(Config::setPins)>>;
-        using OutPins  = detail::PinRange<std::remove_cvref_t<decltype(Config::outPins)>>;
-        using SidePins = detail::PinRange<std::remove_cvref_t<decltype(Config::sidesetPins)>>;
-        using InPins   = detail::PinRange<std::remove_cvref_t<decltype(Config::inPins)>>;
+        using SetPins  = Detail::PinRange<std::remove_cvref_t<decltype(Config::setPins)>>;
+        using OutPins  = Detail::PinRange<std::remove_cvref_t<decltype(Config::outPins)>>;
+        using SidePins = Detail::PinRange<std::remove_cvref_t<decltype(Config::sidesetPins)>>;
+        using InPins   = Detail::PinRange<std::remove_cvref_t<decltype(Config::inPins)>>;
 
         static_assert(SetPins::ok && OutPins::ok && SidePins::ok && InPins::ok,
                       "a PIO pin mapping is a range of consecutive GPIOs");
@@ -497,7 +497,7 @@ namespace Kvasir { namespace Pio {
                       "the program uses a PIO version 1 instruction (RP2350 only: wait jmppin, "
                       "irq prev/next, mov rxfifo[], mov pindirs); the RP2040 has PIO version 0");
 
-        using JmpPin = detail::PinRange<std::remove_cvref_t<decltype(Config::jmpPin)>>;
+        using JmpPin = Detail::PinRange<std::remove_cvref_t<decltype(Config::jmpPin)>>;
         static_assert(JmpPin::count <= 1,
                       "jmpPin is one pin");
         static_assert(Config::movStatusN < 32,
@@ -506,14 +506,14 @@ namespace Kvasir { namespace Pio {
         // The pins that are outputs, the pins that are inputs (the jmp pin included), each
         // without repeats, and everything together: a pin may be in several mappings (out
         // and side-set on one GPIO) and is configured once.
-        using OutputPins = typename detail::Unique<
+        using OutputPins = typename Detail::Unique<
           brigand::append<std::remove_cvref_t<decltype(Config::setPins)>,
                           std::remove_cvref_t<decltype(Config::outPins)>,
                           std::remove_cvref_t<decltype(Config::sidesetPins)>>>::type;
-        using InputPins = typename detail::Unique<
+        using InputPins = typename Detail::Unique<
           brigand::append<std::remove_cvref_t<decltype(Config::inPins)>,
                           std::remove_cvref_t<decltype(Config::jmpPin)>>>::type;
-        using AllPins     = typename detail::Unique<brigand::append<OutputPins, InputPins>>::type;
+        using AllPins     = typename Detail::Unique<brigand::append<OutputPins, InputPins>>::type;
         using ForeignPads = std::remove_cvref_t<decltype(Config::foreignPads)>;
 
         // The instance's GPIO window: a machine names 32 pins counted from it, so a pin above
@@ -522,9 +522,9 @@ namespace Kvasir { namespace Pio {
         static constexpr unsigned gpioBase = static_cast<unsigned>(
           KVASIR_CONFIG_OR(Config,
                            gpioBase,
-                           Kvasir::Pio::gpioBaseFor(detail::PinNumbers<AllPins>::value)));
+                           Kvasir::Pio::gpioBaseFor(Detail::PinNumbers<AllPins>::value)));
 
-        static_assert(Kvasir::Pio::pinsInWindow(detail::PinNumbers<AllPins>::value,
+        static_assert(Kvasir::Pio::pinsInWindow(Detail::PinNumbers<AllPins>::value,
                                                 gpioBase),
                       "a pin of this state machine is not reachable from the PIO instance's "
                       "GPIO window: a machine sees 32 pins from gpioBase (0 or 16), so one "
@@ -562,7 +562,7 @@ namespace Kvasir { namespace Pio {
         // IN_COUNT (RP2350 only): how many IN pins are not masked to 0 - the program's `.in N`,
         // as pico-sdk sets it; left at its reset value 0 (= 32) when the program does not say.
         static constexpr unsigned inCount = [] {
-            if constexpr(detail::programSaysIn<Program>()) {
+            if constexpr(Detail::programSaysIn<Program>()) {
                 return static_cast<unsigned>(Program::inPinCount) % 32U;
             } else {
                 return 0U;
@@ -661,10 +661,10 @@ namespace Kvasir { namespace Pio {
         }
 
         // An input that is also an output (a bidirectional line) is configured as an output.
-        using PureInputPins = typename detail::Difference<InputPins, OutputPins>::type;
+        using PureInputPins = typename Detail::Difference<InputPins, OutputPins>::type;
 
         // The inputs whose pads are this machine's: all but the foreign ones.
-        using OwnInputPins = typename detail::Difference<PureInputPins, ForeignPads>::type;
+        using OwnInputPins = typename Detail::Difference<PureInputPins, ForeignPads>::type;
 
         static constexpr auto initStepPinConfig
           = brigand::append<decltype(pinConfigs<false>(OutputPins{})),
@@ -714,7 +714,7 @@ namespace Kvasir { namespace Pio {
         template<typename... Pins>
         static constexpr std::uint32_t syncBypassMaskOf(brigand::list<Pins...>) {
             return (0U | ...
-                    | (1U << Kvasir::Pio::pinIndex(static_cast<unsigned>(detail::pinNumber(Pins{})),
+                    | (1U << Kvasir::Pio::pinIndex(static_cast<unsigned>(Detail::pinNumber(Pins{})),
                                                    gpioBase)));
         }
 
@@ -729,7 +729,7 @@ namespace Kvasir { namespace Pio {
             write(SmRegs::EXECCTRL::side_en, Register::value<Config::sidesetOptional ? 1 : 0>()),
             write(SmRegs::EXECCTRL::side_pindir, Register::value<Config::sidesetPindirs ? 1 : 0>()),
             write(SmRegs::EXECCTRL::jmp_pin,
-                  Register::value<detail::mappedBase<JmpPin>(gpioBase)>()),
+                  Register::value<Detail::mappedBase<JmpPin>(gpioBase)>()),
             write(SmRegs::EXECCTRL::out_sticky, Register::value<Config::outSticky ? 1 : 0>()),
             write(SmRegs::EXECCTRL::status_sel,
                   Register::value<typename SmRegs::EXECCTRL::STATUS_SELVal,
@@ -755,7 +755,7 @@ namespace Kvasir { namespace Pio {
         static void setPinDir(Pin,
                               bool out) {
             constexpr auto n
-              = Kvasir::Pio::pinIndex(static_cast<unsigned>(detail::pinNumber(Pin{})), gpioBase);
+              = Kvasir::Pio::pinIndex(static_cast<unsigned>(Detail::pinNumber(Pin{})), gpioBase);
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::set_base, Register::value<n>()),
               write(SmRegs::PINCTRL::set_count, Register::value<1>())));
@@ -767,7 +767,7 @@ namespace Kvasir { namespace Pio {
         static void setPinLevel(Pin,
                                 bool high) {
             constexpr auto n
-              = Kvasir::Pio::pinIndex(static_cast<unsigned>(detail::pinNumber(Pin{})), gpioBase);
+              = Kvasir::Pio::pinIndex(static_cast<unsigned>(Detail::pinNumber(Pin{})), gpioBase);
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::set_base, Register::value<n>()),
               write(SmRegs::PINCTRL::set_count, Register::value<1>())));
@@ -823,7 +823,7 @@ namespace Kvasir { namespace Pio {
                 // the register is the instance's, shared with the other machines (and their cores): our bits
                 // through the SET alias, one store (the RP2040's SVD has no field for it, only FULLREGISTER)
                 apply(Register::atomic(
-                  detail::setBits<syncBypassMask>(PioRegs::INPUT_SYNC_BYPASS::FULLREGISTER)));
+                  Detail::setBits<syncBypassMask>(PioRegs::INPUT_SYNC_BYPASS::FULLREGISTER)));
             }
             // Before any mapping is written and while no machine on the instance runs: every
             // base below counts from this window.
@@ -841,20 +841,20 @@ namespace Kvasir { namespace Pio {
 
             apply(SmRegs::PINCTRL::overrideDefaults(
               write(SmRegs::PINCTRL::set_base,
-                    Register::value<detail::mappedBase<SetPins>(gpioBase)>()),
+                    Register::value<Detail::mappedBase<SetPins>(gpioBase)>()),
               write(SmRegs::PINCTRL::set_count,
                     Register::value<static_cast<unsigned>(SetPins::count)>()),
               write(SmRegs::PINCTRL::out_base,
-                    Register::value<detail::mappedBase<OutPins>(gpioBase)>()),
+                    Register::value<Detail::mappedBase<OutPins>(gpioBase)>()),
               write(SmRegs::PINCTRL::out_count,
                     Register::value<static_cast<unsigned>(OutPins::count)>()),
               write(SmRegs::PINCTRL::sideset_base,
-                    Register::value<detail::mappedBase<SidePins>(gpioBase)>()),
+                    Register::value<Detail::mappedBase<SidePins>(gpioBase)>()),
               write(SmRegs::PINCTRL::sideset_count,
                     Register::value<static_cast<unsigned>(SidePins::count)
                                     + (Config::sidesetOptional ? 1U : 0U)>()),
               write(SmRegs::PINCTRL::in_base,
-                    Register::value<detail::mappedBase<InPins>(gpioBase)>())));
+                    Register::value<Detail::mappedBase<InPins>(gpioBase)>())));
         }
 
         // Jump to the program's first instruction. The restart bits and sm_enable live in
@@ -1156,12 +1156,12 @@ namespace Kvasir { namespace Pio {
         static void runtimeInit() { Sm::runtimeInit(); }
     };
 
-    namespace detail {
+    namespace Detail {
         template<typename... Sms>
         constexpr std::uint32_t syncMask(unsigned instance) {
             return (0U | ... | (Sms::instance == instance ? Sms::smMask : 0U));
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     /// Start state machines in step: their clock dividers restarted and their enable set in
     /// one register write, so they run in lockstep from the same cycle (pico-sdk
@@ -1179,9 +1179,9 @@ namespace Kvasir { namespace Pio {
         constexpr unsigned      count = PinConfig::pioCount(Chip::part);
         constexpr unsigned      next  = (home + 1) % count;
         constexpr unsigned      prev  = (home + count - 1) % count;
-        constexpr std::uint32_t own   = detail::syncMask<Sms...>(home);
-        constexpr std::uint32_t nm    = detail::syncMask<Sms...>(next);
-        constexpr std::uint32_t pm    = detail::syncMask<Sms...>(prev);
+        constexpr std::uint32_t own   = Detail::syncMask<Sms...>(home);
+        constexpr std::uint32_t nm    = Detail::syncMask<Sms...>(next);
+        constexpr std::uint32_t pm    = Detail::syncMask<Sms...>(prev);
         static_assert(
           ((Sms::instance == home || Sms::instance == next || Sms::instance == prev) && ...),
           "every machine is on the first one's PIO block or a neighbouring one");
@@ -1191,24 +1191,24 @@ namespace Kvasir { namespace Pio {
         // other machines stay as they are without a read, and the NEXT/PREV masks and NEXTPREV_* bits are
         // self-clearing (SC, RP2350 datasheet PIO CTRL, md l.46543-46558), so writing their 1s is all they need.
         if constexpr(nm == 0 && pm == 0) {
-            apply(Register::atomic(detail::setBits<own>(Ctrl::sm_enable),
-                                   detail::setBits<own>(Ctrl::clkdiv_restart)));
+            apply(Register::atomic(Detail::setBits<own>(Ctrl::sm_enable),
+                                   Detail::setBits<own>(Ctrl::clkdiv_restart)));
         } else {
             static_assert(!PinConfig::isRp2040(Chip::part),
                           "the RP2040 starts machines in step on one PIO block only");
             constexpr auto across = [] {
                 if constexpr(nm != 0 && pm != 0) {
-                    return brigand::append<decltype(detail::setBits<nm>(Ctrl::next_pio_mask)),
-                                           decltype(detail::setBits<pm>(Ctrl::prev_pio_mask))>{};
+                    return brigand::append<decltype(Detail::setBits<nm>(Ctrl::next_pio_mask)),
+                                           decltype(Detail::setBits<pm>(Ctrl::prev_pio_mask))>{};
                 } else if constexpr(nm != 0) {
-                    return detail::setBits<nm>(Ctrl::next_pio_mask);
+                    return Detail::setBits<nm>(Ctrl::next_pio_mask);
                 } else {
-                    return detail::setBits<pm>(Ctrl::prev_pio_mask);
+                    return Detail::setBits<pm>(Ctrl::prev_pio_mask);
                 }
             }();
             if constexpr(own != 0) {
-                apply(Register::atomic(detail::setBits<own>(Ctrl::sm_enable),
-                                       detail::setBits<own>(Ctrl::clkdiv_restart),
+                apply(Register::atomic(Detail::setBits<own>(Ctrl::sm_enable),
+                                       Detail::setBits<own>(Ctrl::clkdiv_restart),
                                        across,
                                        set(Ctrl::nextprev_sm_enable),
                                        set(Ctrl::nextprev_clkdiv_restart)));

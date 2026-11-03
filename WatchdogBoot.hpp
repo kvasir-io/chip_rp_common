@@ -43,23 +43,23 @@ inline constexpr std::uint32_t magic = 0xB007'C0D3U;
 
 #ifndef KVASIR_CHIP_RP2350
 namespace Kvasir { namespace PM {
-    namespace detail {
+    namespace Detail {
         inline std::uint8_t coreResetCarry{};   // .bss: 0 unread, 1 no, 2 yes
-    }   // namespace detail
+    }   // namespace Detail
 
     // CoreResetGuard's word in WATCHDOG SCRATCH3 (RP2040 datasheet 4.7.6): this value after a reset of core 0
     // alone, else 0. Read once and cleared so a later reset that skips the routine does not inherit it.
     inline constexpr std::uint32_t coreResetCarried = 0x4B43'5253U;   // "KCRS"
 
     inline bool isCoreResetCarried() {
-        if(detail::coreResetCarry == 0) {
+        if(Detail::coreResetCarry == 0) {
             using WD = Kvasir::Peripheral::WATCHDOG::Registers<>;
             auto const carried
               = get<0>(apply(read(WD::SCRATCH3::FULLREGISTER))) == coreResetCarried;
             if(carried) { apply(write(WD::SCRATCH3::FULLREGISTER, Register::value<0>())); }
-            detail::coreResetCarry = carried ? 2 : 1;
+            Detail::coreResetCarry = carried ? 2 : 1;
         }
-        return detail::coreResetCarry == 2;
+        return Detail::coreResetCarry == 2;
     }
 }}   // namespace Kvasir::PM
 #endif

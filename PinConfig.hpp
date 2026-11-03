@@ -137,7 +137,7 @@ namespace Kvasir { namespace PinConfig {
         i2cScl
     };
 
-    namespace detail {
+    namespace Detail {
         constexpr UartPinType uartType(Function f,
                                        unsigned instance) {
             constexpr UartPinType t[2][4]{
@@ -168,7 +168,7 @@ namespace Kvasir { namespace PinConfig {
         constexpr bool isUart(Function f) { return f <= Function::uartRts; }
 
         constexpr bool isSpi(Function f) { return f >= Function::spiRx && f <= Function::spiSck; }
-    }   // namespace detail
+    }   // namespace Detail
 
     // The GPIO function select that gives `pin` role `f` of the instance, -1 for none: F1 SPI, F2 UART, F3 I2C, and on
     // the RP2350 F11 for UART TX/RX on the CTS/RTS pins (the formulas above, from Table 2 / Table 645).
@@ -177,13 +177,13 @@ namespace Kvasir { namespace PinConfig {
                                  unsigned   instance,
                                  int        pin) {
         if(instance > 1 || pin < 0 || pin >= pinCountOf(part)) { return -1; }
-        if(detail::isUart(f)) {
-            auto const want = detail::uartType(f, instance);
+        if(Detail::isUart(f)) {
+            auto const want = Detail::uartType(f, instance);
             if(uartPin(pin) == want) { return 2; }
             return hasUartAuxFunction(part) && uartAuxPin(pin) == want ? 11 : -1;
         }
-        if(detail::isSpi(f)) { return spiPin(pin) == detail::spiType(f, instance) ? 1 : -1; }
-        return i2cPin(pin) == detail::i2cType(f, instance) ? 3 : -1;
+        if(Detail::isSpi(f)) { return spiPin(pin) == Detail::spiType(f, instance) ? 1 : -1; }
+        return i2cPin(pin) == Detail::i2cType(f, instance) ? 3 : -1;
     }
 
     constexpr bool isValidPin(Chip::Part part,
@@ -193,7 +193,7 @@ namespace Kvasir { namespace PinConfig {
         return functionSelect(part, f, instance, pin) >= 0;
     }
 
-    namespace detail {
+    namespace Detail {
         // A compile-time message without the library: "GPIO 5 is not UART0 TX on the RP2040 (UART0 TX: GPIO 0 12 16
         // 28)" - an object with size() and data(), a C++26 static_assert message
         struct PinText {
@@ -251,7 +251,7 @@ namespace Kvasir { namespace PinConfig {
 
         template<int>
         inline constexpr bool alwaysFalse = false;
-    }   // namespace detail
+    }   // namespace Detail
 
     /// `value` true; for a pin that cannot have the role a static_assert names pin, role, instance and the pins that
     /// can (instantiated only then: the message is built for a refused pin alone).
@@ -266,9 +266,9 @@ namespace Kvasir { namespace PinConfig {
 
     template<Chip::Part P, Function F, unsigned Instance, int Pin>
     struct CheckedPin<P, F, Instance, Pin, false> {
-        static constexpr bool check = detail::alwaysFalse<Pin>;
+        static constexpr bool check = Detail::alwaysFalse<Pin>;
         static_assert(check,
-                      detail::pinRefused(P,
+                      Detail::pinRefused(P,
                                          F,
                                          Instance,
                                          Pin));

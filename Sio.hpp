@@ -35,7 +35,7 @@ struct CpuId {
     std::uint32_t operator()() const { return cpuId(); }
 };
 
-namespace detail {
+namespace Detail {
     // The FIFO interrupt of core `Core`: one line with one name on the RP2350 (sio_fifo,
     // banked per core), one line per core on the RP2040 (sio_proc0 / sio_proc1).
     template<unsigned Core,
@@ -49,7 +49,7 @@ namespace detail {
             return I::sio_proc1;
         }
     }
-}   // namespace detail
+}   // namespace Detail
 
 // The mailbox: two 8-deep FIFOs of 32-bit words, one per direction. write() puts a word
 // into the other core's inbox, read() takes one from this core's. Also the channel the
@@ -176,7 +176,7 @@ struct FifoIsrOn {
                   "two cores");
     static constexpr unsigned startupCore = Core;
 
-    using Irq = std::decay_t<decltype(detail::fifoIrq<Core, I>())>;
+    using Irq = std::decay_t<decltype(Detail::fifoIrq<Core, I>())>;
 
     static constexpr auto initStepInterruptConfig
       = list(Nvic::makeSetPriority<Priority>(Irq{}), Nvic::makeClearPending(Irq{}));
@@ -195,7 +195,7 @@ struct FifoIsrOn {
 template<void (*F)(), int Priority = 3, typename I = Kvasir::Interrupt>
 using FifoIsr = FifoIsrOn<0, F, Priority, I>;
 
-namespace detail {
+namespace Detail {
     // Makes a lookup depend on a template's own parameters (a struct, not an alias: an alias
     // is substituted at once and the lookup would be checked at definition), so a chip
     // without doorbells (the RP2040) only errors when a DoorbellIrq is instantiated.
@@ -203,7 +203,7 @@ namespace detail {
     struct Dependent {
         using type = T;
     };
-}   // namespace detail
+}   // namespace Detail
 
 // One bell as a sub-interrupt of sio_bell (kvasir/StartUp/SharedIsr.hpp): any number of these,
 // from any drivers, share the vector, and Startup generates its ISR - one read of
@@ -214,7 +214,7 @@ struct DoorbellIrq {
     static_assert(N < 8,
                   "eight doorbells, 0..7");
 
-    using Irq = std::decay_t<decltype(detail::Dependent<Kvasir::Interrupt, N>::type::sio_bell)>;
+    using Irq = std::decay_t<decltype(Detail::Dependent<Kvasir::Interrupt, N>::type::sio_bell)>;
 
     static constexpr std::uint32_t bit = 1U << N;
 

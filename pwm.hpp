@@ -42,7 +42,7 @@ namespace Kvasir { namespace PWM {
         minTopUnreachable,   // no TOP of at least the config's minTop reaches it
     };
 
-    namespace detail {
+    namespace Detail {
         // The search at run time, as a Result: the divider and TOP, or why not.
         template<std::uint32_t ClockSpeed>
         Kvasir::Result<std::pair<std::uint16_t,
@@ -142,7 +142,7 @@ namespace Kvasir { namespace PWM {
         using IrqEnable = Kvasir::Peripheral::PWM::Registers<>::IRQ0_INTE;
         using IrqStatus = Kvasir::Peripheral::PWM::Registers<>::IRQ0_INTS;
 #endif
-    }   // namespace detail
+    }   // namespace Detail
 
     template<typename Pin, typename Config_>
     struct PWM {
@@ -162,11 +162,11 @@ namespace Kvasir { namespace PWM {
                       "minTop only applies when top is not given: the driver searches TOP for the "
                       "frequency");
 
-        using Regs = Kvasir::Peripheral::PWM::Registers<>::CH<detail::getChannel(Pin{})>;
+        using Regs = Kvasir::Peripheral::PWM::Registers<>::CH<Detail::getChannel(Pin{})>;
 
         /// The slice the pin belongs to and whether it is its A output (else B).
-        static constexpr unsigned slice    = detail::getChannel(Pin{});
-        static constexpr bool     channelA = detail::isChannelA(Pin{});
+        static constexpr unsigned slice    = Detail::getChannel(Pin{});
+        static constexpr bool     channelA = Detail::isChannelA(Pin{});
 
         // `minTop` if given, else 0: any TOP the search finds. (A default of `top` or 256 would
         // refuse run-time frequencies that work today; a possible later change.)
@@ -187,10 +187,10 @@ namespace Kvasir { namespace PWM {
         static_assert(
           [] {
               if constexpr(!topGiven) {
-                  return detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)
+                  return Detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)
                     .has_value();
               } else {
-                  return detail::div16Reachable<Config::clockSpeed>(Config::top, Config::frequency);
+                  return Detail::div16Reachable<Config::clockSpeed>(Config::top, Config::frequency);
               }
           }(),
           "PWM frequency unreachable from clk_sys: with a 16-bit TOP and an 8.4-bit divider "
@@ -198,7 +198,7 @@ namespace Kvasir { namespace PWM {
 
         static constexpr std::uint16_t initialTop = []() {
             if constexpr(!topGiven) {
-                return detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->second;
+                return Detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->second;
             } else {
                 return Config::top;
             }
@@ -206,9 +206,9 @@ namespace Kvasir { namespace PWM {
 
         static constexpr std::uint16_t initialDiv16 = []() {
             if constexpr(!topGiven) {
-                return detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->first;
+                return Detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->first;
             } else {
-                return detail::calcDiv16<Config::clockSpeed>(Config::top, Config::frequency);
+                return Detail::calcDiv16<Config::clockSpeed>(Config::top, Config::frequency);
             }
         }();
 
@@ -217,8 +217,8 @@ namespace Kvasir { namespace PWM {
         // Startup: this slice's counter as configured, this output, and the clock the
         // divider is computed from (clk_sys).
         using Provides
-          = brigand::list<OutputResource<detail::getChannel(Pin{}), detail::isChannelA(Pin{})>,
-                          SliceResource<detail::getChannel(Pin{}), initialDiv16, initialTop>>;
+          = brigand::list<OutputResource<Detail::getChannel(Pin{}), Detail::isChannelA(Pin{})>,
+                          SliceResource<Detail::getChannel(Pin{}), initialDiv16, initialTop>>;
         using Claims = Hal::Claim<Clocks::ClkSys, Config::clockSpeed>;
 
         static constexpr auto powerClockEnable
@@ -230,8 +230,8 @@ namespace Kvasir { namespace PWM {
         static constexpr auto initStepPeripheryConfig
           = list(write(Regs::DIV::div_16, Kvasir::Register::value<initialDiv16>()),
                  write(Regs::TOP::top, Kvasir::Register::value<initialTop>()),
-                 detail::setInvert<Config::invert>(Pin{}),
-                 detail::setDuty<initialDuty>(Pin{}));
+                 Detail::setInvert<Config::invert>(Pin{}),
+                 Detail::setDuty<initialDuty>(Pin{}));
 
         static constexpr auto initStepPeripheryEnable = list(set(Regs::CSR::en));
 
@@ -268,7 +268,7 @@ namespace Kvasir { namespace PWM {
         }
 
         static void setDuty(std::uint16_t duty) {
-            if constexpr(detail::isChannelA(Pin{})) {
+            if constexpr(Detail::isChannelA(Pin{})) {
                 apply(write(Regs::CC::a, duty));
             } else {
                 apply(write(Regs::CC::b, duty));
@@ -276,7 +276,7 @@ namespace Kvasir { namespace PWM {
         }
 
         static bool isValidFrequency(std::uint32_t frequency) {
-            auto const divTopO = detail::checkedDivAndTop<Config::clockSpeed>(frequency, minTop);
+            auto const divTopO = Detail::checkedDivAndTop<Config::clockSpeed>(frequency, minTop);
             return divTopO.has_value();
         }
 
@@ -285,7 +285,7 @@ namespace Kvasir { namespace PWM {
         [[nodiscard]] static Kvasir::Result<void,
                                             PwmError>
         setFrequency(std::uint32_t frequency) {
-            auto const divTop = detail::divAndTopFor<Config::clockSpeed>(frequency, minTop);
+            auto const divTop = Detail::divAndTopFor<Config::clockSpeed>(frequency, minTop);
             if(!divTop) { return std::unexpected{divTop.error()}; }
             auto const& [div16, top] = *divTop;
             apply(write(Regs::DIV::div_16, div16), write(Regs::TOP::top, top));
@@ -322,12 +322,12 @@ namespace Kvasir { namespace PWM {
               = static_cast<bool>(KVASIR_CONFIG_OR(Config_, enabled, true));
         };
 
-        static_assert(!detail::isChannelA(Pin{}),
+        static_assert(!Detail::isChannelA(Pin{}),
                       "a PWM counter's input is the slice's B pin (an odd GPIO)");
         static_assert(Config::clockDiv >= 1.0 && Config::clockDiv < 256.0,
                       "the PWM divider is 8.4 fixed point: 1.0 to 255.9375");
 
-        static constexpr unsigned slice = detail::getChannel(Pin{});
+        static constexpr unsigned slice = Detail::getChannel(Pin{});
         using Regs                      = Kvasir::Peripheral::PWM::Registers<>::CH<slice>;
 
         /// The divider as the hardware holds it, 8.4 fixed point: clockDiv rounded down
@@ -403,27 +403,27 @@ namespace Kvasir { namespace PWM {
         using InterruptIndexs = decltype(PinConfig::PwmTraits<Chip::part>::interrupts);
 
         static constexpr auto getIsrSetEnable() {
-            return set(detail::getChField<detail::IrqEnable, Channel>());
+            return set(Detail::getChField<Detail::IrqEnable, Channel>());
         }
 
         static constexpr auto getIsrIsEnable() {
-            return read(detail::getChField<detail::IrqStatus, Channel>());
+            return read(Detail::getChField<Detail::IrqStatus, Channel>());
         }
 
         static constexpr std::uint16_t minTop = 1;
 
         static_assert(
-          detail::calcDivAndTop<Config::clockSpeed>(Config::frequency,
+          Detail::calcDivAndTop<Config::clockSpeed>(Config::frequency,
                                                     minTop)
             .has_value(),
           "PWM_Timer frequency unreachable from clk_sys with a 16-bit TOP and an 8.4-bit "
           "divider");
 
         static constexpr std::uint16_t initialTop
-          = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->second;
+          = Detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->second;
 
         static constexpr std::uint16_t initialDiv16
-          = detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->first;
+          = Detail::calcDivAndTop<Config::clockSpeed>(Config::frequency, minTop)->first;
 
         static constexpr std::uint16_t initialDuty = initialTop;
 
@@ -439,7 +439,7 @@ namespace Kvasir { namespace PWM {
         static constexpr auto initStepPeripheryConfig
           = list(write(Regs::DIV::div_16, Kvasir::Register::value<initialDiv16>()),
                  write(Regs::TOP::top, Kvasir::Register::value<initialTop>()),
-                 detail::setDuty<initialDuty, Channel, true>());
+                 Detail::setDuty<initialDuty, Channel, true>());
 
         static constexpr auto initStepInterruptConfig
           = list(Nvic::makeSetPriority<Config::isrPriority>(InterruptIndexs{}),
@@ -453,7 +453,7 @@ namespace Kvasir { namespace PWM {
         }
 
         static bool isValidFrequency(std::uint32_t frequency) {
-            auto const divTopO = detail::checkedDivAndTop<Config::clockSpeed>(frequency, minTop);
+            auto const divTopO = Detail::checkedDivAndTop<Config::clockSpeed>(frequency, minTop);
             return divTopO.has_value();
         }
 
@@ -462,7 +462,7 @@ namespace Kvasir { namespace PWM {
         [[nodiscard]] static Kvasir::Result<void,
                                             PwmError>
         setFrequency(std::uint32_t frequency) {
-            auto const divTop = detail::divAndTopFor<Config::clockSpeed>(frequency, minTop);
+            auto const divTop = Detail::divAndTopFor<Config::clockSpeed>(frequency, minTop);
             if(!divTop) { return std::unexpected{divTop.error()}; }
             auto const& [div16, top] = *divTop;
             apply(write(Regs::DIV::div_16, div16), write(Regs::TOP::top, top));
@@ -473,7 +473,7 @@ namespace Kvasir { namespace PWM {
             auto const state = apply(getIsrIsEnable());
             if(state) { Callback{}(); }
             using IntrReg = Kvasir::Peripheral::PWM::Registers<>::INTR;
-            apply(set(detail::getChField<IntrReg, Channel>()));
+            apply(set(Detail::getChField<IntrReg, Channel>()));
         }
 
         using Isr = Nvic::IsrsFor<std::addressof(onIsr), InterruptIndexs>;

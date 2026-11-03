@@ -50,7 +50,7 @@ template<typename Clock, typename ConfigT>
 struct Backend {
 private:
     template<typename, std::size_t, EndpointDirection, EndpointTransferType>
-    friend struct Kvasir::USB::detail::EndpointOps;
+    friend struct Kvasir::USB::Detail::EndpointOps;
 
     using Regs       = Kvasir::Peripheral::USB::Registers<0>;
     using BufferRegs = Kvasir::Peripheral::USB_DPRAM::Registers<0>;
@@ -93,7 +93,7 @@ private:
 
     static SetupPacket getSetupPacket() {
         SetupPacket ret;
-        detail::deviceMemoryMemcpy(
+        Detail::deviceMemoryMemcpy(
           std::addressof(ret),
           reinterpret_cast<void const*>(BufferRegs::SETUP_PACKET_LOW::Addr::value),
           sizeof(SetupPacket));
@@ -116,7 +116,7 @@ private:
     }
 
     static constexpr auto getSofEnable() {
-        if constexpr(Traits::UseSof) {
+        if constexpr(Traits::useSof) {
             return set(Regs::INTE::dev_sof);
         } else {
             return clear(Regs::INTE::dev_sof);
@@ -162,11 +162,11 @@ public:
     static constexpr bool asyncCancel = true;
 
     template<std::size_t N, EndpointDirection Dir, EndpointTransferType Type>
-    using Endpoint = Kvasir::USB::detail::EndpointOps<Backend, N, Dir, Type>;
+    using Endpoint = Kvasir::USB::Detail::EndpointOps<Backend, N, Dir, Type>;
 
 private:
-    using Ep0In  = Endpoint<0, EndpointDirection::In, EndpointTransferType::Control>;
-    using Ep0Out = Endpoint<0, EndpointDirection::Out, EndpointTransferType::Control>;
+    using Ep0In  = Endpoint<0, EndpointDirection::in, EndpointTransferType::control>;
+    using Ep0Out = Endpoint<0, EndpointDirection::out, EndpointTransferType::control>;
 
 public:
     template<typename Sink>
@@ -182,7 +182,7 @@ public:
                               read(Regs::INTS::dev_resume_from_host),
                               read(Regs::INTS::abort_done));
         static constexpr auto isrList = []() {
-            if constexpr(Traits::UseSof) {
+            if constexpr(Traits::useSof) {
                 return Kvasir::MPL::list(commonIsrList, read(Regs::INTS::dev_sof));
             } else {
                 return commonIsrList;
@@ -236,7 +236,7 @@ public:
             apply(write(Regs::SIE_STATUS::FULLREGISTER, sieStatus & errorMask));
         }
 
-        if constexpr(Traits::UseSof) {
+        if constexpr(Traits::useSof) {
             if(status[Regs::INTS::dev_sof]) {
                 auto const sof = get<0>(apply(read(Regs::SOF_RD::count)));
                 Sink::startOfFrame(static_cast<std::uint16_t>(sof));

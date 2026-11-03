@@ -18,7 +18,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace Kvasir::USB::detail {
+namespace Kvasir::USB::Detail {
 // One endpoint of the RP2040 / RP2350 controller: its buffer control, its DPRAM buffers and the
 // data toggle, which this controller leaves to software. What kvasir/Devices/USB/Backend.hpp asks
 // of an endpoint, plus what only this controller can do (abort(), abortDone(), rewindArmed(),
@@ -76,7 +76,7 @@ public:
     // State
     static inline EPState        state{};
     static constexpr std::size_t epNum = EP;
-    static constexpr bool        isIn  = (Dir == EndpointDirection::In);
+    static constexpr bool        isIn  = (Dir == EndpointDirection::in);
 
     // The buffer and PID cursor advance when a packet is armed, on every endpoint: a
     // double-buffered IN endpoint has to (its second packet is armed behind the first), and with
@@ -444,11 +444,11 @@ public:
                                            typename BufferRegs::template EP<EP>::OUT_CONTROL>;
         using RegType = typename EPReg::ENDPOINT_TYPEValC;
         constexpr auto regValue = []() {
-            if constexpr(Type == EndpointTransferType::Bulk) {
+            if constexpr(Type == EndpointTransferType::bulk) {
                 return RegType::bulk;
-            } else if constexpr(Type == EndpointTransferType::Interrupt) {
+            } else if constexpr(Type == EndpointTransferType::interrupt) {
                 return RegType::interrupt;
-            } else if constexpr(Type == EndpointTransferType::Isochronous) {
+            } else if constexpr(Type == EndpointTransferType::isochronous) {
                 return RegType::isochronous;
             } else {
                 return RegType::control;
@@ -464,4 +464,4 @@ public:
         }
     }
 };
-}   // namespace Kvasir::USB::detail
+}   // namespace Kvasir::USB::Detail

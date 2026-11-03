@@ -3,7 +3,9 @@
 // A queued SPI master for the PL022 (RP2040 / RP2350 SPI0/1) with DMA both ways, the SPI
 // counterpart of I2CQueued. Each request brings its own mode, clock ceiling and CS functions;
 // CS goes up in the RX DMA completion. Queue, holds, timeouts and watchdog are kvasir_devices'
-// SPI/QueueCore.hpp. SPIBehavior (SPI.hpp) stays for net's W5500 and TC6.
+// SPI/QueueCore.hpp. A short request on an idle bus goes through the FIFOs by the CPU instead (Hw::transferPolled,
+// QueueCore's `pollUpTo`). The RP's only SPI master; SPI.hpp holds the part it shares (SPIBase: pins, divider, Startup).
+#include "DMA.hpp"
 #include "SPI.hpp"
 #include "WaitBounds.hpp"
 #include "kvasir/Atomic/Atomic.hpp"
@@ -11,7 +13,10 @@
 #include "kvasir/Devices/SPI/QueueCore.hpp"
 #include "kvasir/Devices/SPI/QueuedFront.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string_view>
 #include <uc_log/uc_log.hpp>
 
@@ -59,7 +64,11 @@ namespace Kvasir { namespace SPI {
                 std::uint32_t hz{SPIConfig::baudRate};
                 std::uint32_t usPerBitQ10{Kvasir::SPI::usPerBitQ10(SPIConfig::baudRate)};
 
-                constexpr bool operator==(Setup const&) const = default;
+                /// The four register values decide: `hz` and `usPerBitQ10` follow from them (one clk_peri). Compared
+                /// before every transfer.
+                [[gnu::always_inline]] constexpr bool operator==(Setup const& o) const {
+                    return scr == o.scr && cpsdvsr == o.cpsdvsr && spo == o.spo && sph == o.sph;
+                }
             };
 
             static consteval Setup setup(Hal::ClockMode mode,
@@ -122,23 +131,46 @@ namespace Kvasir { namespace SPI {
                                   std::uint32_t   gen,
                                   void (*)(std::uint32_t,
                                            bool)) {
-                    // Leftovers of an aborted transfer would be this one's first bytes.
-                    for(int i = 0; i < 16 && apply(read(Regs::SSPSR::rne)); ++i) {
-                        apply(read(Regs::SSPDR::data));
-                    }
-                    apply(set(Regs::SSPICR::roric));
-                    // DSS 8 or 16 bit (TRM Table 3-2), with SSE clear, only when it changes.
-                    auto const dss = static_cast<std::uint8_t>(t.wide ? 15U : 7U);
-                    if(dss != dss_) {
-                        apply(clear(Regs::SSPCR1::sse));
-                        apply(write(Regs::SSPCR0::dss, dss));
-                        apply(set(Regs::SSPCR1::sse));
-                        dss_ = dss;
-                    }
+                    prepare_(t);
                     std::atomic_signal_fence(std::memory_order_release);
                     // RX first: the receiver is armed before the first bit is clocked in.
                     startRx_(t, gen);
                     startTx_(t);
+                }
+
+                /// QueueCore's polled path (a short request on an idle bus): the frames through the FIFOs by the
+                /// CPU, no DMA, called masked with nothing on the wire. Each FIFO holds 8 frames (RP2040 datasheet
+                /// 4.4.2.4 / 4.4.2.5, RP2350 12.3 "8-location TX and RX FIFOs"): the first 8 go into the empty
+                /// transmit FIFO without a look, then one more for each one read back - never more than 8 in flight,
+                /// so the receive FIFO cannot overrun. False when SSPSR.RNE (TRM DDI0194H Table 3-5) stayed 0 for
+                /// shifterWaitSpins looks (a stopped block): the core aborts.
+                static bool transferPolled(Transfer const& t) {
+                    drain_();   // no overrun flag to clear: this path never overruns and reads none
+                    frameSize_(t);
+                    std::uint32_t sent = 0;
+                    for(auto const first = std::min(t.frames, fifoDepth); sent != first; ++sent) {
+                        apply(write(Regs::SSPDR::data,
+                                    frameAt_(t.tx, t.txIncrement ? sent : 0, t.wide)));
+                    }
+                    std::uint32_t idle = 0;
+                    for(std::uint32_t received = 0; received != t.frames;) {
+                        if(!apply(read(Regs::SSPSR::rne))) {
+                            if(++idle == shifterWaitSpins) { return false; }
+                            continue;
+                        }
+                        idle = 0;
+                        storeFrame_(t.rx,
+                                    t.rxIncrement ? received : 0,
+                                    t.wide,
+                                    static_cast<std::uint16_t>(apply(read(Regs::SSPDR::data))));
+                        ++received;
+                        if(sent != t.frames) {
+                            apply(write(Regs::SSPDR::data,
+                                        frameAt_(t.tx, t.txIncrement ? sent : 0, t.wide)));
+                            ++sent;
+                        }
+                    }
+                    return true;
                 }
 
                 static void abort() {
@@ -209,6 +241,55 @@ namespace Kvasir { namespace SPI {
                 inline static std::uint8_t  dss_{7};   ///< SSPCR0.DSS as last written (init: 7)
                 inline static std::uint32_t shifterWaitsExhausted_{};
 
+                /// Frames each PL022 FIFO holds (transferPolled()).
+                static constexpr std::uint32_t fifoDepth = 8;
+
+                /// Before a DMA transfer: what an aborted one left, the overrun flag, the frame size.
+                static void prepare_(Transfer const& t) {
+                    drain_();
+                    apply(set(Regs::SSPICR::roric));
+                    frameSize_(t);
+                }
+
+                /// Leftovers of an aborted transfer would be this one's first bytes.
+                [[gnu::always_inline]] static void drain_() {
+                    for(int i = 0; i < 16 && apply(read(Regs::SSPSR::rne)); ++i) {
+                        apply(read(Regs::SSPDR::data));
+                    }
+                }
+
+                /// DSS 8 or 16 bit (TRM Table 3-2), with SSE clear, only when it changes.
+                [[gnu::always_inline]] static void frameSize_(Transfer const& t) {
+                    auto const dss = static_cast<std::uint8_t>(t.wide ? 15U : 7U);
+                    if(dss != dss_) {
+                        apply(clear(Regs::SSPCR1::sse));
+                        apply(write(Regs::SSPCR0::dss, dss));
+                        apply(set(Regs::SSPCR1::sse));
+                        dss_ = dss;
+                    }
+                }
+
+                /// Frame `i` of `p`: a byte, or a native-endian halfword (`wide`, as the DMA reads it).
+                static std::uint32_t frameAt_(std::byte const* p,
+                                              std::uint32_t    i,
+                                              bool             wide) {
+                    if(!wide) { return std::to_integer<std::uint32_t>(p[i]); }
+                    std::uint16_t h{};
+                    std::memcpy(&h, p + (2U * i), sizeof h);
+                    return h;
+                }
+
+                static void storeFrame_(std::byte*    p,
+                                        std::uint32_t i,
+                                        bool          wide,
+                                        std::uint16_t v) {
+                    if(!wide) {
+                        p[i] = static_cast<std::byte>(v);
+                        return;
+                    }
+                    std::memcpy(p + (2U * i), &v, sizeof v);
+                }
+
                 template<bool                       Inc,
                          typename Dma::TransferSize Size>
                 static void rx_(Transfer const& t,
@@ -269,7 +350,7 @@ namespace Kvasir { namespace SPI {
         };
     }   // namespace Detail
 
-    /// SPIConfig as for SPIBehavior; baudRate = the fastest any device may be clocked, `mode`
+    /// SPIConfig as SPIBase reads it; baudRate = the fastest any device may be clocked, `mode`
     /// only the idle level at start (every request brings its own).
     template<typename SPIConfig,
              typename Clock,

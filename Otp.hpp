@@ -44,7 +44,7 @@ struct OtpPageLocks {
 };
 #endif
 
-namespace detail {
+namespace Detail {
 #ifdef KVASIR_CHIP_RP2350
     // STRDEF-only white-label OTP indices (RP2350 datasheet §13.10).
     // VALUE entries (VID=0x0000, PID=0x0001, BCD=0x0002, LANG_ID=0x0003,
@@ -157,5 +157,5 @@ namespace detail {
         return readWhiteLabelString<WhiteLabelStrIndex::usbDeviceSerialNumber, 30>();
     }
 #endif
-}   // namespace detail
+}   // namespace Detail
 }   // namespace Kvasir

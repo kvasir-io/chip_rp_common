@@ -5,6 +5,7 @@
 #include "core/core.hpp"
 #include "kvasir/Atomic/Atomic.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/attributes.hpp"
 
 #include <array>
 #include <cstdint>
@@ -58,7 +59,7 @@ template<typename I = Kvasir::Interrupt>
                                       std::uint32_t sp,
                                       std::uint32_t vtor,
                                       std::uint32_t budget = 1'000'000) {
-    using FifoIrq = std::decay_t<decltype(Sio::detail::fifoIrq<0, I>())>;
+    using FifoIrq = std::decay_t<decltype(Sio::Detail::fifoIrq<0, I>())>;
     Nvic::InterruptGuard<FifoIrq> const guard;
 
     std::array<std::uint32_t, 6> const sequence{0, 0, 1, vtor, sp, entry | 1U};
@@ -149,6 +150,127 @@ struct Core0Park {
             if(parked) { return true; }
         }
         return parked;
+    }
+
+    using Isr = brigand::list<Kvasir::Nvic::Isr<std::addressof(onNmi), Kvasir::Nvic::Index<-14>>>;
+};
+
+// Core 0 keeping core 1 out of the flash while XIP is off (Detail::FlashXipDisabler: every erase, program, direct-mode
+// command and boot ROM flash call - FlashOps, FlashRegion, BootInfo's loadPartitionTable/explicitBuy, Qmi, the
+// RP2040's flash_do_cmd). A core 1 that fetches from flash then reads junk or stalls the QMI; pico-sdk's
+// multicore_lockout asks the other core over the SIO FIFO, which an application here may own. This takes the line
+// Core0Park takes, mirrored: core 0 forces core 1's copy of IO_IRQ_QSPI (IO_QSPI PROC1_INTF, RP2040 datasheet 2.19.6.2
+// Table 334, RP2350 9.11.2 Table 846), routed to core 1's NMI (RP2040 SYSCFG PROC1_NMI_MASK, 2.21.2 Table 355; RP2350
+// EPPB NMI_MASK0, 3.7.5.1 Table 363, core-local: core 1 writes its own), and core 1 waits in onNmi(), from RAM, until
+// core 0 lets go. An NMI also takes a core 1 that masks its interrupts (RP2350 datasheet 3.2.1: it ignores PRIMASK
+// and pre-empts every other exception), which a FIFO interrupt would wait for.
+//
+// Armed by core 1 itself at its entry (SecondaryCoreInit), disarmed by core 0 before every launch and reset of core 1
+// (SecondaryCoreInitBase), so a core 1 in the boot ROM never gets the NMI. Core 0 only: a flash operation on core 1
+// leaves core 0 running (core 0's NMI is Core0Park's). A core 1 that does not answer within ackPolls (halted by a
+// debugger, in lockup, not yet running Kvasir code) fetches nothing either: core 0 goes on and counts it
+// (`unanswered`); the line stays forced, and core 1 takes the NMI when it runs again and returns at once.
+struct Core1Lockout {
+    using IoQspi                           = Kvasir::Peripheral::IO_QSPI::Registers<>;
+    static constexpr std::uint32_t nmiMask = Core0Park::nmiMask;   // the same line, core 1's copy
+    // NMI entry is a few dozen cycles, a core 1 stalled on an XIP fetch some microseconds: about 1 ms at 150 MHz
+    static constexpr std::uint32_t ackPolls = 100'000;
+
+    static inline bool volatile armed
+      = false;   // core 1's NMI routed (core 1 sets it, core 0 clears it)
+    static inline bool volatile hold                = false;   // core 0 holds core 1 in onNmi()
+    static inline bool volatile parked              = false;   // core 1 is in onNmi()
+    static inline std::uint32_t volatile depth      = 0;       // core 0's nested Guards
+    static inline std::uint32_t volatile lockouts   = 0;       // core 1 parked within ackPolls
+    static inline std::uint32_t volatile unanswered = 0;       // it did not
+
+    // Core 0, before every launch and reset of core 1: nothing forced, nothing routed (the RP2040's mask is chip-wide
+    // and survives the PSM reset of core 1; the RP2350's is reset with core 1).
+    static void disarm() {
+        armed = false;
+        apply(clear(IoQspi::PROC1_INTF::gpio_qspi_sclk_level_low));
+#ifndef KVASIR_CHIP_RP2350
+        apply(write(Kvasir::Peripheral::SYSCFG::Registers<>::PROC1_NMI_MASK::FULLREGISTER,
+                    Kvasir::Register::value<0U>()));
+#endif
+    }
+
+    // Core 1, at its entry: the force bit first (a lockout core 0 gave up on may have left it set), then the route.
+    static void arm() {
+        apply(clear(IoQspi::PROC1_INTF::gpio_qspi_sclk_level_low));
+        parked = false;
+#ifdef KVASIR_CHIP_RP2350
+        apply(write(Kvasir::Peripheral::EPPB::Registers<>::NMI_MASK0::nmi_mask0,
+                    Kvasir::Register::value<nmiMask>()));
+#else
+        apply(write(Kvasir::Peripheral::SYSCFG::Registers<>::PROC1_NMI_MASK::FULLREGISTER,
+                    Kvasir::Register::value<nmiMask>()));
+#endif
+        armed = true;
+    }
+
+    // Core 1's NMI. From RAM: core 0 switches XIP off as soon as `parked` is seen. Another NMI (the RP2350's RCP
+    // integrity check) finds the force bit clear and ends as the unhandled-interrupt panic it was before - with XIP
+    // on, so the call into flash is safe.
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void onNmi() {
+        KVASIR_RAM_FUNC_MARK_CALLS_FLASH();
+        if(get<0>(apply(read(IoQspi::PROC1_INTF::gpio_qspi_sclk_level_low))) == 0) {
+            Kvasir::Nvic::DefaultIsrs::onIsr();
+        }
+        apply(clear(IoQspi::PROC1_INTF::gpio_qspi_sclk_level_low));
+        asm volatile("dsb" ::: "memory");   // the clear and every access before it done
+        parked = true;
+        while(hold) { asm volatile("wfe" ::: "memory"); }
+        parked = false;
+    }
+
+    // Core 0: core 1 parked for the Guard's scope (FlashXipDisabler holds one). Nothing on core 1, before core 1 is
+    // armed, or nested inside another Guard (an interrupt's flash write inside a flash write).
+    class Guard {
+    public:
+        Guard() : held_{take()} {}
+
+        ~Guard() {
+            if(held_) { give(); }
+        }
+
+        /// Whether this Guard holds core 1 (false on core 1, before it is armed, and for a nested Guard's outer
+        /// scope's sake: true there too).
+        [[nodiscard]] bool held() const { return held_; }
+
+        Guard(Guard const&)            = delete;
+        Guard& operator=(Guard const&) = delete;
+
+    private:
+        bool held_;
+    };
+
+    [[nodiscard]] static bool take() {
+        if(Kvasir::Sio::cpuId() != 0U || !armed) { return false; }
+        auto const outer = depth;
+        depth            = outer + 1U;
+        if(outer != 0U) { return true; }
+        parked = false;
+        hold   = true;
+        asm volatile("dmb" ::: "memory");
+        apply(set(IoQspi::PROC1_INTF::gpio_qspi_sclk_level_low));
+        for(std::uint32_t i = 0; i != ackPolls; ++i) {
+            if(parked) {
+                lockouts = lockouts + 1U;
+                return true;
+            }
+        }
+        unanswered = unanswered + 1U;
+        return true;
+    }
+
+    static void give() {
+        auto const inner = depth - 1U;
+        depth            = inner;
+        if(inner != 0U) { return; }
+        asm volatile("dsb" ::: "memory");   // every flash access of the scope done (XIP back on)
+        hold = false;
+        asm volatile("dsb\n sev" ::: "memory");
     }
 
     using Isr = brigand::list<Kvasir::Nvic::Isr<std::addressof(onNmi), Kvasir::Nvic::Index<-14>>>;

@@ -6,7 +6,7 @@
 // l.60103-60105). The divider floor of 2 and the 7.5 ns sample point are this package's choices (below).
 #include <cstdint>
 
-namespace Kvasir { namespace DefaultClockSettings { namespace detail {
+namespace Kvasir { namespace DefaultClockSettings { namespace Detail {
     // The QMI's divider for the flash at the final clock: SCK no faster than MaxFlashFreq (what the flash is rated
     // for, 100 MHz by default), 2..255.
     template<auto ClockSpeed,
@@ -71,4 +71,4 @@ namespace Kvasir { namespace DefaultClockSettings { namespace detail {
                                  .rxdelay     = rxdelay,
                                  .clkdiv      = clkdiv};
     }
-}}}   // namespace Kvasir::DefaultClockSettings::detail
+}}}   // namespace Kvasir::DefaultClockSettings::Detail

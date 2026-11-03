@@ -28,7 +28,7 @@ namespace Kvasir::Io {
 
 enum class Edge : std::uint8_t { falling = 1, rising = 2, both = 3 };
 
-namespace detail {
+namespace Detail {
     template<typename T>
     struct GpioNumber;
 
@@ -106,7 +106,7 @@ namespace detail {
         using Ints = brigand::at_c<brigand::at_c<IoBankIrqGroups::Ints, Core>,
                                    Group>;   // this core's masked status
     };
-}   // namespace detail
+}   // namespace Detail
 
 // One pin's edges as sub-interrupts of io_bank0 (kvasir/StartUp/SharedIsr.hpp): any number of
 // these, from any drivers, share the vector, and Startup generates its ISR - one read of each
@@ -127,12 +127,12 @@ struct GpioPinEdgesOn {
 
     using Irq = std::decay_t<decltype(Kvasir::Interrupt::io_bank0)>;
 
-    static constexpr unsigned gpio = detail::GpioNumber<Pin>::value;
-    using Regs                     = detail::IoBankIrqRegs<gpio / 8U, Core_>;
+    static constexpr unsigned gpio = Detail::GpioNumber<Pin>::value;
+    using Regs                     = Detail::IoBankIrqRegs<gpio / 8U, Core_>;
 
     template<unsigned Kind, void (*F)()>
     struct EdgeIrq {
-        static constexpr std::uint32_t mask = detail::irqBit(gpio, Kind);
+        static constexpr std::uint32_t mask = Detail::irqBit(gpio, Kind);
 
         // this core's masked status, the shared raw status (edges write-one-to-clear), this
         // core's enable: the pin's bit in each
@@ -154,8 +154,8 @@ struct GpioPinEdgesOn {
                                  Priority>;
     };
 
-    using Falling = EdgeIrq<detail::edgeLow, OnFalling>;
-    using Rising  = EdgeIrq<detail::edgeHigh, OnRising>;
+    using Falling = EdgeIrq<Detail::edgeLow, OnFalling>;
+    using Rising  = EdgeIrq<Detail::edgeHigh, OnRising>;
 
     using SubIsrs = brigand::append<std::conditional_t<!Nvic::isNullHandler<OnFalling>,
                                                        brigand::list<typename Falling::Sub>,

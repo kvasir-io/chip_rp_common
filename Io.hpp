@@ -121,13 +121,13 @@ namespace Kvasir { namespace Io {
         static_assert(isValidPinLocation<Port, Pin>(), "invalid PinLocation");
     };
 
-    namespace detail {
+    namespace Detail {
         template<int Pin>
         using Pad = typename Kvasir::Peripheral::PADS_BANK0::Registers<>::GPIO<Pin>::PAD;
         template<int Pin>
         using Ctrl = typename Kvasir::Peripheral::IO_BANK0::Registers<>::GPIO<Pin>::CTRL;
 
-    }   // namespace detail
+    }   // namespace Detail
 
     enum class DriveStrength { mA2, mA4, mA8, mA12 };
 
@@ -146,13 +146,13 @@ namespace Kvasir { namespace Io {
              DriveStrength DS>
     constexpr auto getDriveAction() {
         if constexpr(DS == DriveStrength::mA2) {
-            return write(detail::Pad<Pin>::DRIVEValC::_2ma);
+            return write(Detail::Pad<Pin>::DRIVEValC::_2ma);
         } else if constexpr(DS == DriveStrength::mA4) {
-            return write(detail::Pad<Pin>::DRIVEValC::_4ma);
+            return write(Detail::Pad<Pin>::DRIVEValC::_4ma);
         } else if constexpr(DS == DriveStrength::mA8) {
-            return write(detail::Pad<Pin>::DRIVEValC::_8ma);
+            return write(Detail::Pad<Pin>::DRIVEValC::_8ma);
         } else {
-            return write(detail::Pad<Pin>::DRIVEValC::_12ma);
+            return write(Detail::Pad<Pin>::DRIVEValC::_12ma);
         }
     }
 
@@ -178,22 +178,22 @@ namespace Kvasir { namespace Io {
     template<Io::PullConfiguration PC, int Port, int Pin>
     struct MakeAction<Action::Input<PC>, PinLocation<Port, Pin>>
       : decltype(MPL::list(
-          set(detail::Pad<Pin>::ie),
+          set(Detail::Pad<Pin>::ie),
 #ifdef KVASIR_CHIP_RP2350
-          clear(detail::Pad<Pin>::iso),
+          clear(Detail::Pad<Pin>::iso),
 #endif
-          set(detail::Pad<Pin>::od),
-          write(detail::Pad<Pin>::DRIVEValC::_2ma),
-          write(detail::Pad<Pin>::pde,
+          set(Detail::Pad<Pin>::od),
+          write(Detail::Pad<Pin>::DRIVEValC::_2ma),
+          write(Detail::Pad<Pin>::pde,
                 Register::value<PC == PullConfiguration::pullDown ? 1 : 0>()),
-          write(detail::Pad<Pin>::pue, Register::value<PC == PullConfiguration::pullUp ? 1 : 0>()),
-          clear(detail::Pad<Pin>::slewfast),
-          set(detail::Pad<Pin>::schmitt),
-          write(detail::Ctrl<Pin>::IRQOVERValC::normal),
-          write(detail::Ctrl<Pin>::INOVERValC::normal),
-          write(detail::Ctrl<Pin>::OEOVERValC::disable),
-          write(detail::Ctrl<Pin>::OUTOVERValC::normal),
-          write(detail::Ctrl<Pin>::FUNCSELValC::sio),
+          write(Detail::Pad<Pin>::pue, Register::value<PC == PullConfiguration::pullUp ? 1 : 0>()),
+          clear(Detail::Pad<Pin>::slewfast),
+          set(Detail::Pad<Pin>::schmitt),
+          write(Detail::Ctrl<Pin>::IRQOVERValC::normal),
+          write(Detail::Ctrl<Pin>::INOVERValC::normal),
+          write(Detail::Ctrl<Pin>::OEOVERValC::disable),
+          write(Detail::Ctrl<Pin>::OUTOVERValC::normal),
+          write(Detail::Ctrl<Pin>::FUNCSELValC::sio),
           getOeClrAction<Pin>())) {
         static_assert(isValidPinLocation<Port, Pin>(), "invalid PinLocation");
     };
@@ -201,21 +201,21 @@ namespace Kvasir { namespace Io {
     template<Io::OutputType OT, Io::OutputSpeed OS, Io::OutputInit OI, int Port, int Pin>
     struct MakeAction<Action::Output<OT, OS, OI>, PinLocation<Port, Pin>>
       : decltype(MPL::list(
-          set(detail::Pad<Pin>::ie),
+          set(Detail::Pad<Pin>::ie),
 #ifdef KVASIR_CHIP_RP2350
-          clear(detail::Pad<Pin>::iso),
+          clear(Detail::Pad<Pin>::iso),
 #endif
-          clear(detail::Pad<Pin>::od),
+          clear(Detail::Pad<Pin>::od),
           getDriveAction<Pin, driveFromOutputSpeed(OS)>(),
-          clear(detail::Pad<Pin>::pde),
-          clear(detail::Pad<Pin>::pue),
-          write(detail::Pad<Pin>::slewfast, Register::value<slewFastFromOutputSpeed(OS) ? 1 : 0>()),
-          set(detail::Pad<Pin>::schmitt),
-          write(detail::Ctrl<Pin>::IRQOVERValC::normal),
-          write(detail::Ctrl<Pin>::INOVERValC::normal),
-          write(detail::Ctrl<Pin>::OEOVERValC::normal),
-          write(detail::Ctrl<Pin>::OUTOVERValC::normal),
-          write(detail::Ctrl<Pin>::FUNCSELValC::sio),
+          clear(Detail::Pad<Pin>::pde),
+          clear(Detail::Pad<Pin>::pue),
+          write(Detail::Pad<Pin>::slewfast, Register::value<slewFastFromOutputSpeed(OS) ? 1 : 0>()),
+          set(Detail::Pad<Pin>::schmitt),
+          write(Detail::Ctrl<Pin>::IRQOVERValC::normal),
+          write(Detail::Ctrl<Pin>::INOVERValC::normal),
+          write(Detail::Ctrl<Pin>::OEOVERValC::normal),
+          write(Detail::Ctrl<Pin>::OUTOVERValC::normal),
+          write(Detail::Ctrl<Pin>::FUNCSELValC::sio),
           getOeSetAction<Pin>(),
           []() {
               if constexpr(OI == Io::OutputInit::low) {
@@ -240,36 +240,36 @@ namespace Kvasir { namespace Io {
     struct MakeAction<Action::PinFunctionDrive<Function, DS, SlewFast, PC, OI, OutOver, OeOver>,
                       PinLocation<Port, Pin>>
       : decltype(MPL::list(
-          set(detail::Pad<Pin>::ie),
+          set(Detail::Pad<Pin>::ie),
 #ifdef KVASIR_CHIP_RP2350
-          clear(detail::Pad<Pin>::iso),
+          clear(Detail::Pad<Pin>::iso),
 #endif
-          clear(detail::Pad<Pin>::od),
+          clear(Detail::Pad<Pin>::od),
           getDriveAction<Pin, DS>(),
-          write(detail::Pad<Pin>::pde,
+          write(Detail::Pad<Pin>::pde,
                 Register::value<PC == PullConfiguration::pullDown ? 1 : 0>()),
-          write(detail::Pad<Pin>::pue, Register::value<PC == PullConfiguration::pullUp ? 1 : 0>()),
-          write(detail::Pad<Pin>::slewfast, Register::value<SlewFast ? 1 : 0>()),
-          set(detail::Pad<Pin>::schmitt),
-          write(detail::Ctrl<Pin>::IRQOVERValC::normal),
-          write(detail::Ctrl<Pin>::INOVERValC::normal),
+          write(Detail::Pad<Pin>::pue, Register::value<PC == PullConfiguration::pullUp ? 1 : 0>()),
+          write(Detail::Pad<Pin>::slewfast, Register::value<SlewFast ? 1 : 0>()),
+          set(Detail::Pad<Pin>::schmitt),
+          write(Detail::Ctrl<Pin>::IRQOVERValC::normal),
+          write(Detail::Ctrl<Pin>::INOVERValC::normal),
           []() {
               if constexpr(OeOver == PinOverride::invert) {
-                  return write(detail::Ctrl<Pin>::OEOVERValC::invert);
+                  return write(Detail::Ctrl<Pin>::OEOVERValC::invert);
               } else {
-                  return write(detail::Ctrl<Pin>::OEOVERValC::normal);
+                  return write(Detail::Ctrl<Pin>::OEOVERValC::normal);
               }
           }(),
           []() {
               if constexpr(OutOver == PinOverride::invert) {
-                  return write(detail::Ctrl<Pin>::OUTOVERValC::invert);
+                  return write(Detail::Ctrl<Pin>::OUTOVERValC::invert);
               } else {
-                  return write(detail::Ctrl<Pin>::OUTOVERValC::normal);
+                  return write(Detail::Ctrl<Pin>::OUTOVERValC::normal);
               }
           }(),
-          write(detail::Ctrl<Pin>::funcsel,
-                Register::value<typename detail::Ctrl<Pin>::FUNCSELVal,
-                                static_cast<typename detail::Ctrl<Pin>::FUNCSELVal>(Function)>()),
+          write(Detail::Ctrl<Pin>::funcsel,
+                Register::value<typename Detail::Ctrl<Pin>::FUNCSELVal,
+                                static_cast<typename Detail::Ctrl<Pin>::FUNCSELVal>(Function)>()),
           getOeSetAction<Pin>(),
           []() {
               if constexpr(OI == Io::OutputInit::low) {

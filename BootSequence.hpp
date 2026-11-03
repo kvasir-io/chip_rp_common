@@ -99,10 +99,20 @@ struct SecondaryCoreInitBase {
     [[nodiscard]] static bool launch(std::uint32_t entry,
                                      std::uint32_t sp,
                                      std::uint32_t vtor) {
+        Multicore::Core1Lockout::disarm();
         return Multicore::launchCore1(entry, sp, vtor);
     }
 
-    static void reset() { Multicore::resetCore1(); }
+    static void reset() {
+        Multicore::Core1Lockout::disarm();
+        Multicore::resetCore1();
+    }
+
+    // On core 1, at its entry (the chip's SecondaryCoreInit::operator()): its NMI routed for core 0's flash lockout
+    // (Multicore.hpp Core1Lockout), whose handler is core 1's NMI vector (SecondaryIsr).
+    static void armLockout() { Multicore::Core1Lockout::arm(); }
+
+    using SecondaryIsr = Multicore::Core1Lockout::Isr;
 
     // Called by SecondaryCore's runtimeInit before core 1 starts, unless its list holds
     // Kvasir::Startup::NoCoreResetGuard (chip/CoreResetGuard.hpp). No-op in a RAM image.

@@ -1,4 +1,4 @@
-// The RP PLL search (PllSearch.hpp, Kvasir::DefaultClockSettings::detail::calcPllSettings) against an exhaustive
+// The RP PLL search (PllSearch.hpp, Kvasir::DefaultClockSettings::Detail::calcPllSettings) against an exhaustive
 // search in exact integers over every REFDIV, FBDIV, POSTDIV2 and POSTDIV1 the datasheets allow, with vcocalc.py's rules
 // (nearest output, then the preferred VCO, then the first in its order; only whole-mHz settings): over a grid of crystals
 // and targets the two pick the same settings. It reads the SDK's test support (kvasir::test_support: the harness).
@@ -10,7 +10,7 @@
 #include <cstdio>
 
 namespace {
-namespace D = Kvasir::DefaultClockSettings::detail;
+namespace D = Kvasir::DefaultClockSettings::Detail;
 
 // vcocalc.py's search, every setting tried: FREF / REFDIV at least 5 MHz, VCO 750..1600 MHz, FBDIV 16..320,
 // POSTDIV1/2 1..7, REFDIV 1..63 (RP2350 datasheet 8.6.3, RP2040 datasheet 2.18.2), in its order (REFDIV, FBDIV,

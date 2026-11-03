@@ -16,7 +16,7 @@ namespace Kvasir { namespace PWM {
     }
 }}   // namespace Kvasir::PWM
 
-namespace Kvasir { namespace PWM { namespace detail {
+namespace Kvasir { namespace PWM { namespace Detail {
     enum class DivTopRefusal : std::uint8_t {
         none,
         frequencyTooHigh,    // the divider would be below 1.0
@@ -130,4 +130,4 @@ namespace Kvasir { namespace PWM { namespace detail {
                   std::uint32_t topMin) {
         return searchDivAndTop<ClockSpeed>(frequency, topMin).value;
     }
-}}}   // namespace Kvasir::PWM::detail
+}}}   // namespace Kvasir::PWM::Detail

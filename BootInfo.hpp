@@ -1,14 +1,23 @@
 #pragma once
 // The RP2350's boot ROM services under their public names: partition table, address translation, OTP access,
-// BOOT_INFO and explicit_buy (TBYB).
+// BOOT_INFO and explicit_buy (TBYB), each under the boot lock the boot ROM checks for it.
 #include "Rom.hpp"
+#include "XipControl.hpp"   // explicitBuy(): the ROM's flash writes need XIP off
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#ifdef KVASIR_CHIP_RP2350
+    #include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
+    #include "peripherals/BOOTRAM.hpp"
+    #include "peripherals/SHA256.hpp"
 
-namespace Kvasir { namespace Bootrom {
+    #include <kvasir/Register/Register.hpp>
+#endif
+
+namespace Kvasir {
+namespace Bootrom {
 #ifdef KVASIR_CHIP_RP2350
     // get_partition_table_info flags (RP2350 datasheet 5.4.8.16): what the words after the
     // echoed flags word describe.
@@ -36,13 +45,149 @@ namespace Kvasir { namespace Bootrom {
         constexpr std::uint32_t ecc     = 0x00020000;
     }   // namespace OtpCmd
 
+    /// The boot locks (RP2350 datasheet 5.4.4; BOOTRAM BOOTLOCK0..7, 4.3 Table 438). With lock checking on (lock 7
+    /// claimed), a boot ROM function that uses one of these resources returns BOOTROM_ERROR_LOCK_REQUIRED (-19) unless
+    /// its lock is claimed too (pico-bootrom inline_s_lock_check: SHA-256 for get_partition_table_info,
+    /// load_partition_table and the other partition scans, OTP for otp_access, FLASH_OP for the checked flash_op).
+    /// Kvasir never turns checking on, but a boot stage before it may have and left it so - a pico-sdk bootloader
+    /// (picotool's decryption stage) does, and the image it chains into runs with it.
+    enum class BootLock : std::uint8_t {
+        sha256  = 0,
+        flashOp = 1,
+        otp     = 2,
+        enable  = 7,   ///< claimed = the boot ROM checks the other locks
+    };
+
+}   // namespace Bootrom
+
+namespace Detail {
+    using BootRam = Kvasir::Peripheral::BOOTRAM::Registers<>;
+
+    template<Bootrom::BootLock Lock>
+    constexpr auto bootLockField() {
+        if constexpr(Lock == Bootrom::BootLock::sha256) {
+            return BootRam::BOOTLOCK0::bootlock0;
+        } else if constexpr(Lock == Bootrom::BootLock::flashOp) {
+            return BootRam::BOOTLOCK1::bootlock1;
+        } else if constexpr(Lock == Bootrom::BootLock::otp) {
+            return BootRam::BOOTLOCK2::bootlock2;
+        } else {
+            static_assert(Lock == Bootrom::BootLock::enable);
+            return BootRam::BOOTLOCK7::bootlock7;
+        }
+    }
+
+    // The boot ROM hashes on the SHA-256 block (pico-bootrom's sweet-b, its RP2350 path writes sha256_hw) - the
+    // partition table's words at every get_partition_table_info, which compares them with the hash it took at
+    // boot. Kvasir's first init step holds every block nothing claims in reset, and a block held in reset reads
+    // its reset values (CSR 0x1206, WDATA_RDY set): the ROM's loop runs through without an engine and the digest
+    // is wrong - get_partition_table_info answered BOOTROM_ERROR_MODIFIED_DATA (-15) on every partitioned boot
+    // (measured, RESETS.RESET bit 17 set). Released here, before the ROM calls that hash.
+    inline void sha256OutOfReset() {
+        using Sha = Kvasir::Peripheral::SHA256::Registers<>;
+        if(apply(read(Rp::Block<Sha>::reset)) != 0) {
+            apply(clear(Rp::Block<Sha>::reset));
+            Rp::Block<Sha>::waitResetDone();
+        }
+    }
+}   // namespace Detail
+
+namespace Bootrom {
+
+    /// Whether the boot ROM checks the boot locks now: lock 7 claimed (BOOTLOCK_STAT reads 1 for unclaimed, 4.3).
+    [[nodiscard]] inline bool bootLockCheckingOn() {
+        auto const stat = get<0>(apply(read(Detail::BootRam::BOOTLOCK_STAT::bootlock_stat)));
+        return (stat & (1U << static_cast<unsigned>(BootLock::enable))) == 0U;
+    }
+
+    /// Claims a boot lock for its lifetime, if it can (`held()`): a BOOTLOCKn read claims and answers non-zero, a
+    /// write releases (4.3 Table 438). One try, no waiting - a lock someone else holds is reported, the ROM call then
+    /// answers LOCK_REQUIRED if checking is on, and is not released here. With checking off it costs a read and a
+    /// write. Not reentrant: a nested guard of the same lock gets held() == false and leaves the release to the outer.
+    template<BootLock Lock>
+    class BootLockGuard {
+    public:
+        BootLockGuard() : held_{get<0>(apply(read(Detail::bootLockField<Lock>()))) != 0U} {}
+
+        ~BootLockGuard() {
+            if(held_) {
+                apply(write(Detail::bootLockField<Lock>(), Kvasir::Register::value<0U>()));
+            }
+        }
+
+        BootLockGuard(BootLockGuard const&)            = delete;
+        BootLockGuard& operator=(BootLockGuard const&) = delete;
+        BootLockGuard(BootLockGuard&&)                 = delete;
+        BootLockGuard& operator=(BootLockGuard&&)      = delete;
+
+        [[nodiscard]] bool held() const { return held_; }
+
+    private:
+        bool held_;
+    };
+
     /// get_partition_table_info (RP2350 datasheet 5.4.8.16): fills `out_buffer` with the
     /// echoed flags word and what PtInfoFlags asks for; returns the word count or a
-    /// negative bootrom error.
+    /// negative bootrom error (BOOTROM_ERROR_PRECONDITION_NOT_MET, -14, when the table is not
+    /// loaded: a RAM or watchdog boot - loadPartitionTable() first). Under the SHA-256 boot lock,
+    /// with the SHA-256 block out of reset (Detail::sha256OutOfReset).
     [[nodiscard]] inline int getPartitionTableInfo(std::uint32_t* outBuffer,
                                                    std::uint32_t  outBufferWordSize,
                                                    std::uint32_t  partitionAndFlags) {
+        BootLockGuard<BootLock::sha256> const lock{};
+        Detail::sha256OutOfReset();
         return RomFunctions::getPartitionTableInfo(outBuffer, outBufferWordSize, partitionAndFlags);
+    }
+
+    /// The work area load_partition_table and the other partition scans need: the boot ROM checks it against
+    /// WORKAREA_CHECK_SIZE = MAX(sizeof(scan_workarea_t), sizeof(uf2_target_workarea_t)) = 3264 (pico-bootrom
+    /// varm_apis.c, the same in A2, A3 and A4; pico-sdk: "currently required is 3264"). The datasheet's 3064 (5.4.8.20)
+    /// is sizeof(scan_workarea_t) alone: the ROM answers BOOTROM_ERROR_BUFFER_TOO_SMALL to that.
+    inline constexpr std::size_t partitionWorkareaBytes = 3264;
+
+}   // namespace Bootrom
+
+namespace Detail {
+    // load_partition_table rescans the flash the way a boot does, minus the boot: it sets the QMI to serial 03h at
+    // BOOTROM_SPI_CLKDIV_NSBOOT (6) itself (s_varm_crit_ram_trash_perform_flash_scan_and_maybe_run_image ->
+    // flash_select_xip_read_mode, pico-bootrom varm_flash_boot.c), without taking a flash in continuous read
+    // (the image's EBh, XipControl.hpp) out of it first, and leaves that mode behind. Under the XipGuard the flash
+    // leaves continuous mode before and the image's mode comes back after. RAM code for the same reason.
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline int
+    loadPartitionTableImpl(Kvasir::Detail::FlashXipDisabler& xipDisabler,
+                           int (*load)(std::uint8_t*,
+                                       std::uint32_t,
+                                       bool),
+                           std::uint8_t* workarea,
+                           std::uint32_t workareaSize,
+                           bool          forceReload) {
+        KVASIR_RAM_FUNC_MARK();
+        Kvasir::Detail::XipGuard const guard{xipDisabler};
+        return load(workarea, workareaSize, forceReload);
+    }
+}   // namespace Detail
+
+namespace Bootrom {
+
+    /// load_partition_table (RP2350 datasheet 5.4.8.20): reads the partition table from flash into the boot ROM's
+    /// state, which a RAM or watchdog boot leaves empty, so getPartitionTableInfo() answers; `forceReload` reads it
+    /// again after it changed in flash (without it, a loaded table is kept and the call returns 0 at once). 0 or a
+    /// negative boot ROM error. The scan reads flash in serial 03h at clk_sys / 6 (25 MHz at 150 MHz, inside 03h's
+    /// rating up to 300 MHz), with XIP off around it (Detail::loadPartitionTableImpl): interrupts masked and core 1 off
+    /// flash, as for flashErase(). Under the SHA-256 boot lock.
+    [[nodiscard]] inline int loadPartitionTable(std::span<std::uint32_t,
+                                                          partitionWorkareaBytes / 4> workarea,
+                                                bool forceReload = false) {
+        BootLockGuard<BootLock::sha256> const lock{};
+        Detail::sha256OutOfReset();
+        auto const load = RomFunctions::
+          getRomFunctionPointer<'L', 'P', int (*)(std::uint8_t*, std::uint32_t, bool)>();
+        Kvasir::Detail::FlashXipDisabler xipDisabler{};
+        return Detail::loadPartitionTableImpl(xipDisabler,
+                                              load,
+                                              reinterpret_cast<std::uint8_t*>(workarea.data()),
+                                              static_cast<std::uint32_t>(workarea.size_bytes()),
+                                              forceReload);
     }
 
     /// flash_runtime_to_storage_addr (5.4.8.13): the QMI's address translation of a runtime
@@ -54,10 +199,11 @@ namespace Kvasir { namespace Bootrom {
     }
 
     /// otp_access (5.4.8.19): read or write `buf_len` bytes of OTP from the row in
-    /// `cmd_flags` (OtpCmd::ROW_MASK, WRITE, ECC); 0 on success.
+    /// `cmd_flags` (OtpCmd::ROW_MASK, WRITE, ECC); 0 on success. Under the OTP boot lock.
     [[nodiscard]] inline int otpAccess(std::uint8_t* buf,
                                        std::uint32_t bufLen,
                                        std::uint32_t cmdFlags) {
+        BootLockGuard<BootLock::otp> const lock{};
         return RomFunctions::otpAccess(buf, bufLen, cmdFlags);
     }
 
@@ -127,19 +273,55 @@ namespace Kvasir { namespace Bootrom {
     /// least 4 kB", word aligned).
     inline constexpr std::size_t explicitBuyScratchBytes = 4096;
 
+}   // namespace Bootrom
+
+namespace Detail {
+    // explicit_buy reads the TBYB flag's sector through the XIP window (s_varm_crit_flash_read_data: the
+    // uncached untranslated alias, in whatever mode the QMI runs) and erases and programs it in direct mode
+    // without leaving XIP first (pico-bootrom varm_launch_image.c s_varm_api_explicit_buy, varm_generic_flash.c).
+    // A flash in continuous read (the EBh mode an image runs, XipControl.hpp) takes those commands for address
+    // bits. Under the XipGuard the flash is out of continuous mode and the window reads 03h at the boot ROM's own
+    // divider (flash_exit_xip -> flash_init_spi), the state the ROM's own buy at boot runs in; afterwards the
+    // image's mode comes back. RAM code: the flash is not readable during the ROM's erase and program.
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline int
+    explicitBuyImpl(Kvasir::Detail::FlashXipDisabler& xipDisabler,
+                    int (*buy)(std::uint8_t*,
+                               std::uint32_t),
+                    std::uint8_t* buffer,
+                    std::uint32_t bufferSize) {
+        KVASIR_RAM_FUNC_MARK();
+        Kvasir::Detail::XipGuard const guard{xipDisabler};
+        return buy(buffer, bufferSize);
+    }
+}   // namespace Detail
+
+namespace Bootrom {
+
     /// explicit_buy (RP2350 datasheet 5.4.8.4, 5.1.17): make the image a flash update boot
     /// launched on trial (an IMAGE_DEF with the TBYB flag) the one that boots from now on. It
-    /// clears the flag in flash and, if the image is a version downgrade, erases the first sector
-    /// of the other A/B partition; until then any reset that is not that flash update boot
-    /// starts the other partition again. On a secured chip it may also write the rollback
-    /// version to OTP, and may reboot doing so (5.4.8.4). Erases and programs flash: interrupts
-    /// masked and core 1 off flash around it, as for flashErase() (pico-sdk runs it under
-    /// flash_safe_execute). 0 (BOOTROM_OK) or a negative boot ROM error; a call on a bought image
-    /// does nothing and returns 0.
+    /// clears the flag in flash and, if the image is a version downgrade (the other A/B partition's
+    /// IMAGE_DEF has the greater version), erases the other partition's first sector - only then:
+    /// with equal versions the other image stays bootable and partition A wins a normal boot
+    /// (pico-bootrom varm_flash_boot.c, version_downgrade_erase_flash_addr; 5.1.17's "the first 4 kB
+    /// sector of the other partition is erased" is the downgrade case). Until the buy any reset that
+    /// is not that flash update boot starts the other partition again. On a secured chip it may also
+    /// write the rollback version to OTP, and may reboot doing so (5.4.8.4). Erases and programs
+    /// flash with XIP off (Detail::explicitBuyImpl): interrupts masked and core 1 off flash around
+    /// it, as for flashErase(). 0 (BOOTROM_OK) or a negative boot ROM error; a call on a bought
+    /// image does nothing and returns 0. Under the OTP boot lock: the rollback version goes
+    /// through the checked otp_access (pico-bootrom varm_launch_image.c); its flash writes are
+    /// unchecked.
     [[nodiscard]] inline int explicitBuy(std::span<std::uint32_t,
                                                    explicitBuyScratchBytes / 4> scratch) {
-        return RomFunctions::explicitBuy(reinterpret_cast<std::uint8_t*>(scratch.data()),
-                                         static_cast<std::uint32_t>(scratch.size_bytes()));
+        BootLockGuard<BootLock::otp> const lock{};
+        auto const                         buy
+          = RomFunctions::getRomFunctionPointer<'E', 'B', int (*)(std::uint8_t*, std::uint32_t)>();
+        Kvasir::Detail::FlashXipDisabler xipDisabler{};
+        return Detail::explicitBuyImpl(xipDisabler,
+                                       buy,
+                                       reinterpret_cast<std::uint8_t*>(scratch.data()),
+                                       static_cast<std::uint32_t>(scratch.size_bytes()));
     }
 #endif
-}}   // namespace Kvasir::Bootrom
+}
+}   // namespace Kvasir

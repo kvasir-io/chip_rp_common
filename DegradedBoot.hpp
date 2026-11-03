@@ -154,9 +154,9 @@ namespace Kvasir { namespace Clocks {
             auto const s = state_.load(std::memory_order_relaxed);
             return Report{s == State::degraded,
                           switchedUp_.load(std::memory_order_relaxed),
-                          detail::degradedOn,
-                          detail::degradedBy,
-                          detail::failedBootsBefore,
+                          Detail::degradedOn,
+                          Detail::degradedBy,
+                          Detail::failedBootsBefore,
                           tries_.load(std::memory_order_relaxed),
                           lastTry_.load(std::memory_order_relaxed),
                           s == State::reattaching};
@@ -179,9 +179,9 @@ namespace Kvasir { namespace Clocks {
             // a switch that does not show: peripheryClockInit() panics, as for the boots before
             auto const tree = ClockSettings::degradedClockInit();
             if(tree == DegradedTree::none) { return; }
-            detail::degradedBy        = cause;
-            detail::degradedOn        = tree;
-            detail::failedBootsBefore = failures;
+            Detail::degradedBy        = cause;
+            Detail::degradedOn        = tree;
+            Detail::failedBootsBefore = failures;
             state_.store(State::degraded, std::memory_order_relaxed);
         }
 
@@ -233,7 +233,7 @@ namespace Kvasir { namespace Clocks {
                 state_.store(State::idle, std::memory_order_relaxed);
             }
             UC_LOG_I("clocks: switched up from {} after {} tries: crystal and PLLs running, {}{}",
-                     Clocks::name(detail::degradedOn),
+                     Clocks::name(Detail::degradedOn),
                      tries_.load(std::memory_order_relaxed),
                      Clocks::name(Clocks::initResult()),
                      reattach ? std::string_view{"; the USB device off the bus for a re-attach"}

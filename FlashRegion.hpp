@@ -53,7 +53,7 @@ namespace Kvasir { namespace Flash {
                                 std::span<std::byte const,
                                           pageBytes> bytes) {
             Kvasir::Core::IrqGuard const guard{};
-            Kvasir::detail::flashWrite(Offset + page,
+            Kvasir::Detail::flashWrite(Offset + page,
                                        reinterpret_cast<std::uint8_t const*>(bytes.data()),
                                        bytes.size());
             return true;
@@ -61,7 +61,7 @@ namespace Kvasir { namespace Flash {
 
         static bool eraseSector(std::uint32_t sector) {
             Kvasir::Core::IrqGuard const guard{};
-            Kvasir::detail::flashErase(Offset + sector * sectorSize, 1);
+            Kvasir::Detail::flashErase(Offset + sector * sectorSize, 1);
             return true;
         }
 

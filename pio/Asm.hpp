@@ -244,7 +244,7 @@ namespace Kvasir { namespace Pio {
         }
     };
 
-    namespace detail {
+    namespace Detail {
         // A tiny formatter for Asm's messages: string pieces and integers, nothing else (no <format> in the
         // constant evaluator).
         struct Message {
@@ -286,7 +286,7 @@ namespace Kvasir { namespace Pio {
             (m.append(parts), ...);
             return m;
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     class Asm {
     public:
@@ -323,7 +323,7 @@ namespace Kvasir { namespace Pio {
         template<typename... Parts>
         constexpr void fail(Parts const&... parts) {
             if(failed()) { return; }
-            detail::Message m{};
+            Detail::Message m{};
             if(site_.file != nullptr) {
                 // the builder: the call that added the instruction, or the directive's
                 std::string_view file{site_.file};
@@ -749,14 +749,14 @@ namespace Kvasir { namespace Pio {
                           = result_.find(refs_[static_cast<std::size_t>(i.labelRef)].view());
                         if(s == nullptr || !s->isLabel) {
                             return failed_(
-                              detail::concat("jmp to unknown label '",
+                              Detail::concat("jmp to unknown label '",
                                              refs_[static_cast<std::size_t>(i.labelRef)].view(),
                                              "'"));
                         }
                         target = s->value;
                     }
                     if(target < 0 || target >= static_cast<int>(count_)) {
-                        return failed_(detail::concat("jmp target ",
+                        return failed_(Detail::concat("jmp target ",
                                                       target,
                                                       " is beyond the end of the program (",
                                                       static_cast<int>(count_),
@@ -767,7 +767,7 @@ namespace Kvasir { namespace Pio {
                 if(!i.isWord) {
                     if(i.delay_ > delayMax) {
                         if(haveSideset_) {
-                            return failed_(detail::concat("delay ",
+                            return failed_(Detail::concat("delay ",
                                                           i.delay_,
                                                           " does not fit: .side_set ",
                                                           static_cast<int>(result_.sidesetCount),
@@ -779,15 +779,15 @@ namespace Kvasir { namespace Pio {
                                                           ")"));
                         }
                         return failed_(
-                          detail::concat("delay ", i.delay_, " does not fit (max 31)"));
+                          Detail::concat("delay ", i.delay_, " does not fit (max 31)"));
                     }
                     unsigned field = static_cast<unsigned>(i.delay_);
                     if(i.side_ >= 0) {
                         if(!haveSideset_) {
-                            return failed_(detail::concat("side ", i.side_, " without .side_set"));
+                            return failed_(Detail::concat("side ", i.side_, " without .side_set"));
                         }
                         if(i.side_ > sideMax) {
-                            return failed_(detail::concat("side ",
+                            return failed_(Detail::concat("side ",
                                                           i.side_,
                                                           " does not fit .side_set ",
                                                           static_cast<int>(result_.sidesetCount),
@@ -798,7 +798,7 @@ namespace Kvasir { namespace Pio {
                         field |= static_cast<unsigned>(i.side_) << (5U - ssBits);
                         if(result_.sidesetOpt) { field |= 0x10U; }
                     } else if(haveSideset_ && !result_.sidesetOpt) {
-                        return failed_(detail::concat("side-set is not optional here (.side_set ",
+                        return failed_(Detail::concat("side-set is not optional here (.side_set ",
                                                       static_cast<int>(result_.sidesetCount),
                                                       "): 'side' missing"));
                     }
@@ -823,7 +823,7 @@ namespace Kvasir { namespace Pio {
             site_ = Site{loc.file_name(), loc.line()};
         }
 
-        constexpr Assembled failed_(detail::Message const& m) {
+        constexpr Assembled failed_(Detail::Message const& m) {
             fail(std::string_view{m.text, m.size});
             result_.length = 0;
             return result_;

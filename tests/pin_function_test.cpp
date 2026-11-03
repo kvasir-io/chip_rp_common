@@ -273,7 +273,7 @@ static_assert(CheckedPin<Kvasir::Chip::Part::rp2040,
 
 // the refusal's text: pin, role, instance, chip and the pins that have the role
 constexpr bool refusalNames() {
-    auto const t = detail::pinRefused(Kvasir::Chip::Part::rp2040, Function::uartTx, 0, 5);
+    auto const t = Detail::pinRefused(Kvasir::Chip::Part::rp2040, Function::uartTx, 0, 5);
     return std::string_view{t.data(), t.size()}
         == "GPIO 5 is not UART0 TX on the RP2040 (UART0 TX: GPIO 0 12 16 28)";
 }

@@ -70,7 +70,7 @@ namespace Kvasir { namespace Flash {
             std::size_t const eraseBlocks
               = data.size() / flashBlockSize + (data.size() % flashBlockSize == 0 ? 0 : 1);
             Kvasir::Core::IrqGuard const guard{};
-            Kvasir::detail::flashErase(offset, eraseBlocks);
+            Kvasir::Detail::flashErase(offset, eraseBlocks);
         }
         constexpr std::size_t writeBlockSize{pageSize};
         while(!data.empty()) {
@@ -78,7 +78,7 @@ namespace Kvasir { namespace Flash {
             std::copy_n(data.begin(), std::min(data.size(), writeBlockSize), buffer.begin());
             {
                 Kvasir::Core::IrqGuard const guard{};
-                Kvasir::detail::flashWrite(offset,
+                Kvasir::Detail::flashWrite(offset,
                                            reinterpret_cast<std::uint8_t const*>(buffer.data()),
                                            buffer.size());
             }

@@ -63,7 +63,7 @@ namespace Kvasir { namespace Clocks {
         clkHstx,
     };
 
-    namespace detail {
+    namespace Detail {
         using Kvasir::Io::pinNumber;
 
         constexpr int gpoutOf(int pin) { return PinConfig::gpoutOf(Chip::part, pin); }
@@ -102,14 +102,14 @@ namespace Kvasir { namespace Clocks {
             return auxsrcOf<Ctrl>(s);
 #endif
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     template<typename Pin, Source Src, unsigned DivInt, unsigned DivFrac16 = 0>
     struct Output {
-        static constexpr int      pinNumber     = detail::pinNumber(Pin{});
+        static constexpr int      pinNumber     = Detail::pinNumber(Pin{});
         static constexpr unsigned divider       = DivInt;
         static constexpr unsigned dividerFrac16 = DivFrac16;
-        static constexpr int      gpout         = detail::gpoutOf(pinNumber);
+        static constexpr int      gpout         = Detail::gpoutOf(pinNumber);
         static_assert(gpout >= 0,
                       "not a GPOUT pin: GPIO 21 (GPOUT0), 23 (GPOUT1), 24 (GPOUT2), 25 (GPOUT3); "
                       "on the RP2350 also 13 (GPOUT0) and 15 (GPOUT1)");
@@ -161,7 +161,7 @@ namespace Kvasir { namespace Clocks {
                  write(Div::frac, Register::value<divFrac>()),
                  Ctrl::overrideDefaults(write(
                    Ctrl::auxsrc,
-                   Register::value<typename Ctrl::AUXSRCVal, detail::auxsrcOfExtra<Ctrl>(Src)>())));
+                   Register::value<typename Ctrl::AUXSRCVal, Detail::auxsrcOfExtra<Ctrl>(Src)>())));
 
         static constexpr auto initStepPeripheryEnable = list(set(Ctrl::enable));
 
@@ -230,7 +230,7 @@ namespace Kvasir { namespace Clocks {
         using Status = Kvasir::Peripheral::CLOCKS::Registers<>::FC0_STATUS;
     };
 
-    namespace detail {
+    namespace Detail {
         // The chip's FC0_SRC value for a Source, by name (lposc and clk_hstx are RP2350 only).
         template<typename Src>
         constexpr std::uint32_t fcSrcOf(Source s) {
@@ -254,7 +254,7 @@ namespace Kvasir { namespace Clocks {
             default: return 0;   // null: the counter idles
             }
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     template<auto ClkRefHz>
     struct FrequencyCounter {
@@ -318,7 +318,7 @@ namespace Kvasir { namespace Clocks {
 
         static Frequency measure(Source        s,
                                  std::uint32_t interval = 8) {
-            return measureRaw(detail::fcSrcOf<typename Clk::FC0_SRC>(s), interval, noMin, noMax);
+            return measureRaw(Detail::fcSrcOf<typename Clk::FC0_SRC>(s), interval, noMin, noMax);
         }
 
         /// measure() with interrupts masked for the count: what a loop that measures while
@@ -334,7 +334,7 @@ namespace Kvasir { namespace Clocks {
                           std::uint32_t minKhz,
                           std::uint32_t maxKhz,
                           std::uint32_t interval = 8) {
-            return measureRaw(detail::fcSrcOf<typename Clk::FC0_SRC>(s), interval, minKhz, maxKhz)
+            return measureRaw(Detail::fcSrcOf<typename Clk::FC0_SRC>(s), interval, minKhz, maxKhz)
               .pass();
         }
     };
@@ -568,8 +568,8 @@ namespace Kvasir { namespace Clocks {
 #ifdef KVASIR_CHIP_RP2350
             auto const timing = retryPending_.load(std::memory_order_relaxed)
                                 ? savedTiming_
-                                : Kvasir::detail::XipReadMode::currentTiming();
-            Kvasir::detail::XipReadMode::apply(Kvasir::detail::XipReadMode::timingAtClkRef);
+                                : Kvasir::Detail::XipReadMode::currentTiming();
+            Kvasir::Detail::XipReadMode::apply(Kvasir::Detail::XipReadMode::timingAtClkRef);
 #endif
             // The fetch that was in flight when the clock collapsed may have completed
             // with shifted data and sit in the cache. Drop the cache before anything
@@ -583,7 +583,7 @@ namespace Kvasir { namespace Clocks {
 
             // 2. what it found
             constexpr std::uint32_t srcClkSys
-              = detail::fcSrcOf<typename Clk::FC0_SRC>(Source::clkSys);
+              = Detail::fcSrcOf<typename Clk::FC0_SRC>(Source::clkSys);
             khzBefore_.store(Fc::measureRaw(srcClkSys, 8, Fc::noMin, Fc::noMax).khz,
                              std::memory_order_relaxed);
 
@@ -612,7 +612,7 @@ namespace Kvasir { namespace Clocks {
             khzAfter_.store(after, std::memory_order_relaxed);
             bool const ok = init == InitResult::ok && clockGood_(after);
 #ifdef KVASIR_CHIP_RP2350
-            if(ok) { Kvasir::detail::XipReadMode::apply(timing); }
+            if(ok) { Kvasir::Detail::XipReadMode::apply(timing); }
 #endif
             repaired_.store(ok, std::memory_order_relaxed);
             if(!ok) { failed_.fetch_add(1, std::memory_order_relaxed); }
@@ -677,13 +677,13 @@ namespace Kvasir { namespace Clocks {
             if(init == InitResult::ok) { init = ClockSettings::switchToSources(); }
             initResult_.store(init, std::memory_order_relaxed);
             constexpr std::uint32_t srcClkSys
-              = detail::fcSrcOf<typename Clk::FC0_SRC>(Source::clkSys);
+              = Detail::fcSrcOf<typename Clk::FC0_SRC>(Source::clkSys);
             auto const after = Fc::measureRaw(srcClkSys, 8, Fc::noMin, Fc::noMax).khz;
             khzAfter_.store(after, std::memory_order_relaxed);
             bool const ok = init == InitResult::ok && clockGood_(after);
             if(ok) {
 #ifdef KVASIR_CHIP_RP2350
-                Kvasir::detail::XipReadMode::apply(savedTiming_);
+                Kvasir::Detail::XipReadMode::apply(savedTiming_);
 #endif
                 retryPending_.store(false, std::memory_order_relaxed);
             }

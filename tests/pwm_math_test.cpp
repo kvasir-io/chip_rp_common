@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 
-namespace D = Kvasir::PWM::detail;
+namespace D = Kvasir::PWM::Detail;
 using R     = D::DivTopRefusal;
 
 namespace {

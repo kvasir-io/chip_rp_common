@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <ranges>
 
-namespace Kvasir { namespace DefaultClockSettings { namespace detail {
+namespace Kvasir { namespace DefaultClockSettings { namespace Detail {
     struct PllSettings {
         std::uint32_t fbdiv;
         std::uint32_t pd1;
@@ -117,4 +117,4 @@ namespace Kvasir { namespace DefaultClockSettings { namespace detail {
         return {Prescaler::mulChecked(crystalSpeed, s.fbdiv),
                 std::uint64_t{s.refdiv} * s.pd1 * s.pd2};
     }
-}}}   // namespace Kvasir::DefaultClockSettings::detail
+}}}   // namespace Kvasir::DefaultClockSettings::Detail

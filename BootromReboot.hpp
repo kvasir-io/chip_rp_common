@@ -41,7 +41,10 @@ namespace Bootrom {
     namespace RebootFlags {
         constexpr std::uint32_t rebootTypeNormal  = 0x0000;
         constexpr std::uint32_t rebootTypeBootsel = 0x0002;
-        constexpr std::uint32_t noReturnOnSuccess = 0x0100;
+        // p0: the XIP address of the first byte of the flash just written (5.4.8.24; the boot ROM takes p0 - XIP_BASE
+        // as the flash offset, pico-bootrom varm_boot_path.c)
+        constexpr std::uint32_t rebootTypeFlashUpdate = 0x0004;
+        constexpr std::uint32_t noReturnOnSuccess     = 0x0100;
     }   // namespace RebootFlags
 
     // Both reboots announce themselves first (Kvasir_SDK Runtime/AnnouncedReset.hpp): a J-Link that
@@ -68,6 +71,26 @@ namespace Bootrom {
         UC_LOG_E("This should not happen reboot returned");
         Rp::watchdogReboot();   // a chip reset at least, see reboot() below
     }
+
+    // RP2350: reboot as a flash update boot (datasheet 5.1.16, 5.4.8.24) for the flash written from `windowBase` on,
+    // the XIP address of a partition's first byte (Flash::xipBase + its offset): the boot ROM then takes that
+    // partition's IMAGE_DEF whatever its version, and it is the only boot that launches a TBYB image not bought yet
+    // over the other partition of its A/B pair (5.1.17) - under the boot ROM's 16.7 s watchdog, which the image
+    // ends with Bootrom::explicitBuy() (BootInfo.hpp). The boot ROM erases the other partition's first sector when it
+    // launches an image without TBYB that way (5.1.16 step 2). Announced like reboot() below; the watchdog's chip reset
+    // if the ROM call returns. The boot type and p0 travel in watchdog SCRATCH2..7: nothing kept there survives it.
+#ifdef KVASIR_CHIP_RP2350
+    [[noreturn]] inline void rebootFlashUpdate(std::uint32_t windowBase) {
+        (void)AnnouncedReset::announce();
+        [[maybe_unused]] auto const ret = RomFunctions::reboot(RebootFlags::rebootTypeFlashUpdate
+                                                                 | RebootFlags::noReturnOnSuccess,
+                                                               1,
+                                                               windowBase,
+                                                               0);
+        UC_LOG_E("bootrom flash update reboot returned {}", ret);
+        Rp::watchdogReboot();
+    }
+#endif
 
     // Reboot the chip: both cores and every peripheral restart from the bootrom, as after a
     // power-on. PM::resetCause() reports watchdog_timer on the RP2350 (the bootrom arms the

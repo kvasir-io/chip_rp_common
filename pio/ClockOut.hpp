@@ -7,7 +7,7 @@
 #include <cstdint>
 
 namespace Kvasir { namespace Pio {
-    namespace detail {
+    namespace Detail {
         // ClockOut's configuration with its defaults, outside the class so that its state machine
         // can be ClockOut's base (StartupOf).
         template<typename Pin, typename Config_>
@@ -23,7 +23,7 @@ namespace Kvasir { namespace Pio {
 
             static constexpr auto setPins = brigand::list<Pin>{};
         };
-    }   // namespace detail
+    }   // namespace Detail
 
     /// A square wave on any GPIO, from a PIO state machine.
     ///
@@ -44,8 +44,8 @@ namespace Kvasir { namespace Pio {
     template<typename Pin, typename Config_>
     struct ClockOut
       : StartupOf<
-          Kvasir::Pio::StateMachine<ClockOutProgram, detail::ClockOutConfig<Pin, Config_>>> {
-        using Config = detail::ClockOutConfig<Pin, Config_>;
+          Kvasir::Pio::StateMachine<ClockOutProgram, Detail::ClockOutConfig<Pin, Config_>>> {
+        using Config = Detail::ClockOutConfig<Pin, Config_>;
 
         /// The 16.8 divider the state machine is given (Kvasir::Pio::getDiv truncates the
         /// fraction), and what the pin therefore does.

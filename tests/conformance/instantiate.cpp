@@ -76,12 +76,6 @@ struct SpiConfig {
     static constexpr auto isrPriority      = 3;
 };
 
-struct SpiDmaConfig {
-    static constexpr auto channelA = Dma::Channel::ch0;
-    static constexpr auto channelB = Dma::Channel::ch1;
-    static constexpr auto priority = Dma::Priority::low;
-};
-
 struct I2cConfig {
     static constexpr auto clockSpeed     = clockSpeedValue;
     static constexpr auto instance       = 1;
@@ -162,8 +156,6 @@ template struct Kvasir::UART::UartBehavior<Conformance::UartConfig,
                                            Conformance::Dma::Channel::ch0,
                                            Conformance::Dma::Priority::low,
                                            256>;
-template struct Kvasir::SPI::
-  SPIBehavior<Conformance::SpiConfig, Conformance::Dma, Conformance::SpiDmaConfig>;
 template struct Kvasir::SPI::SPIQueued<Conformance::SpiConfig,
                                        Conformance::SystickClock,
                                        Conformance::Dma,

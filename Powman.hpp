@@ -27,7 +27,7 @@
 //   Alarm::armAt(AonTimer::now() + 1500ms); Alarm::disarm();
 namespace Kvasir { namespace Powman {
 
-    namespace detail {
+    namespace Detail {
         // A 16-bit POWMAN register (XOSC_FREQ_KHZ_*, SET_TIME_*, ALARM_TIME_*): the password key field and the
         // value's field cover the word, so it is one store with no read (RP2350 datasheet 6.4, md l.23076: every
         // protected write carries 0x5AFE in bits 31:16).
@@ -37,7 +37,7 @@ namespace Kvasir { namespace Powman {
                                                    std::uint32_t value) {
             apply(write(Reg::PASSWORDValC::password), write(field, value));
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     struct TimerTag {};
 
@@ -83,10 +83,10 @@ namespace Kvasir { namespace Powman {
         static void runtimeInit() {
             timerWrite<false>();   // stop, so the source can change
             if constexpr(UseCrystal) {
-                detail::write16<typename Regs::XOSC_FREQ_KHZ_INT>(
+                Detail::write16<typename Regs::XOSC_FREQ_KHZ_INT>(
                   Regs::XOSC_FREQ_KHZ_INT::xosc_freq_khz_int,
                   khzInt);
-                detail::write16<typename Regs::XOSC_FREQ_KHZ_FRAC>(
+                Detail::write16<typename Regs::XOSC_FREQ_KHZ_FRAC>(
                   Regs::XOSC_FREQ_KHZ_FRAC::xosc_freq_khz_frac,
                   khzFrac16);
             }
@@ -120,29 +120,29 @@ namespace Kvasir { namespace Powman {
         static void set(std::chrono::milliseconds t) {
             auto const v = static_cast<std::uint64_t>(t.count());
             timerWrite<false>(sourceTrigger());   // run clear: stopped
-            detail::write16<typename Regs::SET_TIME_15TO0>(Regs::SET_TIME_15TO0::set_time_15to0,
+            Detail::write16<typename Regs::SET_TIME_15TO0>(Regs::SET_TIME_15TO0::set_time_15to0,
                                                            static_cast<std::uint32_t>(v));
-            detail::write16<typename Regs::SET_TIME_31TO16>(Regs::SET_TIME_31TO16::set_time_31to16,
+            Detail::write16<typename Regs::SET_TIME_31TO16>(Regs::SET_TIME_31TO16::set_time_31to16,
                                                             static_cast<std::uint32_t>(v >> 16));
-            detail::write16<typename Regs::SET_TIME_47TO32>(Regs::SET_TIME_47TO32::set_time_47to32,
+            Detail::write16<typename Regs::SET_TIME_47TO32>(Regs::SET_TIME_47TO32::set_time_47to32,
                                                             static_cast<std::uint32_t>(v >> 32));
-            detail::write16<typename Regs::SET_TIME_63TO48>(Regs::SET_TIME_63TO48::set_time_63to48,
+            Detail::write16<typename Regs::SET_TIME_63TO48>(Regs::SET_TIME_63TO48::set_time_63to48,
                                                             static_cast<std::uint32_t>(v >> 48));
             timerWrite<true>(sourceTrigger());
         }
 
         // -- the alarm, used by Alarm<> below -------------------------------------------
         static void setAlarmTime(std::uint64_t ms) {
-            detail::write16<typename Regs::ALARM_TIME_15TO0>(
+            Detail::write16<typename Regs::ALARM_TIME_15TO0>(
               Regs::ALARM_TIME_15TO0::alarm_time_15to0,
               static_cast<std::uint32_t>(ms));
-            detail::write16<typename Regs::ALARM_TIME_31TO16>(
+            Detail::write16<typename Regs::ALARM_TIME_31TO16>(
               Regs::ALARM_TIME_31TO16::alarm_time_31to16,
               static_cast<std::uint32_t>(ms >> 16));
-            detail::write16<typename Regs::ALARM_TIME_47TO32>(
+            Detail::write16<typename Regs::ALARM_TIME_47TO32>(
               Regs::ALARM_TIME_47TO32::alarm_time_47to32,
               static_cast<std::uint32_t>(ms >> 32));
-            detail::write16<typename Regs::ALARM_TIME_63TO48>(
+            Detail::write16<typename Regs::ALARM_TIME_63TO48>(
               Regs::ALARM_TIME_63TO48::alarm_time_63to48,
               static_cast<std::uint32_t>(ms >> 48));
         }

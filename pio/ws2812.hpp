@@ -31,7 +31,7 @@ namespace Kvasir { namespace Pio {
         unsigned t3;
     };
 
-    namespace detail {
+    namespace Detail {
         // WS2812's configuration, program, timing checks and state machine, outside the class so
         // that the state machine can be WS2812's base (StartupOf). WS2812 derives from it too:
         // its names stay WS2812's (NeoPixel::Program, ::DivFactor, ::PinIndex ...).
@@ -120,7 +120,7 @@ namespace Kvasir { namespace Pio {
             // from the instance's GPIOBASE, not from GPIO 0 (PIO.hpp); StateMachine checks the window.
             static constexpr unsigned pinIndex = Kvasir::Pio::pinIndex(pinNumber, Config::gpioBase);
         };
-    }   // namespace detail
+    }   // namespace Detail
 
     /// Drives a chain of WS2812-style LEDs from one PIO state machine, fed by DMA.
     ///
@@ -154,9 +154,9 @@ namespace Kvasir { namespace Pio {
              typename Dma::Priority DmaPriority,
              typename Config_>
     struct WS2812
-      : detail::Ws2812Parts<Pin, Config_>
-      , StartupOf<typename detail::Ws2812Parts<Pin, Config_>::Sm> {
-        using Parts = detail::Ws2812Parts<Pin, Config_>;
+      : Detail::Ws2812Parts<Pin, Config_>
+      , StartupOf<typename Detail::Ws2812Parts<Pin, Config_>::Sm> {
+        using Parts = Detail::Ws2812Parts<Pin, Config_>;
         using typename Parts::Config;
         using typename Parts::Sm;
 

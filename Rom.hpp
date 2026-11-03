@@ -95,13 +95,6 @@ namespace Kvasir { namespace RomFunctions {
         return RomFunctions::call<'F', 'A', rom_flash_runtime_to_storage_addr>(addr);
     }
 
-    static inline int explicitBuy(std::uint8_t* buffer,
-                                  std::uint32_t bufferSize) {
-        using rom_explicit_buy = int (*)(std::uint8_t* buffer, std::uint32_t bufferSize);
-
-        return RomFunctions::call<'E', 'B', rom_explicit_buy>(buffer, bufferSize);
-    }
-
     // flash_op flags
     namespace FlashOpFlags {
         // Address translation (select one)

@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <peripherals/TIMER.hpp>
 
-namespace Kvasir::Rp::detail {
+namespace Kvasir::Rp::Detail {
 [[gnu::always_inline]] inline std::uint64_t timerRawUs() {
     using Regs       = Kvasir::Peripheral::TIMER::Registers<0>;
     std::uint32_t hi = get<0>(apply(read(Regs::TIMERAWH::FULLREGISTER)));
@@ -28,11 +28,11 @@ namespace Kvasir::Rp::detail {
     }
     return (static_cast<std::uint64_t>(hi) << 32U) | lo;
 }
-}   // namespace Kvasir::Rp::detail
+}   // namespace Kvasir::Rp::Detail
 
 template<typename... Ts>
 struct Kvasir::Port::FreeRunningUs<Kvasir::Tag::User, Ts...> {
     [[gnu::always_inline]] std::uint64_t operator()() const {
-        return Kvasir::Rp::detail::timerRawUs();
+        return Kvasir::Rp::Detail::timerRawUs();
     }
 };

@@ -7,7 +7,7 @@
 #include <cstdint>
 
 namespace {
-namespace D = Kvasir::DefaultClockSettings::detail;
+namespace D = Kvasir::DefaultClockSettings::Detail;
 
 constexpr unsigned long long mhz = 1'000'000;
 

@@ -21,13 +21,17 @@
     #include "peripherals/QMI.hpp"
 #endif
 // the RP2040: its boot2 (Startup::second_stage_bootloader), XIP_SSI and IO_QSPI
+// a multicore image: core 1 is kept out of the flash for every XIP-off stretch (Multicore.hpp Core1Lockout)
+#ifdef KVASIR_MULTICORE
+    #include "Multicore.hpp"
+#endif
 #ifdef KVASIR_CHIP_RP2040
     #include "chip/StartUp.hpp"
     #include "peripherals/IO_QSPI.hpp"
     #include "peripherals/XIP_SSI.hpp"
 #endif
 
-namespace Kvasir { namespace detail {
+namespace Kvasir { namespace Detail {
 #ifdef KVASIR_CHIP_RP2350
     // One transaction on chip select 0 in QMI direct mode (RP2350 datasheet 12.14.5) at
     // clk_sys / clkdiv: byte i of `rx` arrives while byte i of `tx` goes out, the first `rxSize`
@@ -119,6 +123,17 @@ namespace Kvasir { namespace detail {
     //
     // Exception: with quadEnableSr2 set (FlashQuadEnable), the bootrom's BBh is upgraded too.
     //
+    // The other exception: serial 03h Read Data (M0_RFMT 0x1000, the register's reset value, RP2350 datasheet
+    // Table 1298; M0_RCMD prefix 03h), what the bootrom leaves after it has loaded a RAM image from flash, always
+    // becomes 0Bh Fast Read. 03h has no dummy cycles and is rated well below the timing written here, which runs SCK
+    // at up to 100 MHz (fR: 50 MHz W25Q128JV, 9.6 "AC Electrical Characteristics"; 80 MHz PY25Q128HA, 5.3 "AC
+    // Characteristics"), so the first byte of a transfer can come out before it is valid (seen as byte 0 of every word
+    // wrong; not with every flash and board). A read-modify-write of flash through XIP then writes that byte back
+    // wrong - the bootrom's explicit_buy (BootInfo.hpp) rewrites the sector holding the TBYB flag so, and one flipped
+    // bit in the image's hashed range makes the next boot reject the image.
+    // 0Bh is the same transfer with 8 dummy clocks, rated for fC (133 MHz on both parts), and needs no mode set in
+    // the flash.
+    //
     // Runs from RAM with interrupts off and the QMI idle: while the format changes,
     // nothing may fetch from flash. peripheryClockInit() calls it once at boot,
     // FlashXipDisabler::enable() after every direct-mode access (the BOOTRAM setup
@@ -147,6 +162,16 @@ namespace Kvasir { namespace detail {
         static constexpr std::uint32_t commandEBh         = 0xEBU;
         static constexpr std::uint32_t commandBBh         = 0xBBU;
         static constexpr std::uint32_t continuousModeBits = 0xA0U;
+        // Serial reads, every phase on one line: 03h with an 8-bit command and nothing else, 0Bh the same with 8 dummy
+        // bits (8 clocks on one line; M0_RFMT DUMMY_LEN counts 4-bit units, Table 1298)
+        static constexpr std::uint32_t rfmtSerial03h
+          = qmiAt(Rfmt::prefix_len, Rfmt::PREFIX_LENVal::_8);
+        static constexpr std::uint32_t rfmtSerial0Bh
+          = rfmtSerial03h | qmiAt(Rfmt::dummy_len, Rfmt::DUMMY_LENVal::_8);
+        static_assert(rfmtSerial03h == 0x0000'1000U && rfmtSerial0Bh == 0x0002'1000U,
+                      "M0_RFMT: PREFIX_LEN bit 12, DUMMY_LEN 18:16");
+        static constexpr std::uint32_t commandRead03h     = 0x03U;
+        static constexpr std::uint32_t commandFastRead0Bh = 0x0BU;
         // M0_RCMD's PREFIX (the command byte) and SUFFIX (the mode bits) in a snapshot of the register: the masks of the
         // fields, the shape of the compares as before the field names (extract() let the optimiser lay the RAM
         // function's branches out otherwise: +4 B)
@@ -212,6 +237,18 @@ namespace Kvasir { namespace detail {
 
             auto const rfmt = readWhole(QMI::M0_RFMT::FULLREGISTER);
             auto const rcmd = readWhole(QMI::M0_RCMD::FULLREGISTER);
+            // 03h is out of its rating at this timing (above). Nothing has fetched from flash since the timing was
+            // written (RAM code, interrupts off): the QMI is still idle.
+            if(rfmt == rfmtSerial03h && (rcmd & prefixMask) == commandRead03h) {
+                Kvasir::Register::apply(
+                  Kvasir::Register::write(Rcmd::prefix,
+                                          Kvasir::Register::value<commandFastRead0Bh>()),
+                  Kvasir::Register::write(Rcmd::suffix, Kvasir::Register::value<0U>()));
+                writeWhole(QMI::M0_RFMT::FULLREGISTER, rfmtSerial0Bh);
+                Kvasir::Core::dsb();
+                Kvasir::Core::isb();
+                return;
+            }
             bool const upgrade
               = isQuadEBh(rfmt, rcmd) || (quadEnableSr2 != 0 && (rcmd & prefixMask) == commandBBh);
             if(!upgrade || isContinuous(rfmt, rcmd)) { return; }
@@ -268,6 +305,10 @@ namespace Kvasir { namespace detail {
 
 #ifdef KVASIR_CHIP_RP2350
         std::uint32_t flashTiming;
+#endif
+#ifdef KVASIR_MULTICORE
+        // core 1 parked in RAM from the disabler's construction until it is gone (after its XipGuard put XIP back)
+        Multicore::Core1Lockout::Guard lockout{};
 #endif
 
         static std::array<std::uint32_t,
@@ -452,4 +493,4 @@ namespace Kvasir { namespace detail {
     }
 
 #endif
-}}   // namespace Kvasir::detail
+}}   // namespace Kvasir::Detail

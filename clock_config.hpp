@@ -145,7 +145,7 @@ namespace Kvasir { namespace DefaultClockSettings {
     template<auto ClockSpeed, auto CrystalSpeed>
     using Provides = Clocks::DefaultProvides<ClockSpeed, CrystalSpeed>;
 
-    namespace detail {
+    namespace Detail {
         // CLK_x_SELECTED == 1 << src, one decoded bit per CTRL SRC value (RP2040 datasheet Tables 222/225, RP2350
         // Tables 558/561), as a wait condition on the register's one field; may read 0 mid-switch.
         template<auto Selected, unsigned Src>
@@ -312,9 +312,9 @@ namespace Kvasir { namespace DefaultClockSettings {
                 return false;
             }
         }
-    }   // namespace detail
+    }   // namespace Detail
 
-    namespace detail {
+    namespace Detail {
         // CLK_REF_DIV for clk_ref on the ring oscillator (Clocks::onRingOscillator): the ROSC's undivided ceiling
         // (Rp::ChipTraits::roscBaseHzCeiling) over ROSC.DIV's divisor (RP2040 Table 269 md l.10863: 0xaa0 + div;
         // RP2350 Table 611 md l.28310: 0xaa00 + div; 0 and other values per the traits), divided further until clk_ref
@@ -342,7 +342,7 @@ namespace Kvasir { namespace DefaultClockSettings {
             while(k < refDivMax && k * div * refKhz < baseKhz) { ++k; }
             return k;
         }
-    }   // namespace detail
+    }   // namespace Detail
 }}   // namespace Kvasir::DefaultClockSettings
 
 namespace Kvasir { namespace Clocks {
@@ -359,10 +359,10 @@ namespace Kvasir { namespace Clocks {
     template<std::uint64_t CeilingHz = Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling>
     [[nodiscard]] bool onRingOscillator() {
         using Clk = Kvasir::Peripheral::CLOCKS::Registers<>;
-        using DefaultClockSettings::detail::selectedIs;
-        using DefaultClockSettings::detail::waited;
+        using DefaultClockSettings::Detail::selectedIs;
+        using DefaultClockSettings::Detail::waited;
         using Kvasir::Register::value;
-        std::uint32_t const want = DefaultClockSettings::detail::roscRefDivisor<CeilingHz>();
+        std::uint32_t const want = DefaultClockSettings::Detail::roscRefDivisor<CeilingHz>();
         // INT 0 (= its largest + 1) is never written by Kvasir; the A3+ boot ROM leaves 5 (md l.66193)
         std::uint32_t const now = get<0>(apply(read(Clk::CLK_REF_DIV::_int)));
         if(want > now) { apply(write(Clk::CLK_REF_DIV::_int, want)); }
@@ -436,7 +436,7 @@ namespace Kvasir { namespace DefaultClockSettings {
 
             // The regulator ignores writes while an update is in flight (6.3.2, md l.22847); an update takes
             // microseconds, so the polls are bounded (at clk_ref speed a few ms each).
-            bool const idle = detail::waited<Kvasir::Chip::VregUpdateBound>(
+            bool const idle = Detail::waited<Kvasir::Chip::VregUpdateBound>(
               Kvasir::Register::isClear(VREG::update_in_progress));
             // Only a change needs the write and the settling time. The voltage is back at 1.10 V "at
             // initial power-on or after a reset event" (6.3.2), which events the data sheet does not
@@ -445,7 +445,7 @@ namespace Kvasir { namespace DefaultClockSettings {
             if(!idle || get<0>(apply(read(VREG::vsel))) != vsel1v15) {
                 apply(write(VREG::PASSWORDValC::password),
                       write(VREG::vsel, value<std::uint32_t, vsel1v15>()));
-                if(!detail::waited<Kvasir::Chip::VregUpdateBound>(
+                if(!Detail::waited<Kvasir::Chip::VregUpdateBound>(
                      Kvasir::Register::isClear(VREG::update_in_progress)))
                 {
                     return false;
@@ -485,7 +485,7 @@ namespace Kvasir { namespace DefaultClockSettings {
 #endif
     }
 
-    namespace detail {
+    namespace Detail {
         // The QMI's M0_TIMING for the flash at the final clock: divider, sample delay,
         // deselect time (the fields: FlashTimingMath.hpp, with flashClkdiv and bootClkdiv). Applied by
         // XipReadMode::apply() in peripheryClockInit(), from RAM, after the PLL switch - see flashInit() for why
@@ -524,7 +524,7 @@ namespace Kvasir { namespace DefaultClockSettings {
             return (full & ~Timing::clkdiv.mask) | Kvasir::Register::deposit(Timing::clkdiv, div);
         }
 #endif
-    }   // namespace detail
+    }   // namespace Detail
 
     // Before the PLL switch, from flash, on the ring oscillator: only the divider.
     //
@@ -542,8 +542,8 @@ namespace Kvasir { namespace DefaultClockSettings {
 #ifdef KVASIR_CHIP_RP2350
         using namespace Kvasir::Peripheral::QMI;
         using QMI = Registers<0>;
-        (void)detail::flashTiming<ClockSpeed, MaxFlashFreq>();   // the static_asserts
-        constexpr std::uint32_t bootClkdiv = detail::bootClkdiv<ClockSpeed, MaxFlashFreq>();
+        (void)Detail::flashTiming<ClockSpeed, MaxFlashFreq>();   // the static_asserts
+        constexpr std::uint32_t bootClkdiv = Detail::bootClkdiv<ClockSpeed, MaxFlashFreq>();
         // This divider with rxdelay 2 (XipReadMode::TimingAtClkRef, which the resus handler runs
         // coreClockInit() on) samples half an SCK period plus one clk_sys cycle after the edge the
         // flash launches on. The bit is valid from 10 ns after that edge at the latest: 2.5 ns
@@ -559,7 +559,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         // clk_sys goes up (RP2350 datasheet, Table 1297 M0_TIMING.CLKDIV): the next fetch may hit
         // the XIP cache, so read the uncached alias (XIP_NOCACHE_NOALLOC_BASE, 2.2 address map).
         Kvasir::Core::dsb();
-        (void)Kvasir::Memory::load<std::uint32_t>(Kvasir::detail::XipReadMode::xipNoCacheBase);
+        (void)Kvasir::Memory::load<std::uint32_t>(Kvasir::Detail::XipReadMode::xipNoCacheBase);
         Kvasir::Core::dsb();
 #endif
 
@@ -569,7 +569,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         apply(Kvasir::Peripheral::XIP_CTRL::Registers<>::CTRL::overrideDefaults());
     }
 
-    namespace detail {
+    namespace Detail {
         // The TIMER's microsecond tick, in every image: the generator divides clk_ref (the crystal, after
         // coreClockInit's switch) by CYCLES. RP2040: WATCHDOG.TICK (4.7.2, Table 550: ENABLE resets to 1, CYCLES to
         // 0 - no tick), which the TIMER needs to count at all (4.6.4: "The Watchdog tick ... must be running for the
@@ -646,9 +646,9 @@ namespace Kvasir { namespace DefaultClockSettings {
                                              clear(Pll::PWR::postdivpd)));
             return true;
         }
-    }   // namespace detail
+    }   // namespace Detail
 
-    namespace detail {
+    namespace Detail {
         // A generator without a glitchless mux stopped before its AUXSRC changes (RP2040 datasheet 2.15.3.2, RP2350
         // 8.1.3.2). RP2350: CTRL.ENABLED follows ENABLE once it has stopped (Tables 562, 568, 571), waited for bounded;
         // RP2040: no such bit - three cycles of the slowest old source (the ROSC, Rp::ChipTraits::roscHzFloor) at the
@@ -716,7 +716,7 @@ namespace Kvasir { namespace DefaultClockSettings {
                        1>)
                 && get<0>(apply(read(Sys::auxsrc))) == Sys::AUXSRCVal::clksrc_pll_sys;
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     // The boot's clock tree, from whatever the boot ROM, a previous image or a resus left: clk_ref on the crystal,
     // clk_sys = clk_peri on PLL_SYS at ClockSpeed, clk_usb and clk_adc on PLL_USB at 48 MHz. Registers only (it runs
@@ -730,19 +730,19 @@ namespace Kvasir { namespace DefaultClockSettings {
     void coreClockInit() {
         using Kvasir::Register::value;
 
-        static constexpr auto pllSettings    = detail::calcPllSettings(ClockSpeed, CrystalSpeed);
-        static constexpr auto usbPllSettings = detail::calcPllSettings(48'000'000, CrystalSpeed);
+        static constexpr auto pllSettings    = Detail::calcPllSettings(ClockSpeed, CrystalSpeed);
+        static constexpr auto usbPllSettings = Detail::calcPllSettings(48'000'000, CrystalSpeed);
 
         static_assert(pllSettings.refdiv != 0,
                       "no PLL setting for ClockSpeed: none comes nearer than ClockSpeed itself "
                       "(the PLL gives 750 MHz / 49 at the least, see detail::calcPllSettings)");
         static_assert(usbPllSettings.refdiv != 0, "no USB PLL setting for 48 MHz");
         // exactly, or the message says by how much it is missed
-        Prescaler::assertInTolerance<detail::pllOutput(CrystalSpeed, pllSettings),
+        Prescaler::assertInTolerance<Detail::pllOutput(CrystalSpeed, pllSettings),
                                      ClockSpeed,
                                      Prescaler::Tolerance{0, 1},
                                      "clk_sys PLL">();
-        Prescaler::assertInTolerance<detail::pllOutput(CrystalSpeed, usbPllSettings),
+        Prescaler::assertInTolerance<Detail::pllOutput(CrystalSpeed, usbPllSettings),
                                      48'000'000,
                                      Prescaler::Tolerance{0, 1},
                                      "clk_usb PLL">();
@@ -759,7 +759,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         using RST         = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL         = Kvasir::Peripheral::PLL::Registers<0>;
         using USBPLL      = Kvasir::Peripheral::PLL::Registers<1>;
-        using detail::waited;
+        using Detail::waited;
 
         // clk_usb / clk_adc off first (their destinations are in reset at boot; a resus repair resets PLL_USB
         // below anyway): only the last step turns them on again, so their enables tell initResult() a finished init
@@ -817,10 +817,10 @@ namespace Kvasir { namespace DefaultClockSettings {
         // l.25697), on clk_ref on the ROSC (Chip::XoscStableBoundFor counts at its ceiling), then
         // Clocks::XoscStartupConfig's check
         using XoscStable
-          = Kvasir::Chip::XoscStableBoundFor<detail::XoscConfig<CrystalSpeed>::startupMs>;
-        detail::enableCrystal<CrystalSpeed>();
+          = Kvasir::Chip::XoscStableBoundFor<Detail::XoscConfig<CrystalSpeed>::startupMs>;
+        Detail::enableCrystal<CrystalSpeed>();
         if(!waited<XoscStable>(Kvasir::Register::isSet(XOSC::STATUS::stable))
-           || !detail::crystalSettled<CrystalSpeed>())
+           || !Detail::crystalSettled<CrystalSpeed>())
         {
             return;
         }
@@ -834,15 +834,15 @@ namespace Kvasir { namespace DefaultClockSettings {
         // md l.26025)
         apply(write(RefClock::SRCValC::xosc_clksrc));
         if(!waited<Kvasir::Chip::ClkSelectedBound>(
-             detail::selectedIs<RefSelected::clk_ref_selected, 2>))
+             Detail::selectedIs<RefSelected::clk_ref_selected, 2>))
         {
             return;
         }
         apply(write(RefClockDiv::_int, value<std::uint32_t{1}>()));
-        if(!detail::startTimerTick<CrystalSpeed>()) { return; }
+        if(!Detail::startTimerTick<CrystalSpeed>()) { return; }
 
         {   //sys pll, waited for with clk_sys on clk_ref = the crystal
-            if(!detail::pllInit<PLL,
+            if(!Detail::pllInit<PLL,
                                 RST::RESET::pll_sys,
                                 RST::RESET_DONE::pll_sys,
                                 pllSettings,
@@ -855,7 +855,7 @@ namespace Kvasir { namespace DefaultClockSettings {
             apply(write(SysClock::AUXSRCValC::clksrc_pll_sys));
             apply(write(SysClock::SRCValC::clksrc_clk_sys_aux));
             if(!waited<Kvasir::Chip::ClkSelectedBound>(
-                 detail::selectedIs<SysSelected::clk_sys_selected, 1>))
+                 Detail::selectedIs<SysSelected::clk_sys_selected, 1>))
             {
                 return;
             }
@@ -865,7 +865,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         }
 
         {   //usb pll, waited for with clk_sys on PLL_SYS
-            if(!detail::pllInit<USBPLL,
+            if(!Detail::pllInit<USBPLL,
                                 RST::RESET::pll_usb,
                                 RST::RESET_DONE::pll_usb,
                                 usbPllSettings,
@@ -916,8 +916,8 @@ namespace Kvasir { namespace DefaultClockSettings {
         using XOSC = Kvasir::Peripheral::XOSC::Registers<>;
         using RST  = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL  = Kvasir::Peripheral::PLL::Registers<0>;
-        using detail::selectedIs;
-        using detail::waited;
+        using Detail::selectedIs;
+        using Detail::waited;
         using Kvasir::Register::value;
         // clk_ref on the ROSC at most at the crystal's frequency, and never over its own ceiling
         constexpr std::uint64_t roscRefHz
@@ -943,8 +943,8 @@ namespace Kvasir { namespace DefaultClockSettings {
             }
             apply(write(Clk::CLK_REF_DIV::_int, value<std::uint32_t{1}>()));
             bool const onPllSys
-              = detail::sysOnPllSys()
-             && detail::pllUp<PLL, RST::RESET::pll_sys, RST::RESET_DONE::pll_sys>();
+              = Detail::sysOnPllSys()
+             && Detail::pllUp<PLL, RST::RESET::pll_sys, RST::RESET_DONE::pll_sys>();
             if(!onPllSys) {
                 apply(write(Clk::CLK_SYS_CTRL::SRCValC::clk_ref));
                 if(!waited<Kvasir::Chip::ClkSelectedBound>(
@@ -959,14 +959,14 @@ namespace Kvasir { namespace DefaultClockSettings {
             tree = onPllSys ? DegradedTree::noPllUsb : DegradedTree::crystal;
         }
         // clk_peri: no glitchless mux - stopped, clk_sys, started
-        if(!detail::stopGenerator<Clk::CLK_PERI_CTRL>()) { return DegradedTree::none; }
+        if(!Detail::stopGenerator<Clk::CLK_PERI_CTRL>()) { return DegradedTree::none; }
         apply(write(Clk::CLK_PERI_CTRL::AUXSRCValC::clk_sys));
         apply(set(Clk::CLK_PERI_CTRL::enable));
-        if(!detail::startTimerTick<CrystalSpeed>()) { return DegradedTree::none; }
+        if(!Detail::startTimerTick<CrystalSpeed>()) { return DegradedTree::none; }
         bool const marked = tree == DegradedTree::ringOscillator
-                            ? detail::usbAdcTo(Clk::CLK_USB_CTRL::AUXSRCValC::rosc_clksrc_ph,
+                            ? Detail::usbAdcTo(Clk::CLK_USB_CTRL::AUXSRCValC::rosc_clksrc_ph,
                                                Clk::CLK_ADC_CTRL::AUXSRCValC::rosc_clksrc_ph)
-                            : detail::usbAdcTo(Clk::CLK_USB_CTRL::AUXSRCValC::xosc_clksrc,
+                            : Detail::usbAdcTo(Clk::CLK_USB_CTRL::AUXSRCValC::xosc_clksrc,
                                                Clk::CLK_ADC_CTRL::AUXSRCValC::xosc_clksrc);
         return marked ? tree : DegradedTree::none;
     }
@@ -980,8 +980,8 @@ namespace Kvasir { namespace DefaultClockSettings {
         using XOSC = Kvasir::Peripheral::XOSC::Registers<>;
         auto const st
           = apply(read(XOSC::STATUS::stable), read(XOSC::STATUS::enabled));   // one load
-        if(static_cast<bool>(get<0>(st))) { return detail::crystalSettled<CrystalSpeed>(); }
-        if(!static_cast<bool>(get<1>(st))) { detail::enableCrystal<CrystalSpeed>(); }
+        if(static_cast<bool>(get<0>(st))) { return Detail::crystalSettled<CrystalSpeed>(); }
+        if(!static_cast<bool>(get<1>(st))) { Detail::enableCrystal<CrystalSpeed>(); }
         return false;
     }
 
@@ -1000,8 +1000,8 @@ namespace Kvasir { namespace DefaultClockSettings {
              auto CrystalSpeed>
     [[nodiscard]] Clocks::InitResult startSources() {
         using Clocks::InitResult;
-        static constexpr auto pllSettings    = detail::calcPllSettings(ClockSpeed, CrystalSpeed);
-        static constexpr auto usbPllSettings = detail::calcPllSettings(48'000'000, CrystalSpeed);
+        static constexpr auto pllSettings    = Detail::calcPllSettings(ClockSpeed, CrystalSpeed);
+        static constexpr auto usbPllSettings = Detail::calcPllSettings(48'000'000, CrystalSpeed);
         // clk_sys = clk_ref while a PLL comes up: on the ROSC or the crystal, whichever may be faster
         static constexpr std::uint64_t refHz
           = Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling > static_cast<std::uint64_t>(CrystalSpeed)
@@ -1012,25 +1012,25 @@ namespace Kvasir { namespace DefaultClockSettings {
         using RST    = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL    = Kvasir::Peripheral::PLL::Registers<0>;
         using USBPLL = Kvasir::Peripheral::PLL::Registers<1>;
-        using detail::waited;
+        using Detail::waited;
 
         if(!vregInit<ClockSpeed>()) { return InitResult::voltageNotSet; }
         if(!apply(read(XOSC::STATUS::stable))) {
             using XoscStable
-              = Kvasir::Chip::XoscStableBoundFor<detail::XoscConfig<CrystalSpeed>::startupMs>;
-            detail::enableCrystal<CrystalSpeed>();
+              = Kvasir::Chip::XoscStableBoundFor<Detail::XoscConfig<CrystalSpeed>::startupMs>;
+            Detail::enableCrystal<CrystalSpeed>();
             if(!waited<XoscStable>(Kvasir::Register::isSet(XOSC::STATUS::stable))
-               || !detail::crystalSettled<CrystalSpeed>())
+               || !Detail::crystalSettled<CrystalSpeed>())
             {
                 return InitResult::xoscNotStable;
             }
         }
-        bool const sysOnPll = detail::sysOnPllSys();
+        bool const sysOnPll = Detail::sysOnPllSys();
         if(sysOnPll) {
-            if(!detail::pllUp<PLL, RST::RESET::pll_sys, RST::RESET_DONE::pll_sys>()) {
+            if(!Detail::pllUp<PLL, RST::RESET::pll_sys, RST::RESET_DONE::pll_sys>()) {
                 return InitResult::pllSysNotLocked;
             }
-        } else if(!detail::pllInit<PLL,
+        } else if(!Detail::pllInit<PLL,
                                    RST::RESET::pll_sys,
                                    RST::RESET_DONE::pll_sys,
                                    pllSettings,
@@ -1042,24 +1042,24 @@ namespace Kvasir { namespace DefaultClockSettings {
         using Adc                    = Clk::CLK_ADC_CTRL;
         constexpr auto usbFromPllUsb = Usb::AUXSRCVal::clksrc_pll_usb;
         constexpr auto adcFromPllUsb = Adc::AUXSRCVal::clksrc_pll_usb;
-        bool const     usbOn         = detail::runsFrom<Usb, usbFromPllUsb>();
-        bool const     adcOn         = detail::runsFrom<Adc, adcFromPllUsb>();
-        if(usbOn && adcOn && detail::pllUp<USBPLL, RST::RESET::pll_usb, RST::RESET_DONE::pll_usb>())
+        bool const     usbOn         = Detail::runsFrom<Usb, usbFromPllUsb>();
+        bool const     adcOn         = Detail::runsFrom<Adc, adcFromPllUsb>();
+        if(usbOn && adcOn && Detail::pllUp<USBPLL, RST::RESET::pll_usb, RST::RESET_DONE::pll_usb>())
         {
             return InitResult::ok;
         }
         // nothing may run from PLL_USB while it is reset
         if(usbOn || adcOn) {
-            if(!detail::stopGenerator<Usb>() || !detail::stopGenerator<Adc>()) {
+            if(!Detail::stopGenerator<Usb>() || !Detail::stopGenerator<Adc>()) {
                 return InitResult::clockSwitchNotTaken;
             }
         }
-        bool const usbPll = sysOnPll ? detail::pllInit<USBPLL,
+        bool const usbPll = sysOnPll ? Detail::pllInit<USBPLL,
                                                        RST::RESET::pll_usb,
                                                        RST::RESET_DONE::pll_usb,
                                                        usbPllSettings,
                                                        Kvasir::Chip::PllLockBound<ClockSpeed>>()
-                                     : detail::pllInit<USBPLL,
+                                     : Detail::pllInit<USBPLL,
                                                        RST::RESET::pll_usb,
                                                        RST::RESET_DONE::pll_usb,
                                                        usbPllSettings,
@@ -1083,16 +1083,16 @@ namespace Kvasir { namespace DefaultClockSettings {
         using RST    = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL    = Kvasir::Peripheral::PLL::Registers<0>;
         using USBPLL = Kvasir::Peripheral::PLL::Registers<1>;
-        using detail::selectedIs;
-        using detail::waited;
+        using Detail::selectedIs;
+        using Detail::waited;
         using Kvasir::Register::fieldEquals;
         using Kvasir::Register::value;
 
         if(!apply(read(XOSC::STATUS::stable))) { return InitResult::xoscNotStable; }
-        if(!detail::pllUp<PLL, RST::RESET::pll_sys, RST::RESET_DONE::pll_sys>()) {
+        if(!Detail::pllUp<PLL, RST::RESET::pll_sys, RST::RESET_DONE::pll_sys>()) {
             return InitResult::pllSysNotLocked;
         }
-        if(!detail::pllUp<USBPLL, RST::RESET::pll_usb, RST::RESET_DONE::pll_usb>()) {
+        if(!Detail::pllUp<USBPLL, RST::RESET::pll_usb, RST::RESET_DONE::pll_usb>()) {
             return InitResult::pllUsbNotLocked;
         }
         // CLK_x_SELECTED is one-hot over CTRL.SRC (RP2040 Tables 222/225, RP2350 Tables 558/561)
@@ -1105,7 +1105,7 @@ namespace Kvasir { namespace DefaultClockSettings {
             }
         }
         apply(write(Clk::CLK_REF_DIV::_int, value<std::uint32_t{1}>()));
-        if(!detail::sysOnPllSys()) {
+        if(!Detail::sysOnPllSys()) {
             // the aux mux changes only while the glitchless one is on clk_ref
             if(!fieldEquals(selectedIs<Clk::CLK_SYS_SELECTED::clk_sys_selected, 0>)) {
                 apply(write(Clk::CLK_SYS_CTRL::SRCValC::clk_ref));
@@ -1130,10 +1130,10 @@ namespace Kvasir { namespace DefaultClockSettings {
         }
         using Usb = Clk::CLK_USB_CTRL;
         using Adc = Clk::CLK_ADC_CTRL;
-        if(!detail::runsFrom<Usb, Usb::AUXSRCVal::clksrc_pll_usb>()
-           || !detail::runsFrom<Adc, Adc::AUXSRCVal::clksrc_pll_usb>())
+        if(!Detail::runsFrom<Usb, Usb::AUXSRCVal::clksrc_pll_usb>()
+           || !Detail::runsFrom<Adc, Adc::AUXSRCVal::clksrc_pll_usb>())
         {
-            if(!detail::usbAdcTo(Usb::AUXSRCValC::clksrc_pll_usb, Adc::AUXSRCValC::clksrc_pll_usb))
+            if(!Detail::usbAdcTo(Usb::AUXSRCValC::clksrc_pll_usb, Adc::AUXSRCValC::clksrc_pll_usb))
             {
                 return InitResult::clockSwitchNotTaken;
             }
@@ -1155,8 +1155,8 @@ namespace Kvasir { namespace Clocks {
         using Clk = Kvasir::Peripheral::CLOCKS::Registers<>;
         using Usb = Clk::CLK_USB_CTRL;
         using Adc = Clk::CLK_ADC_CTRL;
-        return DefaultClockSettings::detail::runsFrom<Usb, Usb::AUXSRCVal::clksrc_pll_usb>()
-            && DefaultClockSettings::detail::runsFrom<Adc, Adc::AUXSRCVal::clksrc_pll_usb>();
+        return DefaultClockSettings::Detail::runsFrom<Usb, Usb::AUXSRCVal::clksrc_pll_usb>()
+            && DefaultClockSettings::Detail::runsFrom<Adc, Adc::AUXSRCVal::clksrc_pll_usb>();
     }
 
     /// Which of DefaultClockSettings::degradedClockInit()'s trees this boot runs on (Clocks::DegradedBoot), from the
@@ -1168,7 +1168,7 @@ namespace Kvasir { namespace Clocks {
         if(!static_cast<bool>(get<0>(c))) { return DegradedTree::none; }
         if(get<1>(c) == Usb::AUXSRCVal::rosc_clksrc_ph) { return DegradedTree::ringOscillator; }
         if(get<1>(c) != Usb::AUXSRCVal::xosc_clksrc) { return DegradedTree::none; }
-        return DefaultClockSettings::detail::sysOnPllSys() ? DegradedTree::noPllUsb
+        return DefaultClockSettings::Detail::sysOnPllSys() ? DegradedTree::noPllUsb
                                                            : DegradedTree::crystal;
     }
 
@@ -1177,9 +1177,9 @@ namespace Kvasir { namespace Clocks {
 
     /// clk_sys runs from PLL_SYS (its glitchless mux on the aux input, the aux mux on PLL_SYS): what a test that
     /// breaks PLL_SYS on purpose asks first - never break the clock clk_sys runs from.
-    [[nodiscard]] inline bool sysOnPllSys() { return DefaultClockSettings::detail::sysOnPllSys(); }
+    [[nodiscard]] inline bool sysOnPllSys() { return DefaultClockSettings::Detail::sysOnPllSys(); }
 
-    namespace detail {
+    namespace Detail {
         // initResult()'s answer when the init did not finish: cold and out of line, so the boot that works pays two
         // register reads
         [[nodiscard,
@@ -1200,9 +1200,9 @@ namespace Kvasir { namespace Clocks {
                 // The crystal step comes after the switches to the ROSC: an init that stopped before it (a power-on
                 // boot, where the crystal was never enabled) left them undone
                 bool const parked
-                  = Register::fieldEquals(DefaultClockSettings::detail::
+                  = Register::fieldEquals(DefaultClockSettings::Detail::
                                             selectedIs<Clk::CLK_REF_SELECTED::clk_ref_selected, 0>)
-                 && Register::fieldEquals(DefaultClockSettings::detail::
+                 && Register::fieldEquals(DefaultClockSettings::Detail::
                                             selectedIs<Clk::CLK_SYS_SELECTED::clk_sys_selected, 0>);
 #ifdef KVASIR_CHIP_RP2350
                 // and the RP2350's clk_peri is stopped before the crystal is enabled: a stop that did not show
@@ -1218,7 +1218,7 @@ namespace Kvasir { namespace Clocks {
                 return parked ? InitResult::xoscNotStable : InitResult::clockSwitchNotTaken;
             }
             if(!Register::fieldEquals(
-                 DefaultClockSettings::detail::selectedIs<Clk::CLK_REF_SELECTED::clk_ref_selected,
+                 DefaultClockSettings::Detail::selectedIs<Clk::CLK_REF_SELECTED::clk_ref_selected,
                                                           2>))
             {
                 return InitResult::clockSwitchNotTaken;
@@ -1238,7 +1238,7 @@ namespace Kvasir { namespace Clocks {
                 return InitResult::pllSysNotLocked;
             }
             if(!Register::fieldEquals(
-                 DefaultClockSettings::detail::selectedIs<Clk::CLK_SYS_SELECTED::clk_sys_selected,
+                 DefaultClockSettings::Detail::selectedIs<Clk::CLK_SYS_SELECTED::clk_sys_selected,
                                                           1>))
             {
                 return InitResult::clockSwitchNotTaken;
@@ -1252,15 +1252,15 @@ namespace Kvasir { namespace Clocks {
             // ring oscillator (or clk_peri's stop) did not finish
             return InitResult::clockSwitchNotTaken;
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     [[nodiscard]] inline InitResult initResult() {
-        return initFinished() ? InitResult::ok : detail::whereInitStopped();
+        return initFinished() ? InitResult::ok : Detail::whereInitStopped();
     }
 }}   // namespace Kvasir::Clocks
 
 namespace Kvasir { namespace DefaultClockSettings {
-    namespace detail {
+    namespace Detail {
         // The clocks did not come up at boot: the panic (Cause::clockInit, detail = the InitResult), whose default
         // reaction records it, lets the printer take the log and reboots through the chip's Port::Reboot - the next
         // boot's report names it, and a crystal that was only slow gets a fresh start (every RP image's
@@ -1292,7 +1292,7 @@ namespace Kvasir { namespace DefaultClockSettings {
                                    Clocks::name(r),
                                    static_cast<std::uint32_t>(r));
         }
-    }   // namespace detail
+    }   // namespace Detail
 
     // After initMemory(): the RAM functions exist now, and interrupts are not enabled yet.
     // First coreClockInit's outcome (Clocks::initResult()): a log line and a panic record survive from here on, and
@@ -1308,15 +1308,15 @@ namespace Kvasir { namespace DefaultClockSettings {
     void peripheryClockInit() {
         bool const finished = Clocks::initFinished();
         if(!finished && !Clocks::degraded()) [[unlikely]] {
-            detail::clockInitFailed<CrystalSpeed>();
+            Detail::clockInitFailed<CrystalSpeed>();
         }
 #ifdef KVASIR_CHIP_RP2350
-        Kvasir::detail::enableQuadIo();
-        std::uint32_t const timing = finished || detail::sysOnPllSys()
-                                     ? detail::flashTiming<ClockSpeed, MaxFlashFreq>()
-                                     : detail::degradedFlashTiming<ClockSpeed, MaxFlashFreq>();
+        Kvasir::Detail::enableQuadIo();
+        std::uint32_t const timing = finished || Detail::sysOnPllSys()
+                                     ? Detail::flashTiming<ClockSpeed, MaxFlashFreq>()
+                                     : Detail::degradedFlashTiming<ClockSpeed, MaxFlashFreq>();
         auto const          irqs   = Kvasir::Core::IrqState::saveAndMask();
-        Kvasir::detail::XipReadMode::apply(timing);
+        Kvasir::Detail::XipReadMode::apply(timing);
         irqs.restore();
 #endif
     }
@@ -1335,7 +1335,7 @@ namespace Kvasir { namespace DefaultClockSettings {
 #ifdef KVASIR_CHIP_RP2350
         using Timing = Kvasir::Peripheral::QMI::Registers<0>::M0_TIMING;
         using Kvasir::Register::value;
-        apply(write(Timing::clkdiv, value<detail::flashClkdiv<ClockSpeed, MaxFlashFreq>()>()));
+        apply(write(Timing::clkdiv, value<Detail::flashClkdiv<ClockSpeed, MaxFlashFreq>()>()));
 #endif
     }
 
@@ -1394,16 +1394,16 @@ namespace Kvasir { namespace DefaultClockSettings {
     };
 }}   // namespace Kvasir::DefaultClockSettings
 
-namespace Kvasir { namespace Clocks { namespace detail {
+namespace Kvasir { namespace Clocks { namespace Detail {
     // Clocks::DegradedBoot's verdict on this boot, for the boot report (Port::StartNotes below): what the boot's own
     // clock init stopped at (ok: this boot is not degraded), the tree it runs on, and in how many boots in a row before
     // it the init had failed. Set after initMemory(), by DegradedBoot's postMemoryInit.
     inline InitResult    degradedBy{InitResult::ok};
     inline DegradedTree  degradedOn{DegradedTree::none};
     inline std::uint32_t failedBootsBefore{0};
-}}}   // namespace Kvasir::Clocks::detail
+}}}   // namespace Kvasir::Clocks::Detail
 
-namespace Kvasir { namespace Clocks { namespace detail {
+namespace Kvasir { namespace Clocks { namespace Detail {
     // What running on a degraded tree costs until the switch-up (degradedClockInit's list), for the boot report
     [[nodiscard]] constexpr std::string_view costOf(DegradedTree t) {
         switch(t) {
@@ -1419,21 +1419,21 @@ namespace Kvasir { namespace Clocks { namespace detail {
         }
         return "";
     }
-}}}   // namespace Kvasir::Clocks::detail
+}}}   // namespace Kvasir::Clocks::Detail
 
 /// The chip's line in the boot report (kvasir/Port/Hooks.hpp, Boot::logBoot): why this boot runs degraded, on which
 /// tree, and what that costs; nothing for a boot whose clocks came up.
 template<typename... Ts>
 struct Kvasir::Port::StartNotes<Kvasir::Tag::User, Ts...> {
     void operator()() const {
-        auto const tree = Kvasir::Clocks::detail::degradedOn;
+        auto const tree = Kvasir::Clocks::Detail::degradedOn;
         if(tree == Kvasir::Clocks::DegradedTree::none) { return; }
         UC_LOG_W(
           "boot: clocks degraded: the clock init failed in {} boots in a row ({}), "
           "this one runs on {} - {}; the crystal and the PLLs are retried from the main loop",
-          Kvasir::Clocks::detail::failedBootsBefore + 1,
-          Kvasir::Clocks::name(Kvasir::Clocks::detail::degradedBy),
+          Kvasir::Clocks::Detail::failedBootsBefore + 1,
+          Kvasir::Clocks::name(Kvasir::Clocks::Detail::degradedBy),
           Kvasir::Clocks::name(tree),
-          Kvasir::Clocks::detail::costOf(tree));
+          Kvasir::Clocks::Detail::costOf(tree));
     }
 };

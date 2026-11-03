@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace Kvasir::USB::detail {
+namespace Kvasir::USB::Detail {
 
 static inline void deviceMemoryMemcpy(void*       dst,
                                       void const* src,
@@ -56,4 +56,4 @@ static inline void deviceMemoryMemcpy(void*       dst,
     asm volatile("" : : : "memory");
 }
 
-}   // namespace Kvasir::USB::detail
+}   // namespace Kvasir::USB::Detail

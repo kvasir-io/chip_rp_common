@@ -37,7 +37,7 @@ namespace Bootrom {
             txBuffer[0] = cmd;
             {
                 Kvasir::Core::IrqGuard const guard{};
-                detail::flashDoCmd(txBuffer, rxBuffer);
+                Detail::flashDoCmd(txBuffer, rxBuffer);
             }
             std::array<std::byte, dataBytes> id;
             std::copy(rxBuffer.begin() + dummyBytes, rxBuffer.end(), id.begin());
@@ -91,13 +91,13 @@ inline auto serialNumberString() { return Kvasir::hexString(Kvasir::serialNumber
 #ifdef KVASIR_CHIP_RP2350
 inline auto whiteLabelSerialNumber() {
     static std::optional<Kvasir::StaticString<30>> const serialNumber
-      = detail::readWhiteLabelSerialNumber();
+      = Detail::readWhiteLabelSerialNumber();
     return serialNumber;
 }
 
-inline CriticalFlags criticalFlags() { return detail::readCriticalFlags(); }
+inline CriticalFlags criticalFlags() { return Detail::readCriticalFlags(); }
 
-inline OtpPageLocks otpPageLocks() { return detail::readOtpPageLocks(); }
+inline OtpPageLocks otpPageLocks() { return Detail::readOtpPageLocks(); }
 #endif
 
 /// serialNumberString() as a view of one function-local copy: what a string_view member

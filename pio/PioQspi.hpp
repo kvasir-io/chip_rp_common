@@ -19,7 +19,7 @@
 
 namespace Kvasir { namespace Display {
 
-    namespace detail {
+    namespace Detail {
         // PioQspi's configuration, divider checks and state machine, outside the class so that the
         // state machine can be PioQspi's base (Pio::StartupOf); PioQspi derives from it too.
         template<typename Config_>
@@ -107,7 +107,7 @@ namespace Kvasir { namespace Display {
 
             using Sm = Kvasir::Pio::StateMachine<Program, SmConfig>;
         };
-    }   // namespace detail
+    }   // namespace Detail
 
     /// QSPI transport for a DCS panel controller (CO5300, ST77916, ST77922) on one RP2350 PIO
     /// state machine plus one DMA channel; the PL022 is single-lane only. The panel driver is
@@ -139,9 +139,9 @@ namespace Kvasir { namespace Display {
              typename Dma::Priority DmaPriority,
              typename Config_>
     struct PioQspi
-      : detail::PioQspiParts<Config_>
-      , Kvasir::Pio::StartupOf<typename detail::PioQspiParts<Config_>::Sm> {
-        using Parts = detail::PioQspiParts<Config_>;
+      : Detail::PioQspiParts<Config_>
+      , Kvasir::Pio::StartupOf<typename Detail::PioQspiParts<Config_>::Sm> {
+        using Parts = Detail::PioQspiParts<Config_>;
         using Parts::readDiv;
         using Parts::writeDiv;
         using typename Parts::Config;
