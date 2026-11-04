@@ -1,6 +1,8 @@
 #pragma once
 // Kvasir::Port::StopOtherCore<Tag::User> on the RP2040 and RP2350 (kvasir/Port/Hooks.hpp), in an image that runs code
-// on core 1 (KVASIR_MULTICORE; otherwise core 1 sleeps in the boot ROM already):
+// on core 1 (KVASIR_MULTICORE; otherwise core 1 sleeps in the boot ROM already). The SDK's fatal path calls it, and so
+// does every boot ROM reboot (BootromReboot.hpp, Rp::stopForRomReboot: a handler on the other core could undo it) - on
+// a fatal path twice, which is harmless (a second reset of core 1; core 0 found parked already):
 //
 // - on core 0, core 1 is reset: PSM FRCE_OFF.PROC1 set, read back, cleared (RP2040 DS 2.13.5 Table 198, bit 16; RP2350
 //   DS 7.4.4 Table 531, bit 24), Multicore::resetCore1(). Core 1 restarts in the boot ROM and sleeps there until a

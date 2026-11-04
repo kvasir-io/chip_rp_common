@@ -20,13 +20,14 @@
     #include "peripherals/BOOTRAM.hpp"
     #include "peripherals/QMI.hpp"
 #endif
-// the RP2040: its boot2 (Startup::second_stage_bootloader), XIP_SSI and IO_QSPI
+// the RP2040: its boot2 (Startup::secondStageBootloader, chip/Boot2.hpp: not the start code, which includes rp_common
+// headers itself), XIP_SSI and IO_QSPI
 // a multicore image: core 1 is kept out of the flash for every XIP-off stretch (Multicore.hpp Core1Lockout)
 #ifdef KVASIR_MULTICORE
     #include "Multicore.hpp"
 #endif
 #ifdef KVASIR_CHIP_RP2040
-    #include "chip/StartUp.hpp"
+    #include "chip/Boot2.hpp"
     #include "peripherals/IO_QSPI.hpp"
     #include "peripherals/XIP_SSI.hpp"
 #endif
@@ -109,6 +110,13 @@ namespace Kvasir { namespace Detail {
         return Kvasir::Register::deposit(field, static_cast<std::uint32_t>(value));
     }
 
+#endif
+}}   // namespace Kvasir::Detail
+
+// XIP off and on again around a flash access (XipDisabler, XipGuard) and the RP2350's XIP read mode (XipReadMode): the
+// package's flash path uses them, and so may an image's own flash work from RAM.
+namespace Kvasir { namespace Flash {
+#ifdef KVASIR_CHIP_RP2350
     // The XIP read mode every RP2350 project runs in.
     //
     // The bootrom brings the flash up in EBh quad I/O (command on one line, address, mode
@@ -136,7 +144,7 @@ namespace Kvasir { namespace Detail {
     //
     // Runs from RAM with interrupts off and the QMI idle: while the format changes,
     // nothing may fetch from flash. peripheryClockInit() calls it once at boot,
-    // FlashXipDisabler::enable() after every direct-mode access (the BOOTRAM setup
+    // XipDisabler::enable() after every direct-mode access (the BOOTRAM setup
     // function that re-enables XIP restores the bootrom's mode, mode bits 0x00).
     struct XipReadMode {
         using QMI  = Kvasir::Peripheral::QMI::Registers<0>;
@@ -149,14 +157,14 @@ namespace Kvasir { namespace Detail {
         // prefix 1-bit 8 bits, address/suffix/dummy/data 4-bit, suffix 8 bits, dummy 16
         // bits (4 quad clocks): what the bootrom programs for EBh
         static constexpr std::uint32_t rfmtQuadEBh
-          = qmiAt(Rfmt::dummy_len, Rfmt::DUMMY_LENVal::_16)
-          | qmiAt(Rfmt::suffix_len, Rfmt::SUFFIX_LENVal::_8)
-          | qmiAt(Rfmt::prefix_len, Rfmt::PREFIX_LENVal::_8)
-          | qmiAt(Rfmt::data_width, Rfmt::DATA_WIDTHVal::q)
-          | qmiAt(Rfmt::dummy_width, Rfmt::DUMMY_WIDTHVal::q)
-          | qmiAt(Rfmt::suffix_width, Rfmt::SUFFIX_WIDTHVal::q)
-          | qmiAt(Rfmt::addr_width, Rfmt::ADDR_WIDTHVal::q)
-          | qmiAt(Rfmt::prefix_width, Rfmt::PREFIX_WIDTHVal::s);
+          = Kvasir::Detail::qmiAt(Rfmt::dummy_len, Rfmt::DUMMY_LENVal::_16)
+          | Kvasir::Detail::qmiAt(Rfmt::suffix_len, Rfmt::SUFFIX_LENVal::_8)
+          | Kvasir::Detail::qmiAt(Rfmt::prefix_len, Rfmt::PREFIX_LENVal::_8)
+          | Kvasir::Detail::qmiAt(Rfmt::data_width, Rfmt::DATA_WIDTHVal::q)
+          | Kvasir::Detail::qmiAt(Rfmt::dummy_width, Rfmt::DUMMY_WIDTHVal::q)
+          | Kvasir::Detail::qmiAt(Rfmt::suffix_width, Rfmt::SUFFIX_WIDTHVal::q)
+          | Kvasir::Detail::qmiAt(Rfmt::addr_width, Rfmt::ADDR_WIDTHVal::q)
+          | Kvasir::Detail::qmiAt(Rfmt::prefix_width, Rfmt::PREFIX_WIDTHVal::s);
         static_assert(rfmtQuadEBh == 0x0004'92A8U,
                       "the bootrom's EBh format word");
         static constexpr std::uint32_t commandEBh         = 0xEBU;
@@ -165,9 +173,9 @@ namespace Kvasir { namespace Detail {
         // Serial reads, every phase on one line: 03h with an 8-bit command and nothing else, 0Bh the same with 8 dummy
         // bits (8 clocks on one line; M0_RFMT DUMMY_LEN counts 4-bit units, Table 1298)
         static constexpr std::uint32_t rfmtSerial03h
-          = qmiAt(Rfmt::prefix_len, Rfmt::PREFIX_LENVal::_8);
+          = Kvasir::Detail::qmiAt(Rfmt::prefix_len, Rfmt::PREFIX_LENVal::_8);
         static constexpr std::uint32_t rfmtSerial0Bh
-          = rfmtSerial03h | qmiAt(Rfmt::dummy_len, Rfmt::DUMMY_LENVal::_8);
+          = rfmtSerial03h | Kvasir::Detail::qmiAt(Rfmt::dummy_len, Rfmt::DUMMY_LENVal::_8);
         static_assert(rfmtSerial03h == 0x0000'1000U && rfmtSerial0Bh == 0x0002'1000U,
                       "M0_RFMT: PREFIX_LEN bit 12, DUMMY_LEN 18:16");
         static constexpr std::uint32_t commandRead03h     = 0x03U;
@@ -183,7 +191,7 @@ namespace Kvasir { namespace Detail {
                       "M0_RCMD: PREFIX 7:0, SUFFIX 15:8");
 
         // Status register 2 with QE that FlashQuadEnable set at boot, 0 if it did not.
-        // FlashXipDisabler::enable() writes it again before every return to XIP.
+        // XipDisabler::enable() writes it again before every return to XIP.
         static inline std::uint8_t quadEnableSr2 = 0;
 
         // M0_TIMING that reads at clk_ref speed and at the full clock: clkdiv 4, rxdelay 2,
@@ -195,8 +203,10 @@ namespace Kvasir { namespace Detail {
         // flashInit() there raises the divider to the boot one first, and its static_assert
         // checks that rxdelay 2 still samples a valid bit at the project's clk_sys.
         static constexpr std::uint32_t timingAtClkRef
-          = qmiAt(QMI::M0_TIMING::cooldown, 1U) | qmiAt(QMI::M0_TIMING::min_deselect, 2U)
-          | qmiAt(QMI::M0_TIMING::rxdelay, 2U) | qmiAt(QMI::M0_TIMING::clkdiv, 4U);
+          = Kvasir::Detail::qmiAt(QMI::M0_TIMING::cooldown, 1U)
+          | Kvasir::Detail::qmiAt(QMI::M0_TIMING::min_deselect, 2U)
+          | Kvasir::Detail::qmiAt(QMI::M0_TIMING::rxdelay, 2U)
+          | Kvasir::Detail::qmiAt(QMI::M0_TIMING::clkdiv, 4U);
         static_assert(timingAtClkRef == ((1U << 30) | (2U << 12) | (2U << 8) | 4U));
 
         // The resus handler reads it before the flash is readable: never an out-of-line call.
@@ -273,7 +283,7 @@ namespace Kvasir { namespace Detail {
     };
 #endif
 
-    struct FlashXipDisabler {
+    struct XipDisabler {
         using RomConnectInternalFlash = void (*)();
         using RomFlashExitXip         = void (*)();
         using RomFlashFlushCache      = void (*)();
@@ -328,7 +338,7 @@ namespace Kvasir { namespace Detail {
             }
         }
 
-        FlashXipDisabler()
+        XipDisabler()
           : connectInternalFlash{
               Kvasir::RomFunctions::getRomFunctionPointer<'I',
                                                           'F',
@@ -363,8 +373,12 @@ namespace Kvasir { namespace Detail {
 #ifdef KVASIR_CHIP_RP2350
             // Volatile QE again: a flash reset (66h 99h) restores the stored QE = 0.
             if(std::uint32_t const sr2 = XipReadMode::quadEnableSr2; sr2 != 0) {
-                directCommand<1>(0x50U, directCommandClkdiv);   // write enable, volatile
-                directCommand<2>(0x31U | (sr2 << 8), directCommandClkdiv);   // status register 2
+                Kvasir::Detail::directCommand<1>(
+                  0x50U,
+                  Kvasir::Detail::directCommandClkdiv);   // write enable, volatile
+                Kvasir::Detail::directCommand<2>(
+                  0x31U | (sr2 << 8),
+                  Kvasir::Detail::directCommandClkdiv);   // status register 2
             }
 #endif
             xipEnable();
@@ -376,9 +390,9 @@ namespace Kvasir { namespace Detail {
     };
 
     struct XipGuard {
-        FlashXipDisabler& disabler;
+        XipDisabler& disabler;
 
-        [[KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] explicit XipGuard(FlashXipDisabler& d) : disabler(d) {
+        [[KVASIR_RAM_FUNC_INLINE_ATTRIBUTES]] explicit XipGuard(XipDisabler& d) : disabler(d) {
             disabler.disable();
         }
 
@@ -387,6 +401,9 @@ namespace Kvasir { namespace Detail {
         XipGuard(XipGuard const&)            = delete;
         XipGuard& operator=(XipGuard const&) = delete;
     };
+}}   // namespace Kvasir::Flash
+
+namespace Kvasir { namespace Detail {
 
 #ifdef KVASIR_CHIP_RP2350
     // Quad I/O for a flash the bootrom left in BBh dual I/O because QE is clear, e.g. the
@@ -396,10 +413,10 @@ namespace Kvasir { namespace Detail {
     struct FlashQuadEnable {
         static constexpr std::uint32_t clkdiv = directCommandClkdiv;
 
-        // Leaving the guard rewrites QE and switches to continuous EBh (FlashXipDisabler::enable).
-        [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void run(FlashXipDisabler& xip) {
+        // Leaving the guard rewrites QE and switches to continuous EBh (Flash::XipDisabler::enable).
+        [[KVASIR_RAM_FUNC_ATTRIBUTES]] static void run(Flash::XipDisabler& xip) {
             KVASIR_RAM_FUNC_MARK();
-            XipGuard const guard{xip};
+            Flash::XipGuard const guard{xip};
 
             auto const id = directCommand<4>(0x9FU, clkdiv);   // JEDEC id: EF, type, capacity
             auto const manufacturer = (id >> 8) & 0xFFU;
@@ -417,7 +434,7 @@ namespace Kvasir { namespace Detail {
 
             auto const after = (directCommand<2>(0x35U, clkdiv) >> 8) & 0xFFU;
             if((after & 0x02U) != 0) {
-                XipReadMode::quadEnableSr2 = static_cast<std::uint8_t>(wanted);
+                Flash::XipReadMode::quadEnableSr2 = static_cast<std::uint8_t>(wanted);
             }
         }
     };
@@ -425,9 +442,9 @@ namespace Kvasir { namespace Detail {
     // At boot, after initMemory(): FlashQuadEnable if the bootrom settled on BBh.
     inline void enableQuadIo() {
         using QMI = Kvasir::Peripheral::QMI::Registers<0>;
-        if(get<0>(apply(read(QMI::M0_RCMD::prefix))) != XipReadMode::commandBBh) { return; }
-        FlashXipDisabler xip{};
-        auto const       irqs = Kvasir::Core::IrqState::saveAndMask();
+        if(get<0>(apply(read(QMI::M0_RCMD::prefix))) != Flash::XipReadMode::commandBBh) { return; }
+        Flash::XipDisabler xip{};
+        auto const         irqs = Kvasir::Core::IrqState::saveAndMask();
         FlashQuadEnable::run(xip);
         irqs.restore();
     }
@@ -443,17 +460,18 @@ namespace Kvasir { namespace Detail {
     //
     // SSI SR: TFNF, RFNE; DR0 the FIFO's data word (RP2040 datasheet "SSI: SR Register" / "SSI: DR0 Register", md
     // l.28208-28232, l.28490). GPIO_QSPI_SS_CTRL.OUTOVER: 2 drives the pad low, 3 high (md l.14158-14163).
-    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void flashDoCmdImpl(FlashXipDisabler& xipDisabler,
-                                                                     std::byte const*  tx,
-                                                                     std::size_t       txLeft,
-                                                                     std::byte*        rx,
-                                                                     std::size_t       rxLeft) {
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline void
+    flashDoCmdImpl(Flash::XipDisabler& xipDisabler,
+                   std::byte const*    tx,
+                   std::size_t         txLeft,
+                   std::byte*          rx,
+                   std::size_t         rxLeft) {
         KVASIR_RAM_FUNC_MARK();
         using SsiRegs = Kvasir::Peripheral::XIP_SSI::Registers<>;
         using CsCtrl  = Kvasir::Peripheral::IO_QSPI::Registers<>::GPIO_QSPI_SS_CTRL;
         using namespace Kvasir::
           Register;   // always inlined, fields included: nothing here calls into flash
-        XipGuard const guard{xipDisabler};
+        Flash::XipGuard const guard{xipDisabler};
 
         // no lambda here: gcc at -Og would leave it out of line, in flash
         apply(write(CsCtrl::OUTOVERValC::low));
@@ -480,11 +498,11 @@ namespace Kvasir { namespace Detail {
         apply(write(CsCtrl::OUTOVERValC::high));
     }
 
-    // Runs from flash like flash_erase(): the FlashXipDisabler's ROM lookups and boot2 copy
+    // Runs from flash like flash_erase(): the Flash::XipDisabler's ROM lookups and boot2 copy
     // need XIP, only the _impl runs with it off.
     static inline void flashDoCmd(std::span<std::byte const> txBuffer,
                                   std::span<std::byte>       rxBuffer) {
-        FlashXipDisabler xipDisabler{};
+        Flash::XipDisabler xipDisabler{};
         flashDoCmdImpl(xipDisabler,
                        txBuffer.data(),
                        txBuffer.size(),

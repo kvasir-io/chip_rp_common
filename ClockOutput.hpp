@@ -568,8 +568,8 @@ namespace Kvasir { namespace Clocks {
 #ifdef KVASIR_CHIP_RP2350
             auto const timing = retryPending_.load(std::memory_order_relaxed)
                                 ? savedTiming_
-                                : Kvasir::Detail::XipReadMode::currentTiming();
-            Kvasir::Detail::XipReadMode::apply(Kvasir::Detail::XipReadMode::timingAtClkRef);
+                                : Kvasir::Flash::XipReadMode::currentTiming();
+            Kvasir::Flash::XipReadMode::apply(Kvasir::Flash::XipReadMode::timingAtClkRef);
 #endif
             // The fetch that was in flight when the clock collapsed may have completed
             // with shifted data and sit in the cache. Drop the cache before anything
@@ -612,7 +612,7 @@ namespace Kvasir { namespace Clocks {
             khzAfter_.store(after, std::memory_order_relaxed);
             bool const ok = init == InitResult::ok && clockGood_(after);
 #ifdef KVASIR_CHIP_RP2350
-            if(ok) { Kvasir::Detail::XipReadMode::apply(timing); }
+            if(ok) { Kvasir::Flash::XipReadMode::apply(timing); }
 #endif
             repaired_.store(ok, std::memory_order_relaxed);
             if(!ok) { failed_.fetch_add(1, std::memory_order_relaxed); }
@@ -683,7 +683,7 @@ namespace Kvasir { namespace Clocks {
             bool const ok = init == InitResult::ok && clockGood_(after);
             if(ok) {
 #ifdef KVASIR_CHIP_RP2350
-                Kvasir::Detail::XipReadMode::apply(savedTiming_);
+                Kvasir::Flash::XipReadMode::apply(savedTiming_);
 #endif
                 retryPending_.store(false, std::memory_order_relaxed);
             }

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <uc_log/uc_log.hpp>
 
@@ -62,7 +63,11 @@ namespace Kvasir { namespace Clocks {
     //      its bound, Chip::PllLockBound), switchToSources() with interrupts masked, and flashAfterSwitchUp() for the
     //      full clock's flash divider (CLKDIV alone: safe while another core fetches from flash). A live switch, no
     //      reboot: every driver's dividers were computed for the full clock, so they are right from the switch on, and
-    //      the application's state, the log and a BootGuard's count stay.
+    //      the application's state, the log and a BootGuard's count stay. The flash divider follows only once clk_sys
+    //      counts at the full clock against the crystal (XipTiming.hpp); until then the flash keeps the degraded
+    //      timing, which reads right at every clock up to the full one, and turn() tries it again on the same pauses
+    //      (Report::slowFlash) - as for a boot whose own init finished but whose clk_sys did not count at the full
+    //      clock in peripheryClockInit (preEnableRuntimeInit).
     //   4. USB: a host that met the device while clk_usb ran from the ROSC or the crystal gave up enumerating it. After
     //      the switch-up the device goes off the bus and comes back after USB::Rp::Reattach::pause (its D+ pull-up,
     //      usb/Reattach.hpp, through the hook AfterSwitchUp below; nothing for an image without the USB backend or
@@ -121,6 +126,10 @@ namespace Kvasir { namespace Clocks {
         // after the switch-up: the RP USB driver's re-attach where the image has its backend (AfterSwitchUp above)
         using After = typename Port::LateT<AfterSwitchUp<Kvasir::Tag::User>, ClockSettings>::type;
 
+        // Clocks::XoscStartupConfig's switches (XoscStartupConfig.hpp): the crystal check's record, the counts of clk_sys
+        static constexpr bool recordsCrystal = Detail::recordsCrystalCheck<ClockSettings>();
+        static constexpr bool verifiesClkSys = Detail::verifiesClkSys<ClockSettings>();
+
         struct Config {
             // boots in a row whose clock init failed (each a panic and a reboot) before the next runs degraded
             static constexpr std::uint32_t failedBoots
@@ -148,6 +157,14 @@ namespace Kvasir { namespace Clocks {
             InitResult    lastTry{};   // what the last try stopped at (ok: it switched up)
             bool
               reattaching{};   // after the switch-up, AfterSwitchUp's end() is still due (USB: off the bus)
+            // Why the crystal did or did not count as started: this boot's clock init's check (kept at
+            // postMemoryInit, before a resus repair could run the init again), and the last switch-up try's
+            // (Clocks::lastTryCrystalCheck). None where no check recorded one.
+            std::optional<CrystalCheck> bootCrystal{};
+            std::optional<CrystalCheck> lastTryCrystal{};
+            // the tree is the full one, but clk_sys did not count at the full clock against the crystal yet: the flash
+            // keeps the degraded timing (slow, never shifted) and turn() tries the full one again
+            bool slowFlash{};
         };
 
         [[nodiscard]] static Report report() {
@@ -159,12 +176,19 @@ namespace Kvasir { namespace Clocks {
                           Detail::failedBootsBefore,
                           tries_.load(std::memory_order_relaxed),
                           lastTry_.load(std::memory_order_relaxed),
-                          s == State::reattaching};
+                          s == State::reattaching,
+                          bootCrystal(),
+                          Clocks::lastTryCrystalCheck<ClockSettings>(),
+                          slowFlash_.load(std::memory_order_relaxed)};
         }
 
         /// Startup's hook after initMemory(), before peripheryClockInit(): steps 1 and 2 above. Registers and this
         /// struct's own state; interrupts are still masked.
         static void postMemoryInit() {
+            // the boot's crystal check, out of .noInit before anything can run the init again
+            if constexpr(recordsCrystal) {
+                bootCrystal_ = Clocks::lastInitCrystalCheck<ClockSettings>();
+            }
             bool const          valid    = record_.magic == magic;
             std::uint32_t const failures = valid ? record_.failures : 0U;
             if(ClockSettings::initFinished()) {
@@ -185,6 +209,23 @@ namespace Kvasir { namespace Clocks {
             state_.store(State::degraded, std::memory_order_relaxed);
         }
 
+        /// Startup's hook after peripheryClockInit(), before interrupts are enabled: a boot that is not degraded (it
+        /// did not panic in peripheryClockInit, so its init finished) but whose clk_sys did not count at the full clock
+        /// there runs the flash on the degraded timing; turn() tries the full one again (step 3's last part).
+        static void preEnableRuntimeInit() {
+            if constexpr(!verifiesClkSys) {
+                return;
+            }   // the registers' word: never the slow timing on a full tree
+            if(state_.load(std::memory_order_relaxed) != State::idle
+               || Clocks::Detail::fastTimingKhz != 0)
+            {
+                return;
+            }
+            slowFlash_.store(true, std::memory_order_relaxed);
+            backoff_.failed(TimeClock::now());
+            state_.store(State::slowFlash, std::memory_order_relaxed);
+        }
+
         /// The Hook::MainLoop entry: one load while the boot is not degraded (steps 3 and 4 above). What it returns
         /// tells a sleeping loop (Runtime/Executor.hpp, Startup::runTurn) when it is needed next: idle when not
         /// degraded, else at the next try or the end of the re-attach pause.
@@ -195,9 +236,11 @@ namespace Kvasir { namespace Clocks {
             if(s == State::reattaching) {
                 if(now < reattachAt_) { return Kvasir::Turn::within(reattachAt_ - now); }
                 After::end();
-                state_.store(State::idle, std::memory_order_relaxed);
                 UC_LOG_I("clocks: the USB device is back on the bus: the host enumerates it again");
-                return Kvasir::Turn::idle();
+                return afterSwitchUp_(now);
+            }
+            if constexpr(verifiesClkSys) {
+                if(s == State::slowFlash) { return retryFlash_(now); }
             }
             // the first turn of a degraded boot starts the crystal and the first pause
             if(backoff_.failures == 0) {
@@ -221,24 +264,33 @@ namespace Kvasir { namespace Clocks {
                 backoff_.failed(after);
                 return Kvasir::Turn::within(backoff_.next - after);
             }
-            ClockSettings::flashAfterSwitchUp();
+            // the full clock's flash divider only once clk_sys counts at that clock (XipTiming.hpp); otherwise the
+            // degraded timing stays, which reads at every clock up to it, and a later turn tries again
+            bool const fastFlash = ClockSettings::flashAfterSwitchUp();
+            if(!fastFlash) {
+                UC_LOG_W(
+                  "clocks: switched up, but clk_sys counts {} kHz against the crystal: the flash "
+                  "stays on the "
+                  "slow timing, tried again",
+                  Clocks::clkSysKhz());
+            }
+            slowFlash_.store(!fastFlash, std::memory_order_relaxed);
             backoff_.succeeded();
             switchedUp_.store(true, std::memory_order_relaxed);
             // clk_usb ran from the ROSC or the crystal until now (degradedClockInit's marker)
             bool const reattach = After::begin();
-            if(reattach) {
-                reattachAt_ = TimeClock::now() + After::pause;
-                state_.store(State::reattaching, std::memory_order_relaxed);
-            } else {
-                state_.store(State::idle, std::memory_order_relaxed);
-            }
             UC_LOG_I("clocks: switched up from {} after {} tries: crystal and PLLs running, {}{}",
                      Clocks::name(Detail::degradedOn),
                      tries_.load(std::memory_order_relaxed),
                      Clocks::name(Clocks::initResult()),
                      reattach ? std::string_view{"; the USB device off the bus for a re-attach"}
                               : std::string_view{});
-            return reattach ? Kvasir::Turn::within(After::pause) : Kvasir::Turn::idle();
+            if(reattach) {
+                reattachAt_ = TimeClock::now() + After::pause;
+                state_.store(State::reattaching, std::memory_order_relaxed);
+                return Kvasir::Turn::within(After::pause);
+            }
+            return afterSwitchUp_(TimeClock::now());
         }
 
         using Extends = Startup::Extend<Kvasir::Hook::MainLoop, &DegradedBoot::turn>;
@@ -253,7 +305,38 @@ namespace Kvasir { namespace Clocks {
 
         using TimeClock = Kvasir::Timer::TimerClockBase<TimerConfig>;
 
-        enum class State : std::uint8_t { idle, degraded, reattaching };
+        // slowFlash: the full tree with the flash on the degraded timing (flashAfterSwitchUp refused), retried
+        enum class State : std::uint8_t { idle, degraded, reattaching, slowFlash };
+
+        // After the switch-up (and its re-attach): idle, or the flash's full timing still to come (slowFlash_)
+        static Kvasir::Turn afterSwitchUp_([[maybe_unused]] typename TimeClock::time_point now) {
+            if constexpr(verifiesClkSys) {
+                if(slowFlash_.load(std::memory_order_relaxed)) {
+                    backoff_.failed(now);
+                    state_.store(State::slowFlash, std::memory_order_relaxed);
+                    return Kvasir::Turn::within(backoff_.next - now);
+                }
+            }
+            state_.store(State::idle, std::memory_order_relaxed);
+            return Kvasir::Turn::idle();
+        }
+
+        // The full tree, the flash on the degraded timing: flashAfterSwitchUp() again once the pause is over
+        static Kvasir::Turn retryFlash_(typename TimeClock::time_point now) {
+            if(!backoff_.due(now)) { return Kvasir::Turn::within(backoff_.next - now); }
+            if(!ClockSettings::flashAfterSwitchUp()) {
+                auto const after = TimeClock::now();
+                backoff_.failed(after);
+                return Kvasir::Turn::within(backoff_.next - after);
+            }
+            slowFlash_.store(false, std::memory_order_relaxed);
+            backoff_.succeeded();
+            state_.store(State::idle, std::memory_order_relaxed);
+            UC_LOG_I(
+              "clocks: clk_sys counts at the full clock against the crystal: the flash on its full "
+              "timing");
+            return Kvasir::Turn::idle();
+        }
 
         // "DGRD" in memory: the record is no power-on garbage
         static constexpr std::uint32_t magic = 0x4452'4744U;
@@ -272,10 +355,20 @@ namespace Kvasir { namespace Clocks {
         [[KVASIR_NOINIT_MEMBER]] inline static Record volatile record_;
         inline static std::atomic<State>                      state_{State::idle};
         inline static std::atomic<bool>                       switchedUp_{false};
+        inline static std::atomic<bool>                       slowFlash_{false};
         inline static std::atomic<std::uint32_t>              tries_{0};
         inline static std::atomic<InitResult>                 lastTry_{InitResult::ok};
         inline static Kvasir::Backoff<TimeClock, RetryPauses> backoff_{};
         inline static typename TimeClock::time_point          reattachAt_{};
+        inline static std::optional<CrystalCheck>             bootCrystal_{};
+
+        static std::optional<CrystalCheck> bootCrystal() {
+            if constexpr(recordsCrystal) {
+                return bootCrystal_;
+            } else {
+                return std::nullopt;
+            }
+        }
     };
 
 }}   // namespace Kvasir::Clocks

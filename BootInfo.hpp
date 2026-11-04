@@ -1,6 +1,7 @@
 #pragma once
 // The RP2350's boot ROM services under their public names: partition table, address translation, OTP access,
 // BOOT_INFO and explicit_buy (TBYB), each under the boot lock the boot ROM checks for it.
+#include "FlashOps.hpp"   // explicitBuy(): recorded as a flash operation (Flash::OpInFlight::Kind::buy)
 #include "Rom.hpp"
 #include "XipControl.hpp"   // explicitBuy(): the ROM's flash writes need XIP off
 
@@ -154,7 +155,7 @@ namespace Detail {
     // (the image's EBh, XipControl.hpp) out of it first, and leaves that mode behind. Under the XipGuard the flash
     // leaves continuous mode before and the image's mode comes back after. RAM code for the same reason.
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline int
-    loadPartitionTableImpl(Kvasir::Detail::FlashXipDisabler& xipDisabler,
+    loadPartitionTableImpl(Kvasir::Flash::XipDisabler& xipDisabler,
                            int (*load)(std::uint8_t*,
                                        std::uint32_t,
                                        bool),
@@ -162,7 +163,7 @@ namespace Detail {
                            std::uint32_t workareaSize,
                            bool          forceReload) {
         KVASIR_RAM_FUNC_MARK();
-        Kvasir::Detail::XipGuard const guard{xipDisabler};
+        Kvasir::Flash::XipGuard const guard{xipDisabler};
         return load(workarea, workareaSize, forceReload);
     }
 }   // namespace Detail
@@ -182,7 +183,7 @@ namespace Bootrom {
         Detail::sha256OutOfReset();
         auto const load = RomFunctions::
           getRomFunctionPointer<'L', 'P', int (*)(std::uint8_t*, std::uint32_t, bool)>();
-        Kvasir::Detail::FlashXipDisabler xipDisabler{};
+        Kvasir::Flash::XipDisabler xipDisabler{};
         return Detail::loadPartitionTableImpl(xipDisabler,
                                               load,
                                               reinterpret_cast<std::uint8_t*>(workarea.data()),
@@ -215,6 +216,43 @@ namespace Bootrom {
         constexpr std::uint32_t userBase = 0x400;
     }   // namespace Otp::Rows
 
+    /// BOOT_DIAGNOSTIC's bits (RP2350 datasheet 5.4.8.17 "Boot Diagnostic", md l.20339-20407; the names pico-sdk's
+    /// boot/bootrom_constants.h BOOT_DIAGNOSTIC_*): one 16-bit set per region of the diagnosed pair - slot 0 and slot 1,
+    /// or an A partition and its B -, how far the boot ROM's scan got with each.
+    namespace Diagnostic {
+        inline constexpr std::uint16_t windowSearched
+          = 0x0001;   // the data sheet's REGION_SEARCHED
+        inline constexpr std::uint16_t invalidBlockLoop
+          = 0x0002;   // with validBlockLoop: a table that failed
+                      // its full parse after its hash held
+        inline constexpr std::uint16_t validBlockLoop        = 0x0004;
+        inline constexpr std::uint16_t validImageDef         = 0x0008;
+        inline constexpr std::uint16_t hasPartitionTable     = 0x0010;
+        inline constexpr std::uint16_t considered            = 0x0020;
+        inline constexpr std::uint16_t chosen                = 0x0040;
+        inline constexpr std::uint16_t ptMatchingKey         = 0x0080;
+        inline constexpr std::uint16_t ptHashForVerify       = 0x0100;
+        inline constexpr std::uint16_t ptVerifiedOk          = 0x0200;
+        inline constexpr std::uint16_t imageDefMatchingKey   = 0x0400;
+        inline constexpr std::uint16_t imageDefHashForVerify = 0x0800;
+        inline constexpr std::uint16_t imageDefVerifiedOk    = 0x1000;
+        inline constexpr std::uint16_t loadMapEntriesLoaded  = 0x2000;
+        inline constexpr std::uint16_t imageLaunched         = 0x4000;
+        inline constexpr std::uint16_t imageConditionFailure = 0x8000;
+    }   // namespace Diagnostic
+
+    /// The boot diagnostic's "partition" numbers below 0 (5.4.8.17, md l.20323-20333; pico-sdk BOOT_PARTITION_*): what
+    /// BootInfo::diagnosticPartition reads and Bootrom::rebootFlashUpdate(windowBase, diagnosticPartition) takes.
+    /// 0..15 is a partition: for an A/B pair, its A.
+    namespace DiagnosticPartition {
+        inline constexpr std::int8_t none = -1;
+        inline constexpr std::int8_t slot0
+          = -2;   // both slots: slot 0 in the low half, slot 1 in the high half
+        inline constexpr std::int8_t slot1 = -3;
+        inline constexpr std::int8_t image
+          = -4;   // a RAM or OTP image's launch, or a chain_image()
+    }   // namespace DiagnosticPartition
+
     /// How the boot ROM booted this run: get_sys_info BOOT_INFO (RP2350 datasheet 5.4.8.17, flag
     /// 0x0040, word 0 = 0xttppbbdd). The flag and boot type values are pico-sdk's
     /// boot/bootrom_constants.h (BOOT_TBYB_AND_UPDATE_FLAG_*, BOOT_TYPE_*); the data sheet names
@@ -233,10 +271,18 @@ namespace Bootrom {
         static constexpr std::uint8_t typeChainedFlag
           = 0x80;   // or'ed in when an image chained another
 
-        bool          valid{};   // the boot ROM answered
-        std::uint8_t  tbybAndUpdate{};
-        std::uint8_t  partition{noPartition};
-        std::uint8_t  bootType{};
+        bool         valid{};   // the boot ROM answered
+        std::uint8_t tbybAndUpdate{};
+        std::uint8_t partition{noPartition};
+        std::uint8_t bootType{};
+        /// dd: the region `diagnostic` is about (DiagnosticPartition, or a partition number; pico-bootrom bootram
+        /// always.diagnostic_partition_index). For an A/B pair it is the A partition: `diagnostic` holds A's flags in
+        /// its low half, B's in its high half. Set from a regular reboot's p0 (Bootrom::rebootFlashUpdate(windowBase,
+        /// diagnosticPartition) sets it for a flash update boot), to `image` by a RAM or OTP image's launch and by a
+        /// chain_image() (pico-bootrom varm_launch_image.c), and kept by every reset but a cold one (the RUN pin, a
+        /// POWMAN reset: 5.4.8.17), after which the boot ROM starts at slot0 (varm_boot_path.c).
+        std::int8_t diagnosticPartition{DiagnosticPartition::none};
+        /// BOOT_DIAGNOSTIC: what this boot's scan found for the diagnostic region (Diagnostic:: bits, per half).
         std::uint32_t diagnostic{};
 
         /// tt's BUY_PENDING alone. tt is "updated on regular non BOOTSEL boots" only, so after a
@@ -252,6 +298,15 @@ namespace Bootrom {
         [[nodiscard]] constexpr bool trialBoot() const {
             return isBuyPending() && (bootType & ~typeChainedFlag) == typeFlashUpdate;
         }
+
+        /// `diagnostic`'s halves: slot 0 or the A partition (low), slot 1 or the B partition (high).
+        [[nodiscard]] constexpr std::uint16_t diagnosticA() const {
+            return static_cast<std::uint16_t>(diagnostic & 0xffffU);
+        }
+
+        [[nodiscard]] constexpr std::uint16_t diagnosticB() const {
+            return static_cast<std::uint16_t>(diagnostic >> 16);
+        }
     };
 
     /// BOOT_INFO of this boot. Read it early: tt and pp are "updated on regular non BOOTSEL
@@ -262,11 +317,12 @@ namespace Bootrom {
         std::array<std::uint32_t, 5> buffer{};        // the supported-flags word, then the 4
         auto const words = RomFunctions::getSysInfo(buffer.data(), buffer.size(), flag);
         if(words < 5 || (buffer[0] & flag) == 0) { return BootInfo{}; }
-        return BootInfo{.valid         = true,
-                        .tbybAndUpdate = static_cast<std::uint8_t>(buffer[1] >> 24),
-                        .partition     = static_cast<std::uint8_t>(buffer[1] >> 16),
-                        .bootType      = static_cast<std::uint8_t>(buffer[1] >> 8),
-                        .diagnostic    = buffer[2]};
+        return BootInfo{.valid               = true,
+                        .tbybAndUpdate       = static_cast<std::uint8_t>(buffer[1] >> 24),
+                        .partition           = static_cast<std::uint8_t>(buffer[1] >> 16),
+                        .bootType            = static_cast<std::uint8_t>(buffer[1] >> 8),
+                        .diagnosticPartition = static_cast<std::int8_t>(buffer[1] & 0xffU),
+                        .diagnostic          = buffer[2]};
     }
 
     /// The scratch explicit_buy needs to rewrite the sector holding the TBYB flag (5.4.8.4: "at
@@ -284,13 +340,13 @@ namespace Detail {
     // divider (flash_exit_xip -> flash_init_spi), the state the ROM's own buy at boot runs in; afterwards the
     // image's mode comes back. RAM code: the flash is not readable during the ROM's erase and program.
     [[KVASIR_RAM_FUNC_ATTRIBUTES]] static inline int
-    explicitBuyImpl(Kvasir::Detail::FlashXipDisabler& xipDisabler,
+    explicitBuyImpl(Kvasir::Flash::XipDisabler& xipDisabler,
                     int (*buy)(std::uint8_t*,
                                std::uint32_t),
                     std::uint8_t* buffer,
                     std::uint32_t bufferSize) {
         KVASIR_RAM_FUNC_MARK();
-        Kvasir::Detail::XipGuard const guard{xipDisabler};
+        Kvasir::Flash::XipGuard const guard{xipDisabler};
         return buy(buffer, bufferSize);
     }
 }   // namespace Detail
@@ -310,17 +366,25 @@ namespace Bootrom {
     /// it, as for flashErase(). 0 (BOOTROM_OK) or a negative boot ROM error; a call on a bought
     /// image does nothing and returns 0. Under the OTP boot lock: the rollback version goes
     /// through the checked otp_access (pico-bootrom varm_launch_image.c); its flash writes are
-    /// unchecked.
+    /// unchecked. Recorded and timed like flashErase() / flashWrite() (FlashOps.hpp,
+    /// Flash::OpInFlight::Kind::buy, offset and size 0: the boot ROM finds the sector itself).
     [[nodiscard]] inline int explicitBuy(std::span<std::uint32_t,
                                                    explicitBuyScratchBytes / 4> scratch) {
         BootLockGuard<BootLock::otp> const lock{};
         auto const                         buy
           = RomFunctions::getRomFunctionPointer<'E', 'B', int (*)(std::uint8_t*, std::uint32_t)>();
-        Kvasir::Detail::FlashXipDisabler xipDisabler{};
-        return Detail::explicitBuyImpl(xipDisabler,
-                                       buy,
-                                       reinterpret_cast<std::uint8_t*>(scratch.data()),
-                                       static_cast<std::uint32_t>(scratch.size_bytes()));
+        auto const startUs
+          = Kvasir::Flash::Detail::beginOp(Kvasir::Flash::OpInFlight::Kind::buy, 0, 0);
+        int result = 0;
+        {
+            Kvasir::Flash::XipDisabler xipDisabler{};
+            result = Detail::explicitBuyImpl(xipDisabler,
+                                             buy,
+                                             reinterpret_cast<std::uint8_t*>(scratch.data()),
+                                             static_cast<std::uint32_t>(scratch.size_bytes()));
+        }
+        Kvasir::Flash::Detail::endOp(startUs);
+        return result;
     }
 #endif
 }

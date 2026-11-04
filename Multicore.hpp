@@ -155,7 +155,7 @@ struct Core0Park {
     using Isr = brigand::list<Kvasir::Nvic::Isr<std::addressof(onNmi), Kvasir::Nvic::Index<-14>>>;
 };
 
-// Core 0 keeping core 1 out of the flash while XIP is off (Detail::FlashXipDisabler: every erase, program, direct-mode
+// Core 0 keeping core 1 out of the flash while XIP is off (Flash::XipDisabler: every erase, program, direct-mode
 // command and boot ROM flash call - FlashOps, FlashRegion, BootInfo's loadPartitionTable/explicitBuy, Qmi, the
 // RP2040's flash_do_cmd). A core 1 that fetches from flash then reads junk or stalls the QMI; pico-sdk's
 // multicore_lockout asks the other core over the SIO FIFO, which an application here may own. This takes the line
@@ -224,7 +224,7 @@ struct Core1Lockout {
         parked = false;
     }
 
-    // Core 0: core 1 parked for the Guard's scope (FlashXipDisabler holds one). Nothing on core 1, before core 1 is
+    // Core 0: core 1 parked for the Guard's scope (Flash::XipDisabler holds one). Nothing on core 1, before core 1 is
     // armed, or nested inside another Guard (an interrupt's flash write inside a flash write).
     class Guard {
     public:

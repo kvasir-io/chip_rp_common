@@ -4,9 +4,9 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <kvasir/Register/Memory.hpp>
 #include <kvasir/Util/attributes.hpp>
+#include <type_traits>
 
 namespace Kvasir { namespace RomFunctions {
     constexpr std::uint32_t lookupCode(char c1,
@@ -39,10 +39,12 @@ namespace Kvasir { namespace RomFunctions {
 #endif
     }
 
+    // Out of line, as call() below: the boot-ROM calls stay in RomFunctions, where the static stack bound's chip notes
+    // (chip_rp2350/stack_bound.txt, `rom Kvasir::RomFunctions::*`) find them, rather than inlined into the caller.
     template<char C1,
              char C2,
              typename F>
-    F getRomFunctionPointer() {
+    [[gnu::noinline]] F getRomFunctionPointer() {
         auto const fp = lookupRomFunction<F>(lookupCode(C1, C2));
         assert(fp != nullptr);
         return fp;
@@ -59,14 +61,16 @@ namespace Kvasir { namespace RomFunctions {
         return lookupRomFunction<F>(lookupCode(C1, C2));
     }
 
+    // The ROM function called here, through the pointer, not handed to std::invoke: LTO may keep an std::invoke out of
+    // line, and the ROM call would then be in a libc++ function the chip notes cannot name.
     template<char C1,
              char C2,
              typename F,
              typename... Args>
-    std::invoke_result_t<F,
-                         Args...>
+    [[gnu::noinline]] std::invoke_result_t<F,
+                                           Args...>
     call(Args... args) {
-        return std::invoke(getRomFunctionPointer<C1, C2, F>(), args...);
+        return getRomFunctionPointer<C1, C2, F>()(args...);
     }
 
     static inline int getSysInfo(std::uint32_t* outBuffer,

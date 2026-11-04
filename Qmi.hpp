@@ -29,19 +29,19 @@ namespace Kvasir { namespace Qmi {
 
     namespace Detail {
         // In RAM, interrupts off: the transaction on chip select 0 at clk_sys / clkdiv. The
-        // FlashXipDisabler comes from the caller, like flash_erase_impl's: its constructor looks
+        // Flash::XipDisabler comes from the caller, like flash_erase_impl's: its constructor looks
         // up ROM functions and copies the BOOTRAM setup routine, all code in flash.
         // Plain pointers and sizes, taken apart by the caller in flash: a span's data() and size() are real
         // functions in flash in a hardened build (gcc's sanitize variant kept size() out of line, found by
         // check_ram_funcs.py), and a RAM function calls nothing there.
-        [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void transfer(Kvasir::Detail::FlashXipDisabler& xip,
-                                                            std::byte const* txData,
-                                                            std::size_t      txSize,
-                                                            std::byte*       rxData,
-                                                            std::size_t      rxSize,
-                                                            std::uint32_t    clkdiv) {
+        [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void transfer(Kvasir::Flash::XipDisabler& xip,
+                                                            std::byte const*            txData,
+                                                            std::size_t                 txSize,
+                                                            std::byte*                  rxData,
+                                                            std::size_t                 rxSize,
+                                                            std::uint32_t               clkdiv) {
             KVASIR_RAM_FUNC_MARK();
-            Kvasir::Detail::XipGuard const guard{xip};
+            Kvasir::Flash::XipGuard const guard{xip};
             Kvasir::Detail::directTransaction(txData, txSize, rxData, rxSize, clkdiv);
         }
     }   // namespace Detail
@@ -51,8 +51,8 @@ namespace Kvasir { namespace Qmi {
     inline void direct(std::span<std::byte const> tx,
                        std::span<std::byte>       rx,
                        std::uint32_t              clkdiv = Kvasir::Detail::directCommandClkdiv) {
-        Kvasir::Detail::FlashXipDisabler xip{};
-        Kvasir::Core::IrqGuard const     guard{};
+        Kvasir::Flash::XipDisabler   xip{};
+        Kvasir::Core::IrqGuard const guard{};
         Detail::transfer(xip,
                          tx.data(),
                          tx.size(),

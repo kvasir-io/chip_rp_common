@@ -13,9 +13,11 @@
 //   such an image sees its own partition only, and a region in a data partition is a bus fault.
 //
 // Both mask interrupts and stop XIP for the whole operation (an erase takes tens of ms): nothing
-// may run from flash meanwhile, on the other core neither.
+// may run from flash meanwhile, on the other core neither. Both refuse while XIP reads are not right
+// at the clock clk_sys runs at (XipTiming.hpp: a clock tree that is not the one the timing was made for).
 #include "FlashOps.hpp"
 #include "Rom.hpp"
+#include "XipTiming.hpp"
 #include "flash.hpp"
 #include "kvasir/Hal/Flash.hpp"
 #include "kvasir/Port/LinkerSymbols.hpp"
@@ -48,10 +50,13 @@ namespace Kvasir { namespace Flash {
             Kvasir::Memory::loadBytes(xipUntranslatedBase + Offset + addr, out.data(), out.size());
         }
 
-        // the integer flash offset only: no flash symbol's address reaches the boot ROM's RAM function
+        // the integer flash offset only: no flash symbol's address reaches the boot ROM's RAM function. Refused
+        // (false) while XIP reads are not right at the clock clk_sys runs at (XipTiming.hpp): what is read back to
+        // verify, and what a cell store reads at mount, would be shifted.
         static bool programPage(std::uint32_t        page,
                                 std::span<std::byte const,
                                           pageBytes> bytes) {
+            if(!Clocks::xipTimingTrusted()) { return false; }
             Kvasir::Core::IrqGuard const guard{};
             Kvasir::Detail::flashWrite(Offset + page,
                                        reinterpret_cast<std::uint8_t const*>(bytes.data()),
@@ -60,6 +65,7 @@ namespace Kvasir { namespace Flash {
         }
 
         static bool eraseSector(std::uint32_t sector) {
+            if(!Clocks::xipTimingTrusted()) { return false; }
             Kvasir::Core::IrqGuard const guard{};
             Kvasir::Detail::flashErase(Offset + sector * sectorSize, 1);
             return true;

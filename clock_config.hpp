@@ -1,8 +1,11 @@
 #pragma once
 #include "Clocks.hpp"
+#include "FlashOps.hpp"
 #include "FlashTimingMath.hpp"
 #include "PllSearch.hpp"
 #include "WaitBounds.hpp"
+#include "XipTiming.hpp"
+#include "XoscStartupConfig.hpp"
 #include "core/Barrier.hpp"
 #include "core/Delay.hpp"
 #include "core/Special.hpp"
@@ -10,6 +13,8 @@
 #include "kvasir/Port/Hooks.hpp"
 #include "kvasir/Register/Memory.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/Config.hpp"
+#include "kvasir/Util/attributes.hpp"
 #include "peripherals/CLOCKS.hpp"
 #include "peripherals/PLL.hpp"
 #include "peripherals/RESETS.hpp"
@@ -39,6 +44,7 @@
 #include <concepts>
 #include <cstdint>
 #include <kvasir/Runtime/Panic.hpp>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <uc_log/uc_log.hpp>
@@ -100,42 +106,95 @@ namespace Kvasir { namespace Clocks {
 }}   // namespace Kvasir::Clocks
 
 namespace Kvasir { namespace Clocks {
-    // When the crystal counts as started, a hook (DefaultClockSettings::detail::enableCrystal and crystalSettled):
-    //
-    //     struct Xosc : Kvasir::Clocks::XoscDelay {};   // or XoscMeasured with its own agree / maxCounts
-    //     template<> struct Kvasir::Clocks::XoscStartupConfig<Kvasir::Tag::User> { using type = Xosc; };
-    //
-    // XOSC.STATUS.STABLE is only XOSC.STARTUP.DELAY running out: nothing in the XOSC looks at the oscillation.
-    //   - XoscDelay: STABLE after startupMs, and that is it. Long enough for the crystals Kvasir has met
-    //     (Chip::xoscStartupMs), a time that holds for a crystal only as far as somebody measured it.
-    //   - XoscMeasured (the default): STABLE after the short startupMs, then the frequency counter counts clk_xosc
-    //     against clk_ref -
-    //     still the ROSC - until `agree` counts in a row lie within 1/2^toleranceShift of the one before. clk_ref's
-    //     frequency is not known on the ROSC, so the counts are compared with each other, not with CrystalSpeed: a
-    //     crystal still building up drops or adds edges, and its counts disagree. At most maxCounts counts (each
-    //     0.98 us * 2^interval of clk_ref at the ROSC's ceiling, longer at a slower ROSC); a crystal that does not
-    //     settle in them is switched off again, so the boot stops at InitResult::xoscNotStable as for no crystal.
-    enum class XoscCheck : std::uint8_t { delay, measured };
 
-    struct XoscDelay {
-        static constexpr XoscCheck     check     = XoscCheck::delay;
-        static constexpr std::uint32_t startupMs = Kvasir::Chip::xoscStartupMs;
+    /// What one crystal check found, in the check's own terms (Clocks::XoscStartupConfig): the clock init's
+    /// (DefaultClockSettings::coreClockInit at boot, and a resus repair's run of it) or a run-time try's (crystalStarted,
+    /// startSources: a degraded boot's switch-up). Why the crystal did or did not count as started: STATUS.STABLE and
+    /// how many reads it took, and the frequency counter's counts of clk_xosc against clk_ref - the ring oscillator,
+    /// whose settings are recorded with them, since the counts are only as steady as that reference. Plain stores and
+    /// register reads: the clock init's is written before initMemory(), into .noInit (Detail::crystalCheckOfInit), and
+    /// Clocks::DegradedBoot keeps the boot's after it (Report::bootCrystal). Counts are in 1/32 of what FC0 calls a kHz
+    /// against refKhz: off by clk_ref's real frequency, the same for every count of one check.
+    struct CrystalCheck {
+        enum class Outcome : std::uint8_t {
+            notRun,   // no check: the init stopped before the crystal (the voltage, a switch to the ROSC)
+            settled,   // XoscMeasured: agree counts in a row, each within the tolerance of the one before
+            stableOnly,   // XoscDelay: STATUS.STABLE is the whole check
+            alreadyOnCrystal,   // clk_ref already ran from the crystal: nothing to count it against; settled
+            notStable,   // STATUS.STABLE did not come within the bound: the crystal did not oscillate (the
+                         // startup counter counts its edges)
+            notSettled,   // STABLE came, but no agree counts in a row in maxCounts: switched off again
+            startedNow,   // a run-time try found it off and enabled it; a later try looks at it
+            stillNotStable,   // a run-time try found it enabled by an earlier one and STABLE still clear
+        };
+
+        std::uint32_t
+                magic;   // Detail::crystalCheckMagic: written by a check, not power-on garbage
+        Outcome outcome;
+        bool
+          foundEnabled;   // XOSC STATUS.ENABLED when the check started: something before left it on
+        bool foundStable;   // XOSC STATUS.STABLE then
+        bool
+          randomisedFound;   // the ROSC's drive randomisation was on when the check started - for the clock
+        // init: as a stage before the image left it (picotool's decryption stage
+        // does); Clocks::onRingOscillator() switches it off before the counts
+        bool measured;   // XoscMeasured (false: XoscDelay)
+        std::uint32_t
+          roscCtrlFound;   // ROSC CTRL (FREQ_RANGE) and FREQA (drive, randomisation) when the check started -
+        std::uint32_t
+          roscFreqaFound;   // for the clock init: as the stage before left them, before onRingOscillator()
+        std::uint32_t
+          stablePolls;   // reads of STATUS until STABLE; the bound's when it did not come; 0 when not waited
+        std::uint32_t
+          stableBound;   // the bound in reads (Chip::XoscStableBoundFor, counted at clk_ref's ceiling)
+        std::uint32_t counts;   // FC0 counts taken
+        std::uint32_t
+          zeroCounts;   // of them 0: the count did not finish, or the crystal stopped in it (DIED)
+        std::uint32_t bestRun;    // the longest run of nonzero counts in a row within the tolerance
+        std::uint32_t minCount;   // the nonzero counts' range and the last count (0: none)
+        std::uint32_t maxCount;
+        std::uint32_t lastCount;
+        std::uint32_t worstStep;   // the largest difference of two nonzero counts in a row
+        std::uint32_t
+          worstStepFrom;   // the count before it: the tolerance there was worstStepFrom >> toleranceShift
+        std::uint32_t refKhz;      // FC0_REF_KHZ the counts assumed (clk_ref's ceiling on the ROSC)
+        std::uint32_t clkRefDiv;   // CLK_REF_DIV.INT as counted: clk_ref = the ROSC's output / this
+        std::uint32_t
+          clkRefSelected;   // CLK_REF_SELECTED as counted (one-hot over CLK_REF_CTRL.SRC)
+        std::uint32_t
+          roscCtrl;   // ROSC CTRL (FREQ_RANGE), FREQA (drive, DS0/DS1_RANDOM) and DIV as counted
+        std::uint32_t roscFreqa;
+        std::uint32_t roscDiv;
+        std::uint32_t
+          startupMs;   // the configuration the check ran with (Clocks::XoscStartupConfig)
+        std::uint32_t agree;
+        std::uint32_t toleranceShift;
+        std::uint32_t interval;
+        std::uint32_t maxCounts;
     };
 
-    struct XoscMeasured {
-        static constexpr XoscCheck     check = XoscCheck::measured;
-        static constexpr std::uint32_t startupMs
-          = 1;   // pico-sdk's default: the measurement does the waiting
-        static constexpr std::uint32_t agree          = 4;
-        static constexpr std::uint32_t toleranceShift = 8;   // 1/256
-        static constexpr std::uint32_t interval = 10;   // FC0_INTERVAL: ~1 ms at the ROSC's ceiling
-        static constexpr std::uint32_t maxCounts = 256;
-    };
+    [[nodiscard]] constexpr std::string_view name(CrystalCheck::Outcome o) {
+        switch(o) {
+        case CrystalCheck::Outcome::notRun:           return "not run";
+        case CrystalCheck::Outcome::settled:          return "settled";
+        case CrystalCheck::Outcome::stableOnly:       return "stable (no measurement)";
+        case CrystalCheck::Outcome::alreadyOnCrystal: return "clk_ref already on the crystal";
+        case CrystalCheck::Outcome::notStable:        return "not stable within the bound";
+        case CrystalCheck::Outcome::notSettled:       return "counts did not settle";
+        case CrystalCheck::Outcome::startedNow:       return "started at this try";
+        case CrystalCheck::Outcome::stillNotStable:   return "still not stable";
+        }
+        return "?";
+    }
 
-    template<typename T, typename... Ts>
-    struct XoscStartupConfig {
-        using type = XoscMeasured;
-    };
+    namespace Detail {
+        // "XSCK": a CrystalCheck a check wrote
+        inline constexpr std::uint32_t crystalCheckMagic = 0x4B43'5358U;
+        // The last clock init's check: coreClockInit runs before initMemory(), so .noInit, written whole by each run
+        [[KVASIR_NOINIT]] inline CrystalCheck crystalCheckOfInit;
+        // The last run-time try's (crystalStarted, startSources): after initMemory, a plain variable
+        inline CrystalCheck crystalCheckOfTry{};
+    }   // namespace Detail
 }}   // namespace Kvasir::Clocks
 
 namespace Kvasir { namespace DefaultClockSettings {
@@ -198,6 +257,45 @@ namespace Kvasir { namespace DefaultClockSettings {
           Kvasir::Clocks::XoscStartupConfig<Kvasir::Tag::User>,
           std::integral_constant<decltype(CrystalSpeed), CrystalSpeed>>::type;
 
+        // Whether the clock init switches the ROSC's drive randomisation off (the config's roscRandomisationOff; on
+        // for a config that leaves it out)
+        template<auto CrystalSpeed>
+        [[nodiscard]] consteval bool roscRandomisationOffFor() {
+            using Config = XoscConfig<CrystalSpeed>;
+            return KVASIR_CONFIG_OR(Config, roscRandomisationOff, true);
+        }
+
+        // Whether the crystal checks keep their Clocks::CrystalCheck (the config's recordCheck) and where: the clock
+        // init's in .noInit, a run-time try's in .bss - none where the config records nothing, and then the record is
+        // not even referenced
+        template<auto CrystalSpeed>
+        [[nodiscard]] consteval bool crystalRecordFor() {
+            return Clocks::Detail::recordsCrystalCheck<
+              std::integral_constant<decltype(CrystalSpeed), CrystalSpeed>>();
+        }
+
+        template<auto CrystalSpeed>
+        [[nodiscard,
+          gnu::always_inline]] inline Clocks::CrystalCheck*
+        initRecord() {
+            if constexpr(crystalRecordFor<CrystalSpeed>()) {
+                return &Clocks::Detail::crystalCheckOfInit;
+            } else {
+                return nullptr;
+            }
+        }
+
+        template<auto CrystalSpeed>
+        [[nodiscard,
+          gnu::always_inline]] inline Clocks::CrystalCheck*
+        tryRecord() {
+            if constexpr(crystalRecordFor<CrystalSpeed>()) {
+                return &Clocks::Detail::crystalCheckOfTry;
+            } else {
+                return nullptr;
+            }
+        }
+
         // XOSC.STARTUP.DELAY for Ms: what STATUS.STABLE waits for, in 256 crystal periods (XOSC.STARTUP, RP2040
         // Table 262). pico-sdk's formula (hardware_xosc/xosc.c), its 1 ms times PICO_XOSC_STARTUP_DELAY_MULTIPLIER
         // rounded the same way.
@@ -233,40 +331,62 @@ namespace Kvasir { namespace DefaultClockSettings {
 
         // One FC0 count of clk_xosc (XoscMeasured), in 1/32 of what FC0 calls a kHz: FC0_REF_KHZ claims the ROSC's
         // clk_ref ceiling, so the unit is off by clk_ref's real frequency - the same for every count of one wait.
-        // 0 for a count that did not finish or a clock that stopped in it. Registers only and always inlined, as
-        // FrequencyCounter::measureRaw (ClockOutput.hpp), which is a RAM function and cannot run before initMemory().
+        // 0 for a count that did not finish or a clock that stopped in it (Clocks::Detail::fc0Count, XipTiming.hpp: a
+        // flash function, so before initMemory() too - FrequencyCounter::measureRaw is a RAM function and is not).
         template<typename Config>
         [[gnu::always_inline]] inline std::uint32_t xoscCount() {
-            using Clk    = Kvasir::Peripheral::CLOCKS::Registers<>;
-            using Status = Clk::FC0_STATUS;
-            using Kvasir::Register::writeWhole;
-            constexpr std::uint32_t refKhz
-              = static_cast<std::uint32_t>(Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling / 1'000);
-            constexpr std::uint32_t src
-              = static_cast<std::uint32_t>(Clk::FC0_SRC::FC0_SRCVal::xosc_clksrc);
-            // a count lasts ~1 ms at the ceiling, a few at the ROSC's floor; a poll takes some cycles
-            constexpr std::uint32_t pollLimit = 4'000'000;
+            using Src = Kvasir::Peripheral::CLOCKS::Registers<>::FC0_SRC::FC0_SRCVal;
+            return Clocks::Detail::fc0Count(
+              static_cast<std::uint32_t>(Src::xosc_clksrc),
+              static_cast<std::uint32_t>(Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling / 1'000),
+              Config::interval);
+        }
 
-            std::uint32_t polls = pollLimit;
-            while(get<0>(apply(read(Status::running))) != 0) {
-                if(--polls == 0) { return 0; }
+        // A crystal check's record started afresh (Clocks::CrystalCheck): nothing found, nothing counted, outcome
+        // notRun - what an init that stops before the crystal leaves. With the ROSC's randomisation as found, before
+        // Clocks::onRingOscillator() switches it off. Plain stores and register reads (before initMemory() too).
+        [[gnu::noinline]] inline void startCrystalRecord(Clocks::CrystalCheck& c) {
+            c                = Clocks::CrystalCheck{};
+            c.magic          = Clocks::Detail::crystalCheckMagic;
+            c.outcome        = Clocks::CrystalCheck::Outcome::notRun;
+            using Rosc       = Kvasir::Peripheral::ROSC::Registers<>;
+            c.roscCtrlFound  = Kvasir::Register::readWhole(Rosc::CTRL::FULLREGISTER);
+            c.roscFreqaFound = Kvasir::Register::readWhole(Rosc::FREQA::FULLREGISTER);
+#ifdef KVASIR_CHIP_RP2350
+            using Freqa  = Kvasir::Peripheral::ROSC::Registers<>::FREQA;
+            auto const r = apply(read(Freqa::ds0_random), read(Freqa::ds1_random));   // one load
+            c.randomisedFound = get<0>(r) != 0U || get<1>(r) != 0U;
+#endif
+        }
+
+        // Right before the crystal is enabled or looked at: what the XOSC says, the reference the counts will run
+        // against (clk_ref's source and divisor, the ROSC's range, drive and divider) and the check's configuration.
+        template<auto CrystalSpeed>
+        [[gnu::noinline]] inline void beginCrystalCheck(Clocks::CrystalCheck& c) {
+            using Config = XoscConfig<CrystalSpeed>;
+            using Clk    = Kvasir::Peripheral::CLOCKS::Registers<>;
+            using XOSC   = Kvasir::Peripheral::XOSC::Registers<>;
+            using ROSC   = Kvasir::Peripheral::ROSC::Registers<>;
+            using Kvasir::Register::readWhole;
+            auto const st
+              = apply(read(XOSC::STATUS::stable), read(XOSC::STATUS::enabled));   // one load
+            c.foundStable  = get<0>(st) != 0U;
+            c.foundEnabled = get<1>(st) != 0U;
+            c.measured     = Config::check == Kvasir::Clocks::XoscCheck::measured;
+            c.refKhz
+              = static_cast<std::uint32_t>(Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling / 1'000);
+            c.clkRefDiv = static_cast<std::uint32_t>(get<0>(apply(read(Clk::CLK_REF_DIV::_int))));
+            c.clkRefSelected = readWhole(Clk::CLK_REF_SELECTED::FULLREGISTER);
+            c.roscCtrl       = readWhole(ROSC::CTRL::FULLREGISTER);
+            c.roscFreqa      = readWhole(ROSC::FREQA::FULLREGISTER);
+            c.roscDiv        = readWhole(ROSC::DIV::FULLREGISTER);
+            c.startupMs      = Config::startupMs;
+            if constexpr(Config::check == Kvasir::Clocks::XoscCheck::measured) {
+                c.agree          = Config::agree;
+                c.toleranceShift = Config::toleranceShift;
+                c.interval       = Config::interval;
+                c.maxCounts      = Config::maxCounts;
             }
-            writeWhole(Clk::FC0_REF_KHZ::FULLREGISTER, refKhz);
-            writeWhole(Clk::FC0_MIN_KHZ::FULLREGISTER, 0U);
-            writeWhole(Clk::FC0_MAX_KHZ::FULLREGISTER, 0x1FF'FFFFU);
-            writeWhole(Clk::FC0_DELAY::FULLREGISTER, 1U);
-            apply(
-              write(Clk::FC0_INTERVAL::fc0_interval, Kvasir::Register::value<Config::interval>()));
-            writeWhole(Clk::FC0_SRC::FULLREGISTER, src);   // starts the count
-            polls = pollLimit;
-            while(get<0>(apply(read(Status::done))) == 0) {
-                if(--polls == 0) { return 0; }
-            }
-            if(get<0>(apply(read(Status::died))) != 0) { return 0; }
-            auto const r
-              = apply(read(Clk::FC0_RESULT::khz), read(Clk::FC0_RESULT::frac));   // one load
-            return (static_cast<std::uint32_t>(get<0>(r)) << 5)
-                 | static_cast<std::uint32_t>(get<1>(r));
         }
 
         // After STATUS.STABLE: whether the crystal may clock the chip (Clocks::XoscStartupConfig). XoscDelay: yes,
@@ -275,16 +395,21 @@ namespace Kvasir { namespace DefaultClockSettings {
         // Clocks::initResult() then says xoscNotStable, and crystalStarted() starts it afresh). clk_ref is on the ROSC:
         // what is counted is the crystal against it, before anything runs from the crystal. A crystal clk_ref already
         // runs from (a degraded boot on the crystal, a resus repair's clk_ref, crystalStarted()'s run-time callers) is
-        // settled: nothing to count it against, and switching it off would stop clk_ref and clk_sys for good.
+        // settled: nothing to count it against, and switching it off would stop clk_ref and clk_sys for good. What the
+        // counts came to goes into the record @p c (its statistics kept in registers, stored once at the end).
         template<auto CrystalSpeed>
-        [[nodiscard]] inline bool crystalSettled() {
-            using Config = XoscConfig<CrystalSpeed>;
+        [[nodiscard]] inline bool crystalSettled(Clocks::CrystalCheck* c) {
+            using Config          = XoscConfig<CrystalSpeed>;
+            using Outcome         = Clocks::CrystalCheck::Outcome;
+            constexpr bool record = crystalRecordFor<CrystalSpeed>();
             if constexpr(Config::check == Kvasir::Clocks::XoscCheck::delay) {
+                if constexpr(record) { c->outcome = Outcome::stableOnly; }
                 return true;
             } else {
                 using RefSelected = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_SELECTED;
                 // CLK_REF_SELECTED is one-hot over CTRL.SRC, 2 = xosc_clksrc (RP2040 Table 222, RP2350 Table 558)
                 if(Kvasir::Register::fieldEquals(selectedIs<RefSelected::clk_ref_selected, 2>)) {
+                    if constexpr(record) { c->outcome = Outcome::alreadyOnCrystal; }
                     return true;
                 }
                 static_assert(Config::agree >= 2,
@@ -292,36 +417,200 @@ namespace Kvasir { namespace DefaultClockSettings {
                 std::uint32_t previous = 0;
                 std::uint32_t run
                   = 0;   // counts in a row, each within the tolerance of the one before
-                for(std::uint32_t n = 0; n != Config::maxCounts; ++n) {
+                std::uint32_t n = 0;
+                // the record's, kept in registers while counting: one store each at the end
+                std::uint32_t zeros     = 0;
+                std::uint32_t best      = 0;
+                std::uint32_t lo        = 0xFFFF'FFFFU;
+                std::uint32_t hi        = 0;
+                std::uint32_t worst     = 0;
+                std::uint32_t worstFrom = 0;
+                bool          settled   = false;
+                while(n != Config::maxCounts) {
                     // FC0 is shared with Clocks::Resus's handler (FrequencyCounter, ClockOutput.hpp): a run-time
                     // caller (DegradedBoot, a resus repair) counts with interrupts masked; at boot they are anyway
                     std::uint32_t const count = [] {
                         Kvasir::Core::IrqGuard const guard{};
                         return xoscCount<Config>();
                     }();
+                    ++n;
                     std::uint32_t const diff
                       = count > previous ? count - previous : previous - count;
                     bool const agrees
                       = count != 0 && previous != 0 && diff <= (previous >> Config::toleranceShift);
-                    run      = agrees ? run + 1 : 1;
+                    run = agrees ? run + 1 : 1;
+                    if constexpr(record) {
+                        if(count == 0) {
+                            ++zeros;
+                        } else {
+                            lo   = count < lo ? count : lo;
+                            hi   = count > hi ? count : hi;
+                            best = run > best ? run : best;
+                            if(previous != 0 && diff > worst) {
+                                worst     = diff;
+                                worstFrom = previous;
+                            }
+                        }
+                    }
                     previous = count;
-                    if(count != 0 && run >= Config::agree) { return true; }
+                    if(count != 0 && run >= Config::agree) {
+                        settled = true;
+                        break;
+                    }
                 }
+                if constexpr(record) {
+                    c->counts        = n;
+                    c->zeroCounts    = zeros;
+                    c->bestRun       = best;
+                    c->minCount      = hi == 0 ? 0 : lo;
+                    c->maxCount      = hi;
+                    c->lastCount     = previous;
+                    c->worstStep     = worst;
+                    c->worstStepFrom = worstFrom;
+                    c->outcome       = settled ? Outcome::settled : Outcome::notSettled;
+                }
+                if(settled) { return true; }
                 using XOSC = Kvasir::Peripheral::XOSC::Registers<>;
                 apply(write(XOSC::CTRL::ENABLEValC::disable));
                 return false;
             }
         }
+
+        // The crystal enabled (enableCrystal) and taken as started (Clocks::XoscStartupConfig): STATUS.STABLE within
+        // the config's bound (Chip::XoscStableBoundFor, counted at clk_ref's ceiling on the ROSC), then crystalSettled.
+        // Into *c where the config records (its reads until STABLE; notStable when it did not come), from a record
+        // the caller started (startCrystalRecord). The clock init's and startSources()'s crystal.
+        template<auto CrystalSpeed>
+        [[nodiscard]] inline bool startCrystal(Clocks::CrystalCheck* c) {
+            using XOSC  = Kvasir::Peripheral::XOSC::Registers<>;
+            using Bound = Kvasir::Chip::XoscStableBoundFor<XoscConfig<CrystalSpeed>::startupMs>;
+            if constexpr(crystalRecordFor<CrystalSpeed>()) {
+                beginCrystalCheck<CrystalSpeed>(*c);
+                enableCrystal<CrystalSpeed>();
+                auto const r
+                  = Kvasir::Register::waitUntil<Bound, Kvasir::Register::OnTimeout::Report>(
+                    Kvasir::Register::isSet(XOSC::STATUS::stable));
+                c->stablePolls = r.polls;
+                c->stableBound = Bound::polls;
+                if(!r) {
+                    c->outcome = Clocks::CrystalCheck::Outcome::notStable;
+                    return false;
+                }
+            } else {
+                enableCrystal<CrystalSpeed>();
+                if(!waited<Bound>(Kvasir::Register::isSet(XOSC::STATUS::stable))) { return false; }
+            }
+            return crystalSettled<CrystalSpeed>(c);
+        }
     }   // namespace Detail
 
     namespace Detail {
+        // The CLK_REF_DIV that keeps clk_ref at refKhz at most on a ROSC whose undivided ceiling is baseKhz raised by
+        // halves / 2 (roscRaisedHalves), behind ROSC.DIV's divisor div: the smallest k with k * div * refKhz at least
+        // baseKhz * halves / 2, at most refDivMax. Compared in halves on both sides: k * div * refKhz * 2 is at most
+        // 255 * 128 * 25 000 * 2, within 32 bits. A loop of multiplications, no division (the M0+ has none).
+        [[nodiscard]] constexpr std::uint32_t roscRefDivisorFor(std::uint32_t div,
+                                                                std::uint32_t halves,
+                                                                std::uint32_t refKhz,
+                                                                std::uint32_t baseKhz,
+                                                                std::uint32_t refDivMax) {
+            std::uint32_t const ceilingHalves = baseKhz * halves;
+            std::uint32_t       k             = 1;
+            while(k < refDivMax && k * div * refKhz * 2U < ceilingHalves) { ++k; }
+            return k;
+        }
+
+        static_assert(std::uint64_t{255} * 128 * 25'000 * 2 <= 0xFFFF'FFFFU
+                        && 192'000U * 20 <= 0xFFFF'FFFFU,
+                      "roscRefDivisorFor's products fit 32 bits");
+        // the ROSC's 192 MHz undivided ceiling (Rp::ChipTraits::roscBaseHzCeiling) at clk_ref's 25 MHz (RP2350) and
+        // 12 MHz (RP2040) ceilings, CLK_REF_DIV.INT 8 bits (RP2350) and 2 bits (RP2040)
+        static_assert(roscRefDivisorFor(2,
+                                        2,
+                                        25'000,
+                                        192'000,
+                                        255)
+                        == 4,
+                      "the RP2350 A3+ boot ROM's ROSC (DIV 2, LOW, no drive): CLK_REF_DIV 4");
+        static_assert(
+          roscRefDivisorFor(2,
+                            10,
+                            25'000,
+                            192'000,
+                            255)
+            == 20,
+          "picotool's decryption stage's ROSC (DIV 2, HIGH, every drive 7): CLK_REF_DIV 20");
+        static_assert(roscRefDivisorFor(8,
+                                        2,
+                                        25'000,
+                                        192'000,
+                                        255)
+                        == 1,
+                      "the RP2350 A2 boot ROM's ROSC (DIV 8): CLK_REF_DIV 1");
+        static_assert(roscRefDivisorFor(16,
+                                        2,
+                                        12'000,
+                                        192'000,
+                                        3)
+                        == 1,
+                      "the RP2040's ROSC (DIV 16): CLK_REF_DIV 1");
+        static_assert(roscRefDivisorFor(8,
+                                        2,
+                                        12'000,
+                                        192'000,
+                                        255)
+                        == 2,
+                      "a degraded boot on the RP2350 A2's ROSC, clk_ref at a 12 MHz crystal's "
+                      "rate: CLK_REF_DIV 2");
+        static_assert(roscRefDivisorFor(1,
+                                        20,
+                                        1'000,
+                                        192'000,
+                                        255)
+                        == 255,
+                      "never above CLK_REF_DIV.INT's largest");
+
+        // How far above the boot ROM's range (Rp::ChipTraits::roscBaseHzCeiling: FREQ_RANGE LOW, every drive 0, the
+        // datasheet's guarantee) the ROSC may run as a stage before the image left it, in halves: FREQ_RANGE MEDIUM,
+        // HIGH and TOOHIGH run "approximately 1.33, 2 and 4 times the LOW range" (RP2350 datasheet 8.3.5, "not fully
+        // characterised": 1.5, 2.5 and 5 here), and any drive bit set in FREQA or FREQB adds up to a doubling (each bit
+        // adds a drive, the datasheet gives no figure: picotool's decryption stage - HIGH, every drive 7 - measured 2.9
+        // times the boot range on RP2350s, 140 MHz at DIV 2, which 2.5 x 2 holds with margin). Read, never written:
+        // lowering the range glitches the clock clk_sys runs from (8.3.5). Registers only.
+        [[nodiscard]] inline std::uint32_t roscRaisedHalves() {
+            using Rosc  = Kvasir::Peripheral::ROSC::Registers<>;
+            using Range = Rosc::CTRL::FREQ_RANGEVal;
+            // FREQ_RANGE's reset value 0xaa0 is none of the four (RP2350 Table 606, RP2040 Table 265): the LOW ring
+            auto const    range  = get<0>(apply(read(Rosc::CTRL::freq_range)));
+            std::uint32_t halves = 2;
+            if(range == Range::medium) { halves = 3; }
+            if(range == Range::high) { halves = 5; }
+            if(range == Range::toohigh) { halves = 10; }
+            // DS0..DS3 in FREQA, DS4..DS7 in FREQB (3 drive bits each), one load a register
+            auto const a      = apply(read(Rosc::FREQA::ds0),
+                                      read(Rosc::FREQA::ds1),
+                                      read(Rosc::FREQA::ds2),
+                                      read(Rosc::FREQA::ds3));
+            auto const b      = apply(read(Rosc::FREQB::ds4),
+                                      read(Rosc::FREQB::ds5),
+                                      read(Rosc::FREQB::ds6),
+                                      read(Rosc::FREQB::ds7));
+            bool const driven = get<0>(a) != 0U || get<1>(a) != 0U || get<2>(a) != 0U
+                             || get<3>(a) != 0U || get<0>(b) != 0U || get<1>(b) != 0U
+                             || get<2>(b) != 0U || get<3>(b) != 0U;
+            if(driven) { halves *= 2; }
+            return halves;
+        }
+
         // CLK_REF_DIV for clk_ref on the ring oscillator (Clocks::onRingOscillator): the ROSC's undivided ceiling
-        // (Rp::ChipTraits::roscBaseHzCeiling) over ROSC.DIV's divisor (RP2040 Table 269 md l.10863: 0xaa0 + div;
-        // RP2350 Table 611 md l.28310: 0xaa00 + div; 0 and other values per the traits), divided further until clk_ref
-        // is within CeilingHz (Rp::ChipTraits::clkRefOnRoscHzCeiling, or a degraded boot's crystal frequency). At the
-        // clk_ref ceiling: 1 at the RP2040's default divisor 16 and the RP2350 A2's boot divisor 8; 4 after the A3+
-        // boot ROM's divisor 2 (<= 24 MHz). At most CLK_REF_DIV.INT's largest value. Registers only; a loop of at most
-        // that many multiplications, no division (the M0+ has no divide instruction).
+        // (Rp::ChipTraits::roscBaseHzCeiling, raised by the range and drives found: roscRaisedHalves) over ROSC.DIV's
+        // divisor (RP2040 Table 269 md l.10863: 0xaa0 + div; RP2350 Table 611 md l.28310: 0xaa00 + div; 0 and other
+        // values per the traits), divided further until clk_ref is within CeilingHz (Rp::ChipTraits::
+        // clkRefOnRoscHzCeiling, or a degraded boot's crystal frequency). At the clk_ref ceiling: 1 at the RP2040's
+        // default divisor 16 and the RP2350 A2's boot divisor 8; 4 after the A3+ boot ROM's divisor 2 (<= 24 MHz); 20
+        // after picotool's decryption stage (HIGH, every drive 7, divisor 2: ~7 MHz instead of 36). At most
+        // CLK_REF_DIV.INT's largest value. Registers only; a loop of at most that many multiplications, no division
+        // (the M0+ has no divide instruction).
         template<std::uint64_t CeilingHz = Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling>
         [[nodiscard]] std::uint32_t roscRefDivisor() {
             static_assert(CeilingHz >= 1'000'000, "a clk_ref ceiling in whole MHz at least");
@@ -338,14 +627,30 @@ namespace Kvasir { namespace DefaultClockSettings {
             if(raw >= pass && raw - pass <= Traits::roscDivMax) {
                 div = raw == pass ? Traits::roscDivOfZero : raw - pass;
             }
-            std::uint32_t k = 1;
-            while(k < refDivMax && k * div * refKhz < baseKhz) { ++k; }
-            return k;
+            return roscRefDivisorFor(div, roscRaisedHalves(), refKhz, baseKhz, refDivMax);
         }
     }   // namespace Detail
 }}   // namespace Kvasir::DefaultClockSettings
 
 namespace Kvasir { namespace Clocks {
+    /// The ring oscillator's drive randomisation off (ROSC FREQA DS0_RANDOM and DS1_RANDOM), its drive strengths and
+    /// FREQ_RANGE kept. A stage that ran before the image may leave it on - picotool's decryption stage for an
+    /// encrypted image does (enc_bootloader.c runtime_init_clocks: "Enable rosc randomisation") - and on it clk_ref on
+    /// the ROSC jitters on purpose: the reference the crystal is counted against at boot
+    /// (DefaultClockSettings::Detail::crystalSettled, 1/2^toleranceShift between two counts) and the clock the TIMER
+    /// ticks from until the crystal takes over. FREQA applies a write only with its password; FREQB has no random
+    /// bits. The frequency changes to the steady one of the drives as they are. A register read and at most one write:
+    /// before initMemory() too. Clocks::onRingOscillator() runs it first. RP2350 only: the RP2040's ROSC does not
+    /// randomise.
+    inline void roscRandomisationOff() {
+#ifdef KVASIR_CHIP_RP2350
+        using Freqa  = Kvasir::Peripheral::ROSC::Registers<>::FREQA;
+        auto const r = apply(read(Freqa::ds0_random), read(Freqa::ds1_random));   // one load
+        if(get<0>(r) == 0U && get<1>(r) == 0U) { return; }
+        apply(write(Freqa::PASSWDValC::pass), clear(Freqa::ds0_random), clear(Freqa::ds1_random));
+#endif
+    }
+
     /// clk_ref and clk_sys on the ring oscillator - the tree's safe state, from any state - with clk_ref divided to
     /// CeilingHz at most (DefaultClockSettings::detail::roscRefDivisor; by default Rp::ChipTraits::
     /// clkRefOnRoscHzCeiling): the RP2350 A3+ boot ROM runs the ROSC at divisor 2, 18.4 to 96 MHz (datasheet 8.3.1 md
@@ -355,13 +660,19 @@ namespace Kvasir { namespace Clocks {
     /// ("All dividers support on-the-fly divisor changes", RP2350 md l.25859, RP2040 md l.8726). Then clk_sys to
     /// clk_ref, undivided. Registers only, each glitchless switch waited for bounded (CLK_x_SELECTED); false if one
     /// does not show. The first switches of coreClockInit() and degradedClockInit(), and what a test that breaks a
-    /// source on purpose does first: never break the clock clk_sys runs from.
-    template<std::uint64_t CeilingHz = Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling>
+    /// source on purpose does first: never break the clock clk_sys runs from. With RandomisationOff (the clock init
+    /// passes Clocks::XoscStartupConfig's roscRandomisationOff) the ROSC's drive randomisation goes off before anything
+    /// else (roscRandomisationOff): the tree's safe state is then a steady one. The ROSC's range and drives are left as
+    /// found - lowering them glitches the clock clk_sys runs from (RP2350 datasheet 8.3.5) -: the divisor takes them
+    /// into account instead (roscRefDivisor).
+    template<std::uint64_t CeilingHz        = Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling,
+             bool          RandomisationOff = true>
     [[nodiscard]] bool onRingOscillator() {
         using Clk = Kvasir::Peripheral::CLOCKS::Registers<>;
         using DefaultClockSettings::Detail::selectedIs;
         using DefaultClockSettings::Detail::waited;
         using Kvasir::Register::value;
+        if constexpr(RandomisationOff) { roscRandomisationOff(); }
         std::uint32_t const want = DefaultClockSettings::Detail::roscRefDivisor<CeilingHz>();
         // INT 0 (= its largest + 1) is never written by Kvasir; the A3+ boot ROM leaves 5 (md l.66193)
         std::uint32_t const now = get<0>(apply(read(Clk::CLK_REF_DIV::_int)));
@@ -521,6 +832,9 @@ namespace Kvasir { namespace DefaultClockSettings {
             constexpr std::uint32_t rxdelay = Kvasir::Register::extract(Timing::rxdelay, full);
             constexpr std::uint32_t boot    = bootClkdiv<ClockSpeed, MaxFlashFreq>();
             constexpr std::uint32_t div     = rxdelay < boot ? boot : rxdelay + 1;
+            static_assert(Clocks::Detail::readsAtAnySlowerClock(rxdelay, div),
+                          "a degraded boot's flash timing reads at every clock up to the full one "
+                          "(XipTiming.hpp)");
             return (full & ~Timing::clkdiv.mask) | Kvasir::Register::deposit(Timing::clkdiv, div);
         }
 #endif
@@ -559,7 +873,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         // clk_sys goes up (RP2350 datasheet, Table 1297 M0_TIMING.CLKDIV): the next fetch may hit
         // the XIP cache, so read the uncached alias (XIP_NOCACHE_NOALLOC_BASE, 2.2 address map).
         Kvasir::Core::dsb();
-        (void)Kvasir::Memory::load<std::uint32_t>(Kvasir::Detail::XipReadMode::xipNoCacheBase);
+        (void)Kvasir::Memory::load<std::uint32_t>(Kvasir::Flash::XipReadMode::xipNoCacheBase);
         Kvasir::Core::dsb();
 #endif
 
@@ -720,7 +1034,8 @@ namespace Kvasir { namespace DefaultClockSettings {
 
     // The boot's clock tree, from whatever the boot ROM, a previous image or a resus left: clk_ref on the crystal,
     // clk_sys = clk_peri on PLL_SYS at ClockSpeed, clk_usb and clk_adc on PLL_USB at 48 MHz. Registers only (it runs
-    // before initMemory(), and whatever it wrote to .data or .bss would be wiped). Every wait is bounded
+    // before initMemory(), and whatever it wrote to .data or .bss would be wiped), but for the crystal check's record
+    // in .noInit, which initMemory() leaves (Clocks::CrystalCheck, Clocks::lastInitCrystalCheck()). Every wait is bounded
     // (detail::waited, OnTimeout::Report): a step that does not finish stops the init there instead of hanging, and
     // Kvasir::Clocks::initResult() reads from the registers how far it got - peripheryClockInit() asks it at boot, the
     // resus handler after a repair.
@@ -755,11 +1070,18 @@ namespace Kvasir { namespace DefaultClockSettings {
         using AdcClock    = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_ADC_CTRL;
         using SysSelected = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_SYS_SELECTED;
         using RefSelected = Kvasir::Peripheral::CLOCKS::Registers<>::CLK_REF_SELECTED;
-        using XOSC        = Kvasir::Peripheral::XOSC::Registers<>;
         using RST         = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL         = Kvasir::Peripheral::PLL::Registers<0>;
         using USBPLL      = Kvasir::Peripheral::PLL::Registers<1>;
         using Detail::waited;
+
+        // The crystal check's record (Clocks::CrystalCheck, where Clocks::XoscStartupConfig records): started before
+        // anything, so an init that stops before the crystal leaves notRun, and with the ROSC's randomisation as the
+        // stage before left it
+        Clocks::CrystalCheck* const crystalCheck = Detail::initRecord<CrystalSpeed>();
+        if constexpr(Detail::crystalRecordFor<CrystalSpeed>()) {
+            Detail::startCrystalRecord(*crystalCheck);
+        }
 
         // clk_usb / clk_adc off first (their destinations are in reset at boot; a resus repair resets PLL_USB
         // below anyway): only the last step turns them on again, so their enables tell initResult() a finished init
@@ -778,7 +1100,11 @@ namespace Kvasir { namespace DefaultClockSettings {
         // to its ceiling, clk_sys on clk_ref, polling CLK_x_SELECTED), aux muxes changed only while deselected,
         // generators without a glitchless mux disabled for two source cycles first (RP2040 2.15.3.2, RP2350
         // 8.1.3.2). Field writes on purpose: overrideDefaults would also reset AUXSRC (RP2350 Table 559).
-        if(!Clocks::onRingOscillator()) { return; }
+        if(!Clocks::onRingOscillator<Kvasir::Rp::ChipTraits::clkRefOnRoscHzCeiling,
+                                     Detail::roscRandomisationOffFor<CrystalSpeed>()>())
+        {
+            return;
+        }
 
         // clk_peri has no glitchless mux: disable, let it stop, aux to clk_sys; enabled again after the PLL. Its
         // destinations (UART, SPI) are held in reset by FirstInitStep as well.
@@ -816,14 +1142,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         // the crystal: "XOSC startup takes several milliseconds" (RP2040 datasheet 2.15.2 md l.8579, RP2350 8.1 md
         // l.25697), on clk_ref on the ROSC (Chip::XoscStableBoundFor counts at its ceiling), then
         // Clocks::XoscStartupConfig's check
-        using XoscStable
-          = Kvasir::Chip::XoscStableBoundFor<Detail::XoscConfig<CrystalSpeed>::startupMs>;
-        Detail::enableCrystal<CrystalSpeed>();
-        if(!waited<XoscStable>(Kvasir::Register::isSet(XOSC::STATUS::stable))
-           || !Detail::crystalSettled<CrystalSpeed>())
-        {
-            return;
-        }
+        if(!Detail::startCrystal<CrystalSpeed>(crystalCheck)) { return; }
 
         // clk_ref to the crystal, then undivided, and the TIMER's microsecond tick from it - before the PLLs, so a PLL
         // that does not lock leaves clk_sys on clk_ref = the crystal (where a resus puts it too) with the TIMER and the
@@ -926,7 +1245,11 @@ namespace Kvasir { namespace DefaultClockSettings {
             : static_cast<std::uint64_t>(CrystalSpeed);
         DegradedTree tree{DegradedTree::none};
         if(!apply(read(XOSC::STATUS::stable))) {
-            if(!Clocks::onRingOscillator<roscRefHz>()) { return DegradedTree::none; }
+            if(!Clocks::onRingOscillator<roscRefHz,
+                                         Detail::roscRandomisationOffFor<CrystalSpeed>()>())
+            {
+                return DegradedTree::none;
+            }
             tree = DegradedTree::ringOscillator;
         } else {
             // CLK_x_SELECTED is one-hot over CTRL.SRC (RP2040 Tables 222/225, RP2350 Tables 558/561); the source before
@@ -974,14 +1297,28 @@ namespace Kvasir { namespace DefaultClockSettings {
     // The crystal started without waiting for it, for a caller that looks again on its own schedule (Clocks::
     // DegradedBoot's and Resus's tries: a missing crystal does not hold their loop for XoscStableBoundFor): XOSC.CTRL
     // enabled at CrystalSpeed's range unless STATUS.ENABLED says it is on already (a write while it starts up is not
-    // needed; RP2040 datasheet Table 260 md l.10562, RP2350 Table 600 md l.27908). True if it is stable now.
+    // needed; RP2040 datasheet Table 260 md l.10562, RP2350 Table 600 md l.27908). True if it is stable now. What it
+    // found goes into the run-time try's record (Clocks::Detail::crystalCheckOfTry, Clocks::lastTryCrystalCheck())
+    // where Clocks::XoscStartupConfig records.
     template<auto CrystalSpeed>
     [[nodiscard]] bool crystalStarted() {
-        using XOSC = Kvasir::Peripheral::XOSC::Registers<>;
+        using XOSC                         = Kvasir::Peripheral::XOSC::Registers<>;
+        using Outcome                      = Clocks::CrystalCheck::Outcome;
+        constexpr bool              record = Detail::crystalRecordFor<CrystalSpeed>();
+        Clocks::CrystalCheck* const check  = Detail::tryRecord<CrystalSpeed>();
+        if constexpr(record) {
+            Detail::startCrystalRecord(*check);
+            Detail::beginCrystalCheck<CrystalSpeed>(*check);
+        }
         auto const st
           = apply(read(XOSC::STATUS::stable), read(XOSC::STATUS::enabled));   // one load
-        if(static_cast<bool>(get<0>(st))) { return Detail::crystalSettled<CrystalSpeed>(); }
-        if(!static_cast<bool>(get<1>(st))) { Detail::enableCrystal<CrystalSpeed>(); }
+        if(static_cast<bool>(get<0>(st))) { return Detail::crystalSettled<CrystalSpeed>(check); }
+        if(static_cast<bool>(get<1>(st))) {
+            if constexpr(record) { check->outcome = Outcome::stillNotStable; }
+        } else {
+            Detail::enableCrystal<CrystalSpeed>();
+            if constexpr(record) { check->outcome = Outcome::startedNow; }
+        }
         return false;
     }
 
@@ -1012,18 +1349,14 @@ namespace Kvasir { namespace DefaultClockSettings {
         using RST    = Kvasir::Peripheral::RESETS::Registers<0>;
         using PLL    = Kvasir::Peripheral::PLL::Registers<0>;
         using USBPLL = Kvasir::Peripheral::PLL::Registers<1>;
-        using Detail::waited;
 
         if(!vregInit<ClockSpeed>()) { return InitResult::voltageNotSet; }
         if(!apply(read(XOSC::STATUS::stable))) {
-            using XoscStable
-              = Kvasir::Chip::XoscStableBoundFor<Detail::XoscConfig<CrystalSpeed>::startupMs>;
-            Detail::enableCrystal<CrystalSpeed>();
-            if(!waited<XoscStable>(Kvasir::Register::isSet(XOSC::STATUS::stable))
-               || !Detail::crystalSettled<CrystalSpeed>())
-            {
-                return InitResult::xoscNotStable;
+            Clocks::CrystalCheck* const check = Detail::tryRecord<CrystalSpeed>();
+            if constexpr(Detail::crystalRecordFor<CrystalSpeed>()) {
+                Detail::startCrystalRecord(*check);
             }
+            if(!Detail::startCrystal<CrystalSpeed>(check)) { return InitResult::xoscNotStable; }
         }
         bool const sysOnPll = Detail::sysOnPllSys();
         if(sysOnPll) {
@@ -1144,7 +1477,8 @@ namespace Kvasir { namespace DefaultClockSettings {
 
 namespace Kvasir { namespace Clocks {
     /// How far DefaultClockSettings::coreClockInit() got, read back from the registers it leaves: it runs before
-    /// initMemory() and keeps no variable. Its last step alone turns clk_usb and clk_adc on from PLL_USB (its first
+    /// initMemory() and keeps no variable (its crystal check's .noInit record says why the crystal did or did not count
+    /// as started, not how far the init got). Its last step alone turns clk_usb and clk_adc on from PLL_USB (its first
     /// turned them off), so both running from PLL_USB = every wait held. Otherwise the first fact of the finished tree
     /// that does not hold, in the order coreClockInit establishes them, names where it stopped (InitResult's comments
     /// say the state each leaves); `degraded` for the tree a Clocks::DegradedBoot runs a boot on. A block's registers
@@ -1257,6 +1591,48 @@ namespace Kvasir { namespace Clocks {
     [[nodiscard]] inline InitResult initResult() {
         return initFinished() ? InitResult::ok : Detail::whereInitStopped();
     }
+
+    /// clk_sys runs from PLL_SYS at the full clock the boot (or a degraded boot's switch-up) verified, counted against
+    /// the crystal again now (XipTiming.hpp), and clk_usb and clk_adc from PLL_USB: the tree the image is built for -
+    /// measured, not only selected. On the RP2350 the flash runs on the full clock's timing then. What a write the next
+    /// boot depends on (an A/B trial's buy) waits for. One FC0 count (~0.25 ms, interrupts masked for it); without
+    /// Clocks::XoscStartupConfig's verifyClkSys none - the registers' word for it.
+    template<typename... Dep>
+    [[nodiscard]] inline bool onVerifiedFullClock() {
+        if(!initFinished() || !sysOnPllSys() || Detail::fastTimingKhz == 0) { return false; }
+        if constexpr(Detail::verifiesClkSys<Dep...>()) {
+            return clkSysAt(Detail::fastTimingKhz);
+        } else {
+            return true;
+        }
+    }
+
+    /// The last clock init's crystal check (DefaultClockSettings::coreClockInit: the boot's, until a resus repair runs
+    /// the init again - Clocks::DegradedBoot::report() keeps the boot's), or none when no init recorded one - always
+    /// none where Clocks::XoscStartupConfig records nothing.
+    template<typename... Dep>
+    [[nodiscard]] inline std::optional<CrystalCheck> lastInitCrystalCheck() {
+        if constexpr(Detail::recordsCrystalCheck<Dep...>()) {
+            CrystalCheck const c = Detail::crystalCheckOfInit;
+            if(c.magic != Detail::crystalCheckMagic) { return std::nullopt; }
+            return c;
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    /// The last run-time try's crystal check (crystalStarted, startSources: a degraded boot's switch-up, a resus
+    /// repair's retry), or none before the first - always none where Clocks::XoscStartupConfig records nothing.
+    template<typename... Dep>
+    [[nodiscard]] inline std::optional<CrystalCheck> lastTryCrystalCheck() {
+        if constexpr(Detail::recordsCrystalCheck<Dep...>()) {
+            CrystalCheck const c = Detail::crystalCheckOfTry;
+            if(c.magic != Detail::crystalCheckMagic) { return std::nullopt; }
+            return c;
+        } else {
+            return std::nullopt;
+        }
+    }
 }}   // namespace Kvasir::Clocks
 
 namespace Kvasir { namespace DefaultClockSettings {
@@ -1310,15 +1686,31 @@ namespace Kvasir { namespace DefaultClockSettings {
         if(!finished && !Clocks::degraded()) [[unlikely]] {
             Detail::clockInitFailed<CrystalSpeed>();
         }
+        // the counts' reference from here on (XipTiming.hpp)
+        Clocks::Detail::crystalKhz = static_cast<std::uint32_t>(CrystalSpeed / 1000);
+        // Whether clk_sys, counted against the crystal, runs at the full clock - whatever the registers say of the
+        // tree (XipTiming.hpp). The RP2350's full-clock flash timing reads right at that clock only: taken only then,
+        // otherwise the degraded boot's, which reads at every clock up to the full one (degradedFlashTiming) - a slow
+        // XIP, never a shifted one; Clocks::DegradedBoot tries the full one again from the main loop
+        // (flashAfterSwitchUp). On both chips the count is what Clocks::onVerifiedFullClock() starts from. Without
+        // Clocks::XoscStartupConfig's verifyClkSys no count: the registers' word for it.
+        constexpr auto fullKhz = static_cast<std::uint32_t>(ClockSpeed / 1000);
+        bool           atSpeed = finished || Detail::sysOnPllSys();
+        if constexpr(Clocks::Detail::verifiesClkSys<
+                       std::integral_constant<decltype(CrystalSpeed), CrystalSpeed>>())
+        {
+            atSpeed = atSpeed && Clocks::clkSysAt(fullKhz);
+        }
 #ifdef KVASIR_CHIP_RP2350
         Kvasir::Detail::enableQuadIo();
-        std::uint32_t const timing = finished || Detail::sysOnPllSys()
+        std::uint32_t const timing = atSpeed
                                      ? Detail::flashTiming<ClockSpeed, MaxFlashFreq>()
                                      : Detail::degradedFlashTiming<ClockSpeed, MaxFlashFreq>();
         auto const          irqs   = Kvasir::Core::IrqState::saveAndMask();
-        Kvasir::Detail::XipReadMode::apply(timing);
+        Kvasir::Flash::XipReadMode::apply(timing);
         irqs.restore();
 #endif
+        Clocks::Detail::fastTimingKhz = atSpeed ? fullKhz : 0U;
     }
 
     // After a degraded boot's switch-up (Clocks::DegradedBoot: clk_sys at ClockSpeed again), the flash's divider for
@@ -1327,16 +1719,28 @@ namespace Kvasir { namespace DefaultClockSettings {
     // currently accessing memory in this address window. All other parameters must only be changed when the QMI is
     // idle." (RP2350 datasheet, M0_TIMING md l.60489): a register write at run time, no XIP-off command (a BBh flash's
     // quad enable reads the JEDEC id in direct mode), no read-mode change and no wait for an idle QMI, whatever another
-    // core fetches from flash meanwhile - those ran at boot, single-core (peripheryClockInit). The RP2040's flash runs
-    // on boot2's SSI divider, which no clock switch changes: nothing to do there.
+    // core fetches from flash meanwhile - those ran at boot, single-core (peripheryClockInit). Only once clk_sys,
+    // counted against the crystal, runs at ClockSpeed (XipTiming.hpp): the full clock's divider makes the timing one
+    // that reads at that clock alone. False, the degraded timing kept, where it does not - Clocks::DegradedBoot tries
+    // again. The RP2040's flash runs on boot2's SSI divider, which no clock switch changes: nothing to write there, the
+    // count alone (Clocks::onVerifiedFullClock()). Idempotent. Without Clocks::XoscStartupConfig's verifyClkSys no
+    // count: always true.
     template<auto ClockSpeed,
              auto MaxFlashFreq = 100'000'000>
-    void flashAfterSwitchUp() {
+    [[nodiscard]] bool flashAfterSwitchUp() {
+        constexpr auto fullKhz = static_cast<std::uint32_t>(ClockSpeed / 1000);
+        if constexpr(Clocks::Detail::verifiesClkSys<
+                       std::integral_constant<decltype(ClockSpeed), ClockSpeed>>())
+        {
+            if(!Clocks::clkSysAt(fullKhz)) { return false; }
+        }
 #ifdef KVASIR_CHIP_RP2350
         using Timing = Kvasir::Peripheral::QMI::Registers<0>::M0_TIMING;
         using Kvasir::Register::value;
         apply(write(Timing::clkdiv, value<Detail::flashClkdiv<ClockSpeed, MaxFlashFreq>()>()));
 #endif
+        Clocks::Detail::fastTimingKhz = fullKhz;
+        return true;
     }
 
     // An application's whole ClockSettings in one line:
@@ -1376,8 +1780,8 @@ namespace Kvasir { namespace DefaultClockSettings {
             return DefaultClockSettings::switchToSources<ClockSpeed, CrystalSpeed>();
         }
 
-        static void flashAfterSwitchUp() {
-            DefaultClockSettings::flashAfterSwitchUp<ClockSpeed, MaxFlashFreq>();
+        [[nodiscard]] static bool flashAfterSwitchUp() {
+            return DefaultClockSettings::flashAfterSwitchUp<ClockSpeed, MaxFlashFreq>();
         }
     };
 
@@ -1390,7 +1794,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         { CS::crystalStarted() } -> std::same_as<bool>;
         { CS::startSources() } -> std::same_as<Clocks::InitResult>;
         { CS::switchToSources() } -> std::same_as<Clocks::InitResult>;
-        CS::flashAfterSwitchUp();
+        { CS::flashAfterSwitchUp() } -> std::same_as<bool>;
     };
 }}   // namespace Kvasir::DefaultClockSettings
 
@@ -1421,13 +1825,38 @@ namespace Kvasir { namespace Clocks { namespace Detail {
     }
 }}}   // namespace Kvasir::Clocks::Detail
 
-/// The chip's line in the boot report (kvasir/Port/Hooks.hpp, Boot::logBoot): why this boot runs degraded, on which
-/// tree, and what that costs; nothing for a boot whose clocks came up.
+/// The chip's lines in the boot report (kvasir/Port/Hooks.hpp, Boot::logBoot): the flash operation the previous run
+/// was reset in (FlashOps.hpp, Flash::opInFlightAtBoot()); why this boot runs degraded, on which tree, what that costs,
+/// and what the crystal check found; for a boot on the full tree whose clk_sys did not count at the full clock, that
+/// the flash runs on the slow timing; nothing for a boot whose clocks came up after a run that ended no flash
+/// operation half-way.
 template<typename... Ts>
 struct Kvasir::Port::StartNotes<Kvasir::Tag::User, Ts...> {
     void operator()() const {
+        if(auto const op = Kvasir::Flash::opInFlightAtBoot()) {
+            UC_LOG_W(
+              "boot: the previous run was reset in a flash {} of {} B at flash offset {:#010x}, "
+              "which it began "
+              "{} us into its boot",
+              Kvasir::Flash::name(op->kind),
+              op->bytes,
+              op->offset,
+              op->startUs);
+        }
         auto const tree = Kvasir::Clocks::Detail::degradedOn;
-        if(tree == Kvasir::Clocks::DegradedTree::none) { return; }
+        if(tree == Kvasir::Clocks::DegradedTree::none) {
+            // the full tree, but clk_sys did not count at the full clock in peripheryClockInit (XipTiming.hpp)
+            if(Kvasir::Clocks::Detail::verifiesClkSys<Ts...>()
+               && Kvasir::Clocks::Detail::fastTimingKhz == 0)
+            {
+                UC_LOG_W(
+                  "boot: clk_sys counts {} kHz against the crystal, not the full clock: the flash "
+                  "runs on the "
+                  "slow timing; tried again from the main loop",
+                  Kvasir::Clocks::clkSysKhz());
+            }
+            return;
+        }
         UC_LOG_W(
           "boot: clocks degraded: the clock init failed in {} boots in a row ({}), "
           "this one runs on {} - {}; the crystal and the PLLs are retried from the main loop",
@@ -1435,5 +1864,23 @@ struct Kvasir::Port::StartNotes<Kvasir::Tag::User, Ts...> {
           Kvasir::Clocks::name(Kvasir::Clocks::Detail::degradedBy),
           Kvasir::Clocks::name(tree),
           Kvasir::Clocks::Detail::costOf(tree));
+        // why the crystal did not count as started, in this boot's check (Clocks::CrystalCheck), where it is recorded
+        if(auto const c = Kvasir::Clocks::lastInitCrystalCheck<Ts...>()) {
+            UC_LOG_W(
+              "boot: crystal check: {}; STABLE after {} of {} reads; {} counts ({} zero), best run "
+              "{} of {}, "
+              "worst step {} on {} (tolerance: >> {}); ROSC randomisation {} at the start",
+              Kvasir::Clocks::name(c->outcome),
+              c->stablePolls,
+              c->stableBound,
+              c->counts,
+              c->zeroCounts,
+              c->bestRun,
+              c->agree,
+              c->worstStep,
+              c->worstStepFrom,
+              c->toleranceShift,
+              c->randomisedFound ? std::string_view{"on"} : std::string_view{"off"});
+        }
     }
 };
