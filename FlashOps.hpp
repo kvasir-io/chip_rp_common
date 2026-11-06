@@ -10,6 +10,10 @@
 // Each operation's time is measured too (Flash::opTimes(): the last, the longest since boot and where), which needs no
 // reset to survive. Two TIMER reads and a few stores each, outside the RAM functions. Bootrom::explicitBuy
 // (BootInfo.hpp), the boot ROM's own erase and program of the TBYB sector, is recorded the same way.
+//
+// And each operation arms the watchdog boot vector while it runs (FlashBusyBoot.hpp): a watchdog reset in the middle
+// of an erase would otherwise have the boot ROM read the still busy flash as empty and stay in BOOTSEL.
+#include "FlashBusyBoot.hpp"
 #include "FreeRunningUs.hpp"
 #include "Rom.hpp"
 #include "XipControl.hpp"
@@ -132,6 +136,8 @@ namespace Detail {
                    std::size_t   blocks) {
         KVASIR_RAM_FUNC_MARK();
         Flash::XipGuard const guard{xipDisabler};
+        [[maybe_unused]] Flash::BusyBoot::Guard const
+          busyBoot{};   // XIP off first, gone before it is back
         erase(offset, blocks * 4096, 1 << 16, 0xD8);
     }
 
@@ -162,6 +168,8 @@ namespace Detail {
                    std::size_t         size) {
         KVASIR_RAM_FUNC_MARK();
         Flash::XipGuard const guard{xipDisabler};
+        [[maybe_unused]] Flash::BusyBoot::Guard const
+          busyBoot{};   // XIP off first, gone before it is back
         write(offset, data, size);
     }
 

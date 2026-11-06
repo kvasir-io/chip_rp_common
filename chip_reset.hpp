@@ -4,6 +4,7 @@
 #include "kvasir/Port/ResetKind.hpp"
 #include "kvasir/Register/Register.hpp"
 #include "kvasir/Register/Utility.hpp"
+#include "kvasir/Util/attributes.hpp"   // KVASIR_NOINIT: the carried REASON
 
 #ifdef KVASIR_CHIP_RP2350
     #include "peripherals/POWMAN.hpp"
@@ -24,7 +25,9 @@ namespace Kvasir { namespace PM {
     // `chip_reset_earlier` says (bit 0, unused by CHIP_RESET); on the RP2040 `cores_only` (bit 1, unused too) says
     // that the reset was of the cores alone (the mark's CoresOnly, ResetCauseRules.hpp).
     // Values are the RP2350 CHIP_RESET bit positions (POWMAN, datasheet Table 489); wd_timer/wd_force
-    // come from WATCHDOG::REASON (Table 1250) and use bits 2 and 3, which CHIP_RESET leaves unused.
+    // come from WATCHDOG::REASON (Table 1250) and use bits 2 and 3, which CHIP_RESET leaves unused; RP2350
+    // `reason_carried` (bit 4, unused too) says they are REASON as a boot vector routine found it before its own
+    // watchdog reset (carryReasonAcrossReset below).
     // had_watchdog_reset_rsm is the datasheet's HAD_WATCHDOG_RESET_PSM (bit 28; the SVD says RSM).
     // On the RP2040 the three bits of VREG_AND_CHIP_RESET.CHIP_RESET (RP2040 datasheet Table 191)
     // map onto had_por (HAD_POR: power-on or brown-out), had_run_low (HAD_RUN) and had_rescue
@@ -36,6 +39,7 @@ namespace Kvasir { namespace PM {
         coresOnly                   = 1U << 1U,
         wdTimer                     = 1U << 2U,
         wdForce                     = 1U << 3U,
+        reasonCarried               = 1U << 4U,
         hadPor                      = 1U << 16U,
         hadBor                      = 1U << 17U,
         hadRunLow                   = 1U << 18U,
@@ -100,6 +104,54 @@ namespace Kvasir { namespace PM {
 #endif
         apply(write(WD::SCRATCH1::FULLREGISTER, ChipResetMark::next(found, coresOnly)));
     }
+
+#ifdef KVASIR_CHIP_RP2350
+    // REASON across a reset of our own. A watchdog boot vector routine that ends in a watchdog trigger (Flash::BusyBoot,
+    // FlashBusyBoot.hpp: a reset in the middle of a flash erase) leaves REASON = FORCE behind, standing for the reset
+    // that started the routine - a watchdog timeout, that is a hang, would read as a deliberate reboot. So the routine
+    // carries REASON as it found it in .noInit (SRAM survives its reset: WatchdogTick.hpp), and the next boot's first
+    // step (Rp::firstInit) takes it for that boot alone, which resetCause() then judges by (ResetCauseRules.hpp). Lost
+    // where .noInit is (an image a decryption stage loads): there the boot reads as the forced reset it saw.
+    namespace Detail {
+        struct CarriedReason {
+            std::uint32_t magic;
+            std::uint32_t force;   // REASON.FORCE as the routine found it
+            std::uint32_t timer;   // REASON.TIMER
+        };
+
+        inline constexpr std::uint32_t carriedReasonWritten
+          = 0x4B43'5257U;   // "KCRW": by the routine, before its reset
+        inline constexpr std::uint32_t carriedReasonTaken
+          = 0x4B43'5254U;   // "KCRT": this boot is the one after it
+        [[KVASIR_NOINIT]] inline CarriedReason carriedReason;
+    }   // namespace Detail
+
+    // The routine, right before its own trigger: no call, registers and one record (RAM code).
+    [[gnu::always_inline]] inline void carryReasonAcrossReset() {
+        using WdReason         = Kvasir::Peripheral::WATCHDOG::Registers<>::REASON;
+        auto const     reasons = apply(read(WdReason::force), read(WdReason::timer));
+        auto volatile& c       = Detail::carriedReason;
+        c.force                = reasons[WdReason::force] != 0 ? 1U : 0U;
+        c.timer                = reasons[WdReason::timer] != 0 ? 1U : 0U;
+        c.magic                = Detail::carriedReasonWritten;
+    }
+
+    // Each boot's first step (Rp::firstInit), before anything reads the reset cause: the record counts for this boot
+    // only if the routine wrote it and this reset is its forced one; any other boot drops it. Registers and .noInit
+    // only (before .data/.bss).
+    [[gnu::always_inline]] inline void takeCarriedReason() {
+        using WdReason       = Kvasir::Peripheral::WATCHDOG::Registers<>::REASON;
+        bool const     force = get<0>(apply(read(WdReason::force))) != 0;
+        auto volatile& c     = Detail::carriedReason;
+        c.magic
+          = force && c.magic == Detail::carriedReasonWritten ? Detail::carriedReasonTaken : 0U;
+    }
+
+    // This boot follows a vector routine's own reset: its REASON stands for the carried one.
+    [[nodiscard]] inline bool followsCarriedReset() {
+        return Detail::carriedReason.magic == Detail::carriedReasonTaken;
+    }
+#endif
 
     // CHIP_RESET names an earlier boot's reset: none of the chip-level resets that clear the mark came since.
     inline bool chipResetIsEarlier() {
@@ -203,8 +255,20 @@ namespace Kvasir { namespace PM {
         auto const add = [&](bool present, ResetSource source) {
             if(present) { sources |= source; }
         };
+#ifdef KVASIR_CHIP_RP2350
+        if(followsCarriedReset()) {
+            // REASON as the vector routine found it, not its own trigger
+            sources |= ResetSource::reasonCarried;
+            add(Detail::carriedReason.timer != 0U, ResetSource::wdTimer);
+            add(Detail::carriedReason.force != 0U, ResetSource::wdForce);
+        } else {
+            add(r.wdTimer, ResetSource::wdTimer);
+            add(r.wdForce, ResetSource::wdForce);
+        }
+#else
         add(r.wdTimer, ResetSource::wdTimer);
         add(r.wdForce, ResetSource::wdForce);
+#endif
         add(r.hadPor, ResetSource::hadPor);
         add(r.hadBor, ResetSource::hadBor);
         add(r.hadRunLow, ResetSource::hadRunLow);
@@ -224,16 +288,20 @@ namespace Kvasir { namespace PM {
     inline ResetCause resetCause() {
 #ifdef KVASIR_CHIP_RP2350
         auto const r = Detail::readResetRegisters();
-        return Detail::classify(Detail::Rp2350Reset{.wdForce          = r.wdForce,
-                                                    .wdTimer          = r.wdTimer,
-                                                    .chipResetEarlier = chipResetIsEarlier(),
-                                                    .hadRescue        = r.hadRescue,
-                                                    .hadDpResetReq    = r.hadDpResetReq,
-                                                    .hadGlitchDetect  = r.hadGlitchDetect,
-                                                    .hadBor           = r.hadBor,
-                                                    .hadPor           = r.hadPor,
-                                                    .hadRunLow        = r.hadRunLow,
-                                                    .hadSwcorePd      = r.hadSwcorePd});
+        return Detail::classify(
+          Detail::Rp2350Reset{.wdForce          = r.wdForce,
+                              .wdTimer          = r.wdTimer,
+                              .chipResetEarlier = chipResetIsEarlier(),
+                              .hadRescue        = r.hadRescue,
+                              .hadDpResetReq    = r.hadDpResetReq,
+                              .hadGlitchDetect  = r.hadGlitchDetect,
+                              .hadBor           = r.hadBor,
+                              .hadPor           = r.hadPor,
+                              .hadRunLow        = r.hadRunLow,
+                              .hadSwcorePd      = r.hadSwcorePd,
+                              .reasonCarried    = followsCarriedReset(),
+                              .carriedForce     = Detail::carriedReason.force != 0U,
+                              .carriedTimer     = Detail::carriedReason.timer != 0U});
 #else
         // a reset of core 0 alone leaves REASON and CHIP_RESET as they were: the guard's SCRATCH3 word and the mark's
         // CoresOnly say so (ResetCauseRules.hpp)

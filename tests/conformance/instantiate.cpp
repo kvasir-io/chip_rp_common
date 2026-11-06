@@ -23,6 +23,7 @@
 #else
     #include "chip/rp_common/Powman.hpp"
 #endif
+#include "chip/rp_common/PioSpiQueued.hpp"
 #include "chip/rp_common/SPIQueued.hpp"
 #ifdef KVASIR_CHIP_RP2350
     #include "chip/rp_common/Sha256.hpp"
@@ -62,6 +63,19 @@ struct UartConfig {
     static constexpr auto parity        = Kvasir::Hal::Uart::Parity::none;
     static constexpr auto stopBits      = Kvasir::Hal::Uart::StopBits::stop1;
     static constexpr auto isrPriority   = 3;
+};
+
+// The PIO SPI master: its own pins on PIO1 (the program fits beside nothing else there); a 14..18 ns round trip, which
+// gives the sample cycle 5 at both chips' clocks.
+struct PioSpiConfig {
+    static constexpr auto clockSpeed                  = clockSpeedValue;
+    static constexpr auto pioInstance                 = 1;
+    static constexpr auto smInstance                  = 0;
+    using Sck                                         = PinLocation<0, 10>;
+    using Mosi                                        = PinLocation<0, 11>;
+    using Miso                                        = PinLocation<0, 12>;
+    static constexpr std::uint32_t misoRoundTripMinNs = 14;
+    static constexpr std::uint32_t misoRoundTripMaxNs = 18;
 };
 
 struct SpiConfig {
@@ -184,6 +198,33 @@ template struct Kvasir::SPI::QueuedFront<
                                                 Conformance::Dma::Channel::ch0,
                                                 Conformance::Dma::Channel::ch1,
                                                 Conformance::Dma::Priority::low>>::Core>;
+// PioSpiQueued as SPIQueued: the master, its half (Hw: the PIO and DMA register writes) and its front
+template struct Kvasir::SPI::PioSpiQueued<Conformance::PioSpiConfig,
+                                          Conformance::SystickClock,
+                                          Conformance::Dma,
+                                          Kvasir::SPI::QueuedDma<Conformance::Dma,
+                                                                 Conformance::Dma::Channel::ch2,
+                                                                 Conformance::Dma::Channel::ch3,
+                                                                 Conformance::Dma::Priority::low>>;
+template struct Kvasir::SPI::Detail::PioSpiQueuedHalf<
+  Conformance::PioSpiConfig,
+  Conformance::SystickClock,
+  Conformance::Dma,
+  Kvasir::SPI::QueuedDma<Conformance::Dma,
+                         Conformance::Dma::Channel::ch2,
+                         Conformance::Dma::Channel::ch3,
+                         Conformance::Dma::Priority::low>,
+  8,
+  16,
+  Kvasir::SPI::PioSpiTiming>;
+template struct Kvasir::SPI::QueuedFront<
+  Kvasir::SPI::PioSpiQueued<Conformance::PioSpiConfig,
+                            Conformance::SystickClock,
+                            Conformance::Dma,
+                            Kvasir::SPI::QueuedDma<Conformance::Dma,
+                                                   Conformance::Dma::Channel::ch2,
+                                                   Conformance::Dma::Channel::ch3,
+                                                   Conformance::Dma::Priority::low>>::Core>;
 template struct Kvasir::I2C::
   I2CBehaviorQueued<Conformance::I2cConfig, Conformance::SystickClock, 4, 16>;
 // I2CBehaviorQueued is its hardware half and the front (kvasir_devices I2C/Controller/QueuedFront.hpp), named here as SPIQueued's

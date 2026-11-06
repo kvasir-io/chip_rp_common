@@ -99,13 +99,23 @@ namespace Kvasir { namespace PM {
             bool hadPor;
             bool hadRunLow;
             bool hadSwcorePd;
+            // This boot follows the watchdog reset a boot vector routine ended with (chip_reset.hpp,
+            // PM::carryReasonAcrossReset; FlashBusyBoot.hpp): REASON's FORCE is that routine's own trigger, and
+            // carriedForce / carriedTimer are REASON as the routine found it - the reset that started the routine (0
+            // and 0 for a reset of the cores alone, which clears REASON).
+            bool reasonCarried{};
+            bool carriedForce{};
+            bool carriedTimer{};
         };
 
         constexpr ResetCause classify(Rp2350Reset const& r) {
             // REASON first: a watchdog reset of the PSM stages is not chip-level (CHIP_RESET keeps the one before),
-            // and a SYSRESETREQ clears REASON - so a set bit is this boot's
-            if(r.wdForce) { return ResetCause::watchdogForce; }
-            if(r.wdTimer) { return ResetCause::watchdogTimer; }
+            // and a SYSRESETREQ clears REASON - so a set bit is this boot's; behind a vector routine's own reset, the
+            // one REASON had before it (the mark is untouched by both resets)
+            bool const force = r.reasonCarried ? r.carriedForce : r.wdForce;
+            bool const timer = r.reasonCarried ? r.carriedTimer : r.wdTimer;
+            if(force) { return ResetCause::watchdogForce; }
+            if(timer) { return ResetCause::watchdogTimer; }
             // every chip-level reset clears the mark: with it, all of CHIP_RESET is an earlier boot's
             if(r.chipResetEarlier) { return ResetCause::coreReset; }
             if(r.hadRescue) { return ResetCause::rescue; }

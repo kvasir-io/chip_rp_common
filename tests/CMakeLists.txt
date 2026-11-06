@@ -8,6 +8,8 @@ cmake_minimum_required(VERSION 3.28)
 #   datasheet 11.4, side-set and delay packing, labels, whole programs, the chip package's programs and the error
 #   messages. Building is the test (static_assert).
 # * uart_stream_cursor_test.cpp: UartStream's RX cursor arithmetic driven by a simulated DMA channel.
+# * pio_spi_program_test.cpp: PioSpiQueued's program (pio/PioSpiProgram.hpp) run cycle by cycle: edges, MOSI, the sample
+#   point of every bit; and the sample-cycle choice from a board's round trip.
 # * pwm_math_test.cpp: the PWM divider/TOP search (PwmMath.hpp), in constant and in run-time evaluation.
 # * adc_math_test.cpp: the ADC pacer divider and the channel-attribution check (AdcMath.hpp).
 # * reset_cause_test.cpp: the reset-cause decision (ResetCauseRules.hpp): a SYSRESETREQ after a RUN-pin reset is not
@@ -87,6 +89,11 @@ target_compile_options(pio_asm_tests PRIVATE ${_warnings})
 add_test(NAME pio_asm_tests COMMAND pio_asm_tests)
 
 # ---- UartStream's RX cursor (UARTStreamCursor.hpp) against a simulated DMA channel
+add_executable(pio_spi_program_test pio_spi_program_test.cpp)
+target_include_directories(pio_spi_program_test PRIVATE ${_chip_rp_common})
+target_compile_options(pio_spi_program_test PRIVATE ${_warnings})
+add_test(NAME pio_spi_program_test COMMAND pio_spi_program_test)
+
 add_executable(uart_stream_cursor_test uart_stream_cursor_test.cpp)
 target_include_directories(uart_stream_cursor_test PRIVATE ${_chip_rp_common})
 target_compile_options(uart_stream_cursor_test PRIVATE ${_warnings})

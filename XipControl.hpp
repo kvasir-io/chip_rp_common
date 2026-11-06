@@ -34,6 +34,19 @@
 
 namespace Kvasir { namespace Detail {
 #ifdef KVASIR_CHIP_RP2350
+    // CS up, direct mode off: every read-write field of DIRECT_CSR 0, one store (RAM code: always inlined).
+    [[gnu::always_inline]] inline void directModeOff() {
+        using Csr = Kvasir::Peripheral::QMI::Registers<0>::DIRECT_CSR;
+        using namespace Kvasir::Register;
+        apply(write(Csr::rxdelay, value<std::uint32_t, 0U>()),
+              write(Csr::clkdiv, value<std::uint32_t, 0U>()),
+              clear(Csr::auto_cs1n),
+              clear(Csr::auto_cs0n),
+              clear(Csr::assert_cs1n),
+              clear(Csr::assert_cs0n),
+              clear(Csr::en));
+    }
+
     // One transaction on chip select 0 in QMI direct mode (RP2350 datasheet 12.14.5) at
     // clk_sys / clkdiv: byte i of `rx` arrives while byte i of `tx` goes out, the first `rxSize`
     // are kept. XIP must be off. Plain pointers: hardened span accessors live in flash.
@@ -72,14 +85,7 @@ namespace Kvasir { namespace Detail {
             }
         }
         while(std::uint32_t{apply(read(Csr::busy))} != 0) {}
-        // CS up, direct mode off: every read-write field 0
-        apply(write(Csr::rxdelay, value<std::uint32_t, 0U>()),
-              write(Csr::clkdiv, value<std::uint32_t, 0U>()),
-              clear(Csr::auto_cs1n),
-              clear(Csr::auto_cs0n),
-              clear(Csr::assert_cs1n),
-              clear(Csr::assert_cs0n),
-              clear(Csr::en));
+        directModeOff();
     }
 
     // A command of N bytes packed into a word, first byte lowest; returns the reply packed the

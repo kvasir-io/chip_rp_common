@@ -16,7 +16,9 @@
 //   PM::markChipReset()            WATCHDOG SCRATCH1: whether CHIP_RESET names this reset or an earlier boot's, and
 //                                  on the RP2040 whether the cores alone were reset (the CLOCKS block still on the
 //                                  image's sources) - chip_reset.hpp, ResetCauseRules.hpp; before anything reads the
-//                                  reset cause, and before the clock init
+//                                  reset cause, and before the clock init. RP2350 first PM::takeCarriedReason(): REASON
+//                                  as a boot vector routine found it before its own reset (FlashBusyBoot.hpp), for
+//                                  this boot only (.noInit)
 #include "Multicore.hpp"
 #include "chip_reset.hpp"
 #include "core/core.hpp"
@@ -43,6 +45,9 @@ template<typename Traits>
     Traits::holdBlocksInReset();
     Traits::afterResetsHeld();
     Traits::selectWatchdogDomains();
+#ifdef KVASIR_CHIP_RP2350
+    PM::takeCarriedReason();
+#endif
     PM::markChipReset();
 }
 

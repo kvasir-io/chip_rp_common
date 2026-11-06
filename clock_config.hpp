@@ -1826,7 +1826,8 @@ namespace Kvasir { namespace Clocks { namespace Detail {
 }}}   // namespace Kvasir::Clocks::Detail
 
 /// The chip's lines in the boot report (kvasir/Port/Hooks.hpp, Boot::logBoot): the flash operation the previous run
-/// was reset in (FlashOps.hpp, Flash::opInFlightAtBoot()); why this boot runs degraded, on which tree, what that costs,
+/// was reset in (FlashOps.hpp, Flash::opInFlightAtBoot()) and whether the flash was still busy after it
+/// (FlashBusyBoot.hpp, Flash::BusyBoot::atBoot()); why this boot runs degraded, on which tree, what that costs,
 /// and what the crystal check found; for a boot on the full tree whose clk_sys did not count at the full clock, that
 /// the flash runs on the slow timing; nothing for a boot whose clocks came up after a run that ended no flash
 /// operation half-way.
@@ -1842,6 +1843,25 @@ struct Kvasir::Port::StartNotes<Kvasir::Tag::User, Ts...> {
               op->bytes,
               op->offset,
               op->startUs);
+        }
+        // after that reset the watchdog boot vector waited for the flash, then reset once more (FlashBusyBoot.hpp):
+        // two reads are the least it makes (ready twice in a row), more mean the flash was still busy
+        if(auto const busy = Kvasir::Flash::BusyBoot::atBoot()) {
+            if(busy->ready) {
+                UC_LOG_W(
+                  "boot: after that reset the watchdog boot vector read the flash's status {} "
+                  "times until it "
+                  "was ready (2: at once; status {:#04x}), then reset the chip once more",
+                  busy->polls,
+                  busy->status);
+            } else {
+                UC_LOG_W(
+                  "boot: after that reset the flash never read ready in {} status reads (status "
+                  "{:#04x}); the "
+                  "watchdog boot vector reset the chip once more",
+                  busy->polls,
+                  busy->status);
+            }
         }
         auto const tree = Kvasir::Clocks::Detail::degradedOn;
         if(tree == Kvasir::Clocks::DegradedTree::none) {

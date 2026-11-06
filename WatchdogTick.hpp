@@ -17,7 +17,8 @@ namespace Kvasir { namespace Rp {
     // Starts the watchdog tick if it is stopped; a running one (the Watchdog driver's, the boot ROM's) is left
     // as it is - "Before changing the cycle count, always stop the tick generator" (8.5.1). 12 cycles: a 1 us
     // tick from a 12 MHz clk_ref; the Watchdog driver sets its own. Waits until RUNNING (bounded).
-    inline void keepWatchdogTickRunning() {
+    // always_inline: FlashBusyBoot's vector routine runs from RAM and resets through it (RAM code calls only RAM code).
+    [[gnu::always_inline]] inline void keepWatchdogTickRunning() {
         using Ticks = Kvasir::Peripheral::TICKS::Registers<>;
         if(get<0>(apply(read(Ticks::WATCHDOG_CTRL::enable))) != 0U) { return; }
         apply(write(Ticks::WATCHDOG_CYCLES::watchdog_cycles, Kvasir::Register::value<12U>()));

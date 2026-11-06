@@ -16,6 +16,10 @@ watchdogResetNow() {
     using WD = Kvasir::Peripheral::WATCHDOG::Registers<>;
     Rp::WatchdogDomains::beforeReset();
     apply(set(WD::CTRL::trigger));
-    while(true) { asm volatile("wfi"); }
+    while(true) {
+#if defined(__arm__) || defined(__thumb__)
+        asm volatile("wfi");
+#endif   // a host build (the firmware's boot tests) only needs it to compile: never called there
+    }
 }
 }   // namespace Kvasir::Rp::Detail

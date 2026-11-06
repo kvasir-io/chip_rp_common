@@ -152,6 +152,51 @@ static_assert(D::classify(rp2350(false)) == C::unknown,
               "no bit at all");
 static_assert(D::classify(rp2350(true)) == C::coreReset);
 
+// Behind a boot vector routine's own watchdog reset (FlashBusyBoot.hpp): REASON says FORCE, the carried REASON counts
+constexpr D::Rp2350Reset behindVectorReset(bool earlier,
+                                           bool carriedForce,
+                                           bool carriedTimer) {
+    auto r          = rp2350(earlier);
+    r.wdForce       = true;
+    r.reasonCarried = true;
+    r.carriedForce  = carriedForce;
+    r.carriedTimer  = carriedTimer;
+    return r;
+}
+
+static_assert(D::classify(behindVectorReset(true,
+                                            false,
+                                            true))
+                == C::watchdogTimer,
+              "a watchdog timeout in a flash operation stays a timeout (a hang), not the routine's "
+              "forced reset");
+static_assert(D::classify(behindVectorReset(true,
+                                            true,
+                                            false))
+                == C::watchdogForce,
+              "a forced watchdog reset in a flash operation: forced");
+static_assert(
+  D::classify(behindVectorReset(true,
+                                false,
+                                false))
+    == C::coreReset,
+  "a SYSRESETREQ in a flash operation (it clears REASON; the mark is kept): core_reset");
+static_assert(
+  [] {
+      auto r      = behindVectorReset(true, false, false);
+      r.hadRunLow = true;
+      return D::classify(r) == C::coreReset;
+  }(),
+  "and not the RUN-pin reset CHIP_RESET still names");
+static_assert(
+  [] {
+      auto r         = rp2350RunLow(true);
+      r.wdForce      = true;
+      r.carriedTimer = true;   // a record without the carried flag: not this boot's
+      return D::classify(r) == C::watchdogForce;
+  }(),
+  "without reasonCarried the carried bits do not count");
+
 // ---- RP2040
 constexpr D::Rp2040Reset rp2040(bool earlier) {
     return D::Rp2040Reset{.coreResetCarried = false,

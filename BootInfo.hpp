@@ -13,6 +13,7 @@
     #include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
     #include "peripherals/BOOTRAM.hpp"
     #include "peripherals/SHA256.hpp"
+    #include "peripherals/WATCHDOG.hpp"   // explicitBuy(): the boot ROM's buy switches the watchdog off
 
     #include <kvasir/Register/Register.hpp>
 #endif
@@ -347,6 +348,8 @@ namespace Detail {
                     std::uint32_t bufferSize) {
         KVASIR_RAM_FUNC_MARK();
         Kvasir::Flash::XipGuard const guard{xipDisabler};
+        Kvasir::Flash::BusyBoot::Guard const
+          busyBoot{};   // the buy erases and programs a sector (FlashBusyBoot.hpp)
         return buy(buffer, bufferSize);
     }
 }   // namespace Detail
@@ -368,11 +371,20 @@ namespace Bootrom {
     /// through the checked otp_access (pico-bootrom varm_launch_image.c); its flash writes are
     /// unchecked. Recorded and timed like flashErase() / flashWrite() (FlashOps.hpp,
     /// Flash::OpInFlight::Kind::buy, offset and size 0: the boot ROM finds the sector itself).
+    ///
+    /// The watchdog runs on afterwards as it ran before. The boot ROM's buy switches it off first
+    /// thing (pico-bootrom varm_launch_image.c s_varm_api_explicit_buy: WATCHDOG CTRL.ENABLE cleared,
+    /// whatever armed it) - meant for the ROM's own 16.7 s trial watchdog, but by the buy that is the
+    /// image's, and a bought image then ran with no watchdog until its next reset (seen: CTRL ENABLE
+    /// off long after a buy). The counter stands while it is off, so it goes on with what it had
+    /// left.
     [[nodiscard]] inline int explicitBuy(std::span<std::uint32_t,
                                                    explicitBuyScratchBytes / 4> scratch) {
+        using WatchdogRegs = Kvasir::Peripheral::WATCHDOG::Registers<>;
         BootLockGuard<BootLock::otp> const lock{};
         auto const                         buy
           = RomFunctions::getRomFunctionPointer<'E', 'B', int (*)(std::uint8_t*, std::uint32_t)>();
+        bool const watchdogOn = get<0>(apply(read(WatchdogRegs::CTRL::enable))) != 0;
         auto const startUs
           = Kvasir::Flash::Detail::beginOp(Kvasir::Flash::OpInFlight::Kind::buy, 0, 0);
         int result = 0;
@@ -383,6 +395,7 @@ namespace Bootrom {
                                              reinterpret_cast<std::uint8_t*>(scratch.data()),
                                              static_cast<std::uint32_t>(scratch.size_bytes()));
         }
+        if(watchdogOn) { apply(set(WatchdogRegs::CTRL::enable)); }
         Kvasir::Flash::Detail::endOp(startUs);
         return result;
     }
