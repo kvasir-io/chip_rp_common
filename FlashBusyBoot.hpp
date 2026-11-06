@@ -17,12 +17,12 @@
 //   1. does CoreResetGuard's work in an image that arms that guard (DMA aborted, core 1 back in the ROM's pen);
 //   2. connects the flash as the ROM's own connect_internal_flash does - IO_QSPI and PADS_QSPI out of reset, the pins'
 //      FUNCSEL to XIP, the pads' isolation off: at the vector none of that is done yet, and an unconnected status read
-//      comes back 0, "not busy";
+//      comes back 0, "not busy" - and takes SYSCFG out of reset for step 5;
 //   3. puts the QMI's direct mode into a clean state (below);
 //   4. reads the flash's status register (05h) until its busy bit reads clear twice in a row - at most maxPolls reads;
 //      2000-6600 after a reset 3-20 ms into a sector erase, at the boot ROM's clocks;
-//   5. reboots the chip through the watchdog, the vector disarmed, so the next boot is a plain flash boot of an idle
-//      flash.
+//   5. reboots the chip through the watchdog, the vector disarmed and POWMAN on the LPOSC first, so the next boot is a
+//      plain flash boot of an idle flash.
 // Why 5 and not a return into the boot ROM: after a reset of the cores alone (a debugger's SYSRESETREQ) the QMI/XIP stay
 // as the interrupted operation set them - only a chip-level reset puts them back - and the ROM's flash boot found
 // nothing; its nsboot, disabled once a vector was taken, then rebooted into BOOTSEL with boot type BOOTSEL, which reads
@@ -63,9 +63,10 @@
 namespace Kvasir::Flash::BusyBoot {
 /// What entry() found after the reset that stopped a flash operation (atBoot()).
 struct Report {
-    std::uint32_t polls;    ///< status reads it made
-    std::uint8_t  status;   ///< the last status byte read
-    bool          ready;    ///< the flash read ready (two reads in a row) before maxPolls
+    std::uint32_t polls;           ///< status reads it made
+    std::uint8_t  status;          ///< the last status byte read
+    bool          ready;           ///< the flash read ready (two reads in a row) before maxPolls
+    bool          powmanOnLposc;   ///< POWMAN read on the LPOSC before entry()'s reset
 };
 
 #ifdef KVASIR_CHIP_RP2350
@@ -85,6 +86,7 @@ namespace Detail {
         std::uint32_t polls;    // status reads made
         std::uint32_t status;   // the last status byte read (0x100: none yet)
         std::uint32_t ready;    // 1: two reads in a row said ready
+        std::uint32_t lposc;    // 1: POWMAN read on the LPOSC before the reset
     };
 
     inline constexpr std::uint32_t  recordMagic = 0x4255'5359U;   // "BUSY"
@@ -111,6 +113,7 @@ namespace Detail {
         rec.polls  = 0;
         rec.status = 0x100U;
         rec.ready  = 0;
+        rec.lposc  = 0;
     #if KVASIR_RP_CORE_RESET_GUARDED
         Kvasir::CoreResetGuard::entry();   // DMA aborted, core 1 back in the ROM's pen
     #endif
@@ -119,11 +122,23 @@ namespace Detail {
         // Unconnected, every status read comes back 0, "not busy" (seen: RESETS.RESET 0x1dddffff at the vector, one
         // poll, status 0, the flash still erasing). Both blocks out of reset, each pin's FUNCSEL to XIP (CTRL 0), the
         // pads' isolation off; the ROM resets the blocks again before it uses them itself.
-        apply(clear(Resets::RESET::io_qspi), clear(Resets::RESET::pads_qspi));
+        // SYSCFG too (RESETS bit 20, RP2350 datasheet Table 535): the reset holds it as well, and neither the ROM
+        // before the vector (pico-bootrom varm_boot_path.c releases TRNG, SHA256 and SYSINFO only) nor anything of
+        // the image's own boot (chip/BootTraits.hpp holdBlocksInReset, later) has released it yet. Step 5 writes its
+        // AUXCTRL bit 0 (WatchdogDomains::beforeReset): POWMAN onto the LPOSC before a watchdog reset whose stages
+        // include CLOCKS, or "the short pulse generated on clk_ref by the reset of the CLOCKS block may affect POWMAN
+        // register state" (Table 1317) - the glitch the ROM's own reboot avoids the same way. What a write to a block
+        // held in reset does, the datasheet does not say; measured: without this release the bit has no effect, and
+        // POWMAN never reads on the LPOSC (rec.lposc 0). After a reset of the cores alone SYSCFG is out of reset
+        // already; the reset of step 5 holds it again.
+        apply(clear(Resets::RESET::io_qspi),
+              clear(Resets::RESET::pads_qspi),
+              clear(Resets::RESET::syscfg));
         for(std::uint32_t i = 0; i < 100'000U; ++i) {
-            auto const done
-              = apply(read(Resets::RESET_DONE::io_qspi), read(Resets::RESET_DONE::pads_qspi));
-            if(get<0>(done) != 0U && get<1>(done) != 0U) { break; }
+            auto const done = apply(read(Resets::RESET_DONE::io_qspi),
+                                    read(Resets::RESET_DONE::pads_qspi),
+                                    read(Resets::RESET_DONE::syscfg));
+            if(get<0>(done) != 0U && get<1>(done) != 0U && get<2>(done) != 0U) { break; }
         }
         apply(write(Io::GPIO_QSPI_SCLK_CTRL::FULLREGISTER, value<std::uint32_t, 0U>()),
               write(Io::GPIO_QSPI_SS_CTRL::FULLREGISTER, value<std::uint32_t, 0U>()),
@@ -174,6 +189,9 @@ namespace Detail {
         Kvasir::Rp::WatchdogBoot::disarm();
         Kvasir::PM::carryReasonAcrossReset();
         Kvasir::Rp::WatchdogDomains::onTimeout();
+        // POWMAN onto the LPOSC here already, for the record (step 2); beforeReset() in watchdogResetNow() sets the
+        // bit again and finds POWMAN there at its first read
+        rec.lposc = Kvasir::Rp::WatchdogDomains::forcePowmanOnLposc() ? 1U : 0U;
         Kvasir::Rp::Detail::watchdogResetNow();
     }
 }   // namespace Detail
@@ -221,9 +239,10 @@ struct Guard {
 [[nodiscard]] inline std::optional<Report> atBoot() {
     Detail::Record const r = Detail::record;
     if(!PM::followsCarriedReset() || r.magic != Detail::recordMagic) { return std::nullopt; }
-    return Report{.polls  = r.polls,
-                  .status = static_cast<std::uint8_t>(r.status),
-                  .ready  = r.ready != 0U};
+    return Report{.polls         = r.polls,
+                  .status        = static_cast<std::uint8_t>(r.status),
+                  .ready         = r.ready != 0U,
+                  .powmanOnLposc = r.lposc != 0U};
 }
 #else
 /// The RP2040: nothing armed (its users mark the object [[maybe_unused]]).

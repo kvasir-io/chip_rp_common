@@ -1862,6 +1862,11 @@ struct Kvasir::Port::StartNotes<Kvasir::Tag::User, Ts...> {
                   busy->polls,
                   busy->status);
             }
+            if(!busy->powmanOnLposc) {
+                UC_LOG_W(
+                  "boot: POWMAN was not on the LPOSC at that reset (SYSCFG.AUXCTRL bit 0): its "
+                  "registers may have taken the glitch of the CLOCKS reset");
+            }
         }
         auto const tree = Kvasir::Clocks::Detail::degradedOn;
         if(tree == Kvasir::Clocks::DegradedTree::none) {
