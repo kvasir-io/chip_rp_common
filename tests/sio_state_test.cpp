@@ -174,7 +174,7 @@ constexpr std::string_view messageOf
 
 constexpr bool has(std::string_view text,
                    std::string_view part) {
-    return text.find(part) != std::string_view::npos;
+    return text.contains(part);
 }
 
 constexpr auto levelText = messageOf<OutClr, OutSet, 1U << 17>;
