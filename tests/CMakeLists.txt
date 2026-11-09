@@ -18,6 +18,8 @@ cmake_minimum_required(VERSION 3.28)
 #   isValidPin, the refusal's text) against RP2040 Table 2 / RP2350 Table 645.
 # * register_alias_test.cpp, pll_search_test.cpp: the RP alias backend on the Kvasir SDK's register mock, the PLL search
 #   against an exhaustive exact search (the SDK's headers and test support: the sibling checkout, else fetched).
+# * sio_state_test.cpp: the SIO's shared states (RegisterAlias.hpp) on the same mock, for each chip: GPIO_OUT/OE and
+#   their SET/CLR/XOR against RP2040 Table 16 / RP2350 Table 17, one pin through two of them in one step refused.
 # * dma_crc_hold_test.cpp: the DMA CRC sniffer's debug check (DmaCrcHold.hpp) at debug-check levels 2 and 0.
 # * i2c_math_test.cpp, watchdog_math_test.cpp, flash_timing_math_test.cpp: the I2C SCL counts (I2CMath.hpp), the
 #   watchdog tick and LOAD incl. RP2040-E1 (WatchdogMath.hpp), the QMI flash timing (FlashTimingMath.hpp) against the
@@ -156,6 +158,19 @@ target_compile_definitions(register_alias_test PRIVATE KVASIR_REGISTER_MOCK
 target_include_directories(register_alias_test PRIVATE ${_chip_rp_common})
 target_compile_options(register_alias_test PRIVATE ${_sdk_test_warnings})
 add_test(NAME register_alias_test COMMAND register_alias_test)
+
+# the SIO's shared states (RegisterAlias.hpp, Register::SharedState): the register lists of both chips, the plan's
+# refusal of one pin through two GPIO registers in one step, the message's words
+foreach(_chip RP2040 RP2350)
+    string(TOLOWER ${_chip} _c)
+    add_executable(sio_state_test_${_c} sio_state_test.cpp)
+    target_link_libraries(sio_state_test_${_c} PRIVATE kvasir::test_support)
+    target_compile_definitions(sio_state_test_${_c} PRIVATE KVASIR_REGISTER_MOCK KVASIR_CHIP_${_chip}
+                                                            [[KVASIR_CHIP_REGISTER_SEAM="RegisterAlias.hpp"]])
+    target_include_directories(sio_state_test_${_c} PRIVATE ${_chip_rp_common})
+    target_compile_options(sio_state_test_${_c} PRIVATE ${_sdk_test_warnings})
+    add_test(NAME sio_state_test_${_c} COMMAND sio_state_test_${_c})
+endforeach()
 
 add_executable(pll_search_test pll_search_test.cpp)
 target_link_libraries(pll_search_test PRIVATE kvasir::test_support) # test_harness.hpp

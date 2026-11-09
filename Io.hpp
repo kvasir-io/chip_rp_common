@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PinConfig.hpp"
+#include "RegisterAlias.hpp"   // the SIO states below (Register::SharedState), also the image's seam
 #include "chip/PinConfig.hpp"
 #include "kvasir/Hal/Pins.hpp"
 #include "kvasir/Io/Claims.hpp"
@@ -35,6 +36,59 @@ namespace Kvasir { namespace Io {
     }
 
     using SIO = Kvasir::Peripheral::SIO::Registers<0>;
+
+    // A pin's level is written by makeOutput and clear (GPIO_OUT_CLR), makeOutputInitHigh and set (GPIO_OUT_SET),
+    // toggle (GPIO_OUT_XOR) and a peripheral function (its OutputInit); its output enable by makeOutput and a peripheral
+    // function (GPIO_OE_SET) and makeInput (GPIO_OE_CLR). Two of those registers on one pin in one apply() (one Startup
+    // phase) are a compile error naming the pin (RegisterAlias.hpp, Register::SharedState): the step runs by address,
+    // highest first, so `makeOutputInitHigh(pin), clear(pin)` would end high.
+    namespace Detail {
+        // RegisterAlias.hpp's SIO literals against the generated SIO: GPIO_OUT, GPIO_OE, GPIO_HI_OUT and GPIO_HI_OE
+        // each a state of its own and of its SET, CLR and XOR registers, the inputs and the FIFO none
+        template<typename R>
+        inline constexpr unsigned sioState = Rp::SioSeam::stateOf(R::Addr::value);
+
+        template<typename State,
+                 typename... Writers>
+        consteval bool sioWrites() {
+            return sioState<State> == State::Addr::value
+                && ((sioState<Writers> == State::Addr::value) && ...);
+        }
+
+        static_assert(
+          Rp::SioSeam::baseAddress == SIO::baseAddr
+            && sioWrites<SIO::GPIO_OUT,
+                         SIO::GPIO_OUT_SET,
+                         SIO::GPIO_OUT_CLR,
+                         SIO::GPIO_OUT_XOR>()
+            && sioWrites<SIO::GPIO_OE,
+                         SIO::GPIO_OE_SET,
+                         SIO::GPIO_OE_CLR,
+                         SIO::GPIO_OE_XOR>()
+            && sioWrites<SIO::GPIO_HI_OUT,
+                         SIO::GPIO_HI_OUT_SET,
+                         SIO::GPIO_HI_OUT_CLR,
+                         SIO::GPIO_HI_OUT_XOR>()
+            && sioWrites<SIO::GPIO_HI_OE,
+                         SIO::GPIO_HI_OE_SET,
+                         SIO::GPIO_HI_OE_CLR,
+                         SIO::GPIO_HI_OE_XOR>()
+            && sioState<SIO::CPUID> == 0 && sioState<SIO::GPIO_IN> == 0
+            && sioState<SIO::GPIO_HI_IN> == 0 && sioState<SIO::FIFO_ST> == 0,
+          "chip/rp_common/RegisterAlias.hpp: the SIO's GPIO register offsets differ from the "
+          "generated SIO registers");
+#ifdef KVASIR_CHIP_RP2350
+        // the Non-secure view writes the Secure view's states
+        using SioNonSecure = Kvasir::Peripheral::SIO::Registers<1>;
+        static_assert(
+          Rp::SioSeam::nonSecureBase == SioNonSecure::baseAddr
+            && sioState<SioNonSecure::GPIO_OUT_CLR> == SIO::GPIO_OUT::Addr::value
+            && sioState<SioNonSecure::GPIO_HI_OE_XOR> == SIO::GPIO_HI_OE::Addr::value
+            && sioState<SioNonSecure::GPIO_IN> == 0,
+          "chip/rp_common/RegisterAlias.hpp: the Non-secure SIO's GPIO registers are not the "
+          "Secure ones + 0x20000");
+#endif
+    }   // namespace Detail
 
     template<int Pin>
     constexpr auto getClearAction() {

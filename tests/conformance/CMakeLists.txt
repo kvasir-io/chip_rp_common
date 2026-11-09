@@ -166,3 +166,32 @@ kvasir_conformance_project(
     MAIN_TU
     main_tu.cpp
     ${_main_tu_definitions})
+
+# A pin's level or output enable written through two SIO registers in one apply() (RegisterAlias.hpp: GPIO_OUT, GPIO_OE
+# and their GPIO_HI_* twins as Register::SharedState): port_levels_must_fail.cpp with PORT_FAIL=0 compiles in `all`,
+# each case below must fail naming the pin and what it writes (ctest in this tree, both compilers). Case 9, the
+# Non-secure SIO view, is the RP2350's.
+set(_port_level_cases
+    "1|one hardware state through two registers.*RP SIO GPIO17, its output level[.:].*apply[(][)] of its own"
+    "2|one hardware state through two registers.*RP SIO GPIO8, its output level[.:].*apply[(][)] of its own"
+    "3|one hardware state through two registers.*RP SIO GPIO6, its output level[.:].*apply[(][)] of its own"
+    "4|one hardware state through two registers.*RP SIO GPIO17, its output level[.:].*apply[(][)] of its own"
+    "5|one hardware state through two registers.*RP SIO GPIO17, its output level[.:].*apply[(][)] of its own"
+    "6|one hardware state through two registers.*RP SIO GPIO2, its output level[.:].*apply[(][)] of its own"
+    "7|one hardware state through two registers.*RP SIO GPIO6, its output enable: .*once per list"
+    "8|one hardware state through two registers.*RP SIO QSPI_SCL?K, its output level[.:].*GPIO_HI_OUT_CLR")
+if(CONFORMANCE_CHIP STREQUAL "rp2350")
+    list(APPEND _port_level_cases
+         "9|one hardware state through two registers.*0xD0020018.*RP SIO GPIO17, its output level[.:]")
+endif()
+kvasir_conformance_must_fail(
+    NAME
+    port_levels_must_fail
+    PROJECT
+    chip_${CONFORMANCE_CHIP}_conformance
+    SOURCE
+    port_levels_must_fail.cpp
+    DEFINE
+    PORT_FAIL
+    CASES
+    ${_port_level_cases})
