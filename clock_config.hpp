@@ -1,5 +1,6 @@
 #pragma once
 #include "Clocks.hpp"
+#include "CrystalCounts.hpp"
 #include "FlashOps.hpp"
 #include "FlashTimingMath.hpp"
 #include "PllSearch.hpp"
@@ -157,6 +158,17 @@ namespace Kvasir { namespace Clocks {
         std::uint32_t worstStep;   // the largest difference of two nonzero counts in a row
         std::uint32_t
           worstStepFrom;   // the count before it: the tolerance there was worstStepFrom >> toleranceShift
+        // worstStep split at the run that settled the check (its last `agree` counts; Clocks::Detail::CrystalCounts):
+        // the largest step within the run (0 unless settled; within the tolerance by definition), and the largest
+        // before it - the step into the run included, every step of a check that did not settle: a crystal still
+        // starting up into the first counts shows there, not in the run. Each with the count before it, as
+        // worstStepFrom; worstStep is the larger of the two.
+        std::uint32_t worstStepSettled;
+        std::uint32_t worstStepSettledFrom;
+        std::uint32_t worstStepBeforeSettled;
+        std::uint32_t worstStepBeforeSettledFrom;
+        std::uint32_t
+          countsDiscarded;         // counts before the run that settled (all of them when none did)
         std::uint32_t refKhz;      // FC0_REF_KHZ the counts assumed (clk_ref's ceiling on the ROSC)
         std::uint32_t clkRefDiv;   // CLK_REF_DIV.INT as counted: clk_ref = the ROSC's output / this
         std::uint32_t
@@ -396,7 +408,7 @@ namespace Kvasir { namespace DefaultClockSettings {
         // what is counted is the crystal against it, before anything runs from the crystal. A crystal clk_ref already
         // runs from (a degraded boot on the crystal, a resus repair's clk_ref, crystalStarted()'s run-time callers) is
         // settled: nothing to count it against, and switching it off would stop clk_ref and clk_sys for good. What the
-        // counts came to goes into the record @p c (its statistics kept in registers, stored once at the end).
+        // counts came to goes into the record @p c.
         template<auto CrystalSpeed>
         [[nodiscard]] inline bool crystalSettled(Clocks::CrystalCheck* c) {
             using Config          = XoscConfig<CrystalSpeed>;
@@ -412,64 +424,36 @@ namespace Kvasir { namespace DefaultClockSettings {
                     if constexpr(record) { c->outcome = Outcome::alreadyOnCrystal; }
                     return true;
                 }
-                static_assert(Config::agree >= 2,
-                              "XoscMeasured compares counts: agree is at least 2");
-                std::uint32_t previous = 0;
-                std::uint32_t run
-                  = 0;   // counts in a row, each within the tolerance of the one before
-                std::uint32_t n = 0;
-                // the record's, kept in registers while counting: one store each at the end
-                std::uint32_t zeros     = 0;
-                std::uint32_t best      = 0;
-                std::uint32_t lo        = 0xFFFF'FFFFU;
-                std::uint32_t hi        = 0;
-                std::uint32_t worst     = 0;
-                std::uint32_t worstFrom = 0;
-                bool          settled   = false;
-                while(n != Config::maxCounts) {
+                // the counts and the record's statistics (CrystalCounts.hpp): a local, stored into the record once
+                Clocks::Detail::CrystalCounts<Config::agree, Config::toleranceShift, record>
+                  counts{};
+                while(counts.n != Config::maxCounts) {
                     // FC0 is shared with Clocks::Resus's handler (FrequencyCounter, ClockOutput.hpp): a run-time
                     // caller (DegradedBoot, a resus repair) counts with interrupts masked; at boot they are anyway
                     std::uint32_t const count = [] {
                         Kvasir::Core::IrqGuard const guard{};
                         return xoscCount<Config>();
                     }();
-                    ++n;
-                    std::uint32_t const diff
-                      = count > previous ? count - previous : previous - count;
-                    bool const agrees
-                      = count != 0 && previous != 0 && diff <= (previous >> Config::toleranceShift);
-                    run = agrees ? run + 1 : 1;
-                    if constexpr(record) {
-                        if(count == 0) {
-                            ++zeros;
-                        } else {
-                            lo   = count < lo ? count : lo;
-                            hi   = count > hi ? count : hi;
-                            best = run > best ? run : best;
-                            if(previous != 0 && diff > worst) {
-                                worst     = diff;
-                                worstFrom = previous;
-                            }
-                        }
-                    }
-                    previous = count;
-                    if(count != 0 && run >= Config::agree) {
-                        settled = true;
-                        break;
-                    }
+                    if(counts.add(count)) { break; }
                 }
                 if constexpr(record) {
-                    c->counts        = n;
-                    c->zeroCounts    = zeros;
-                    c->bestRun       = best;
-                    c->minCount      = hi == 0 ? 0 : lo;
-                    c->maxCount      = hi;
-                    c->lastCount     = previous;
-                    c->worstStep     = worst;
-                    c->worstStepFrom = worstFrom;
-                    c->outcome       = settled ? Outcome::settled : Outcome::notSettled;
+                    counts.finish();
+                    c->counts                     = counts.n;
+                    c->zeroCounts                 = counts.zeroCounts;
+                    c->bestRun                    = counts.bestRun;
+                    c->minCount                   = counts.minCount();
+                    c->maxCount                   = counts.hi;
+                    c->lastCount                  = counts.previous;
+                    c->worstStep                  = counts.worstStep();
+                    c->worstStepFrom              = counts.worstStepFrom();
+                    c->worstStepSettled           = counts.inRun;
+                    c->worstStepSettledFrom       = counts.inRunFrom;
+                    c->worstStepBeforeSettled     = counts.before;
+                    c->worstStepBeforeSettledFrom = counts.beforeFrom;
+                    c->countsDiscarded            = counts.discarded();
+                    c->outcome = counts.settled ? Outcome::settled : Outcome::notSettled;
                 }
-                if(settled) { return true; }
+                if(counts.settled) { return true; }
                 using XOSC = Kvasir::Peripheral::XOSC::Registers<>;
                 apply(write(XOSC::CTRL::ENABLEValC::disable));
                 return false;
@@ -1592,6 +1576,23 @@ namespace Kvasir { namespace Clocks {
         return initFinished() ? InitResult::ok : Detail::whereInitStopped();
     }
 
+    namespace Detail {
+        // onVerifiedFullClock() on clk_sys in kHz from @p countClkSysKhz(), asked only where the registers left a
+        // question (XipTiming.hpp xipTimingTrustedBy)
+        template<typename... Dep,
+                 typename CountKhz>
+        [[nodiscard]] inline bool onVerifiedFullClockBy(CountKhz const& countClkSysKhz) {
+            if(!Clocks::initFinished() || !Clocks::sysOnPllSys() || fastTimingKhz == 0) {
+                return false;
+            }
+            if constexpr(verifiesClkSys<Dep...>()) {
+                return withinTolerance(countClkSysKhz(), fastTimingKhz);
+            } else {
+                return true;
+            }
+        }
+    }   // namespace Detail
+
     /// clk_sys runs from PLL_SYS at the full clock the boot (or a degraded boot's switch-up) verified, counted against
     /// the crystal again now (XipTiming.hpp), and clk_usb and clk_adc from PLL_USB: the tree the image is built for -
     /// measured, not only selected. On the RP2350 the flash runs on the full clock's timing then. What a write the next
@@ -1599,12 +1600,15 @@ namespace Kvasir { namespace Clocks {
     /// Clocks::XoscStartupConfig's verifyClkSys none - the registers' word for it.
     template<typename... Dep>
     [[nodiscard]] inline bool onVerifiedFullClock() {
-        if(!initFinished() || !sysOnPllSys() || Detail::fastTimingKhz == 0) { return false; }
-        if constexpr(Detail::verifiesClkSys<Dep...>()) {
-            return clkSysAt(Detail::fastTimingKhz);
-        } else {
-            return true;
-        }
+        return Detail::onVerifiedFullClockBy<Dep...>([] { return clkSysKhz(); });
+    }
+
+    /// onVerifiedFullClock() on a count of clk_sys the caller made instead of one made now, as xipTimingTrustedAt() is
+    /// to xipTimingTrusted(): @p countedKhz in kHz against the crystal, clk_ref on it undivided (what clkSysKhz()
+    /// counts; 0 for none). For a report; as old as that count, so a buy asks onVerifiedFullClock().
+    template<typename... Dep>
+    [[nodiscard]] inline bool onVerifiedFullClockAt(std::uint32_t countedKhz) {
+        return Detail::onVerifiedFullClockBy<Dep...>([countedKhz] { return countedKhz; });
     }
 
     /// The last clock init's crystal check (DefaultClockSettings::coreClockInit: the boot's, until a resus repair runs

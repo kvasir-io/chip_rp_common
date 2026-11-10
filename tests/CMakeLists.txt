@@ -14,6 +14,9 @@ cmake_minimum_required(VERSION 3.28)
 # * adc_math_test.cpp: the ADC pacer divider and the channel-attribution check (AdcMath.hpp).
 # * reset_cause_test.cpp: the reset-cause decision (ResetCauseRules.hpp): a SYSRESETREQ after a RUN-pin reset is not
 #   "RUN".
+# * crystal_counts_test.cpp: the crystal check's counts (CrystalCounts.hpp): when they settle, the record's worst step
+#   split at the settled run and the counts discarded, against the loop before the split and the split worked out
+#   afterwards.
 # * pin_function_test.cpp: the pin-function formulas and the drivers' pin check (PinConfig.hpp functionSelect,
 #   isValidPin, the refusal's text) against RP2040 Table 2 / RP2350 Table 645.
 # * register_alias_test.cpp, pll_search_test.cpp: the RP alias backend on the Kvasir SDK's register mock, the PLL search
@@ -118,6 +121,12 @@ add_executable(reset_cause_test reset_cause_test.cpp)
 target_include_directories(reset_cause_test PRIVATE ${_chip_rp_common})
 target_compile_options(reset_cause_test PRIVATE ${_warnings})
 add_test(NAME reset_cause_test COMMAND reset_cause_test)
+
+# ---- the crystal check's counts (CrystalCounts.hpp): fixed sequences (static_assert) and a seeded sweep
+add_executable(crystal_counts_test crystal_counts_test.cpp)
+target_include_directories(crystal_counts_test PRIVATE ${_chip_rp_common})
+target_compile_options(crystal_counts_test PRIVATE ${_warnings})
+add_test(NAME crystal_counts_test COMMAND crystal_counts_test)
 
 # ---- the pin-function formulas (PinConfig.hpp) against the datasheets' tables, for all three variants: building is the
 # test (static_assert). PinConfig.hpp wants a chip identity; the test names the variants itself.
@@ -240,6 +249,7 @@ list(
     pwm_math_test.cpp
     adc_math_test.cpp
     reset_cause_test.cpp
+    crystal_counts_test.cpp
     watchdog_math_test.cpp
     flash_timing_math_test.cpp)
 set(_abs_sources)

@@ -18,9 +18,10 @@
 //
 // So the clock init records where it applies a timing of that kind and for which clock (clock_config.hpp
 // peripheryClockInit, flashAfterSwitchUp - each only after counting clk_sys at that speed against the crystal), and
-// xipTimingTrusted() counts clk_sys again against the crystal before a write (Flash::Region). Registers and plain
-// variables; the count masks interrupts for its ~0.25 ms alone. Clocks::XoscStartupConfig's verifyClkSys (on by
-// default) switches the counts off: the registers' word for it then (XoscStartupConfig.hpp).
+// xipTimingTrusted() counts clk_sys again against the crystal before a write (Flash::Region); xipTimingTrustedAt()
+// answers on a count the caller made. Registers and plain variables; the count masks interrupts for its ~0.25 ms alone.
+// Clocks::XoscStartupConfig's verifyClkSys (on by default) switches the counts off: the registers' word for it then
+// (XoscStartupConfig.hpp).
 #include "XoscStartupConfig.hpp"
 #include "core/InterruptMask.hpp"
 #include "kvasir/Register/Register.hpp"
@@ -178,6 +179,29 @@ namespace Kvasir { namespace Clocks {
             && !readsAtAnySlowerClock(2,
                                       2),
           "the full clock's at 200 MHz (CLKDIV 2, RXDELAY 3) and at 150 MHz (RXDELAY 2)");
+
+        // xipTimingTrusted() on clk_sys in kHz from @p countClkSysKhz(), asked only where the timing in effect needs it
+        template<typename... Dep,
+                 typename CountKhz>
+        [[nodiscard]] inline bool xipTimingTrustedBy(CountKhz const& countClkSysKhz) {
+#ifdef KVASIR_CHIP_RP2350
+            using Timing = Kvasir::Peripheral::QMI::Registers<0>::M0_TIMING;
+            auto const t = apply(read(Timing::rxdelay), read(Timing::clkdiv));   // one load
+            if(readsAtAnySlowerClock(static_cast<std::uint32_t>(get<0>(t)),
+                                     static_cast<std::uint32_t>(get<1>(t))))
+            {
+                return true;
+            }
+            if constexpr(verifiesClkSys<Dep...>()) {
+                return fastTimingKhz != 0 && withinTolerance(countClkSysKhz(), fastTimingKhz);
+            } else {
+                return fastTimingKhz != 0;
+            }
+#else
+            static_cast<void>(countClkSysKhz);
+            return true;
+#endif
+        }
     }   // namespace Detail
 
     /// Whether XIP reads come back right at the clock clk_sys runs at now (the top of this header): a timing whose
@@ -187,21 +211,15 @@ namespace Kvasir { namespace Clocks {
     /// tree the registers showed. The RP2040's SSI is not timed this way: true there.
     template<typename... Dep>
     [[nodiscard]] inline bool xipTimingTrusted() {
-#ifdef KVASIR_CHIP_RP2350
-        using Timing = Kvasir::Peripheral::QMI::Registers<0>::M0_TIMING;
-        auto const t = apply(read(Timing::rxdelay), read(Timing::clkdiv));   // one load
-        if(Detail::readsAtAnySlowerClock(static_cast<std::uint32_t>(get<0>(t)),
-                                         static_cast<std::uint32_t>(get<1>(t))))
-        {
-            return true;
-        }
-        if constexpr(Detail::verifiesClkSys<Dep...>()) {
-            return Detail::fastTimingKhz != 0 && clkSysAt(Detail::fastTimingKhz);
-        } else {
-            return Detail::fastTimingKhz != 0;
-        }
-#else
-        return true;
-#endif
+        return Detail::xipTimingTrustedBy<Dep...>([] { return clkSysKhz(); });
+    }
+
+    /// xipTimingTrusted() on a count of clk_sys the caller made instead of one made now: @p countedKhz in kHz, counted
+    /// by FC0 against the crystal with clk_ref on it undivided (what clkSysKhz() counts; 0 for none). For a report that
+    /// must not wait the ~0.25 ms a count masks interrupts for, the caller counting in the background; the answer is as
+    /// old as that count, so a flash write asks xipTimingTrusted().
+    template<typename... Dep>
+    [[nodiscard]] inline bool xipTimingTrustedAt(std::uint32_t countedKhz) {
+        return Detail::xipTimingTrustedBy<Dep...>([countedKhz] { return countedKhz; });
     }
 }}   // namespace Kvasir::Clocks
