@@ -45,6 +45,7 @@
 #include "chip_reset.hpp"
 #include "kvasir/Port/LinkerSymbols.hpp"
 #include "kvasir/Register/Register.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/attributes.hpp"
 
 #include <cstdint>
@@ -214,7 +215,7 @@ struct Guard {
       , scratch6{get<0>(apply(read(WD::SCRATCH6::FULLREGISTER)))}
       , scratch7{get<0>(apply(read(WD::SCRATCH7::FULLREGISTER)))} {
         Rp::WatchdogBoot::arm(
-          static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&Detail::entry)) | 1U,
+          Kvasir::busAddress(&Detail::entry) | 1U,
           static_cast<std::uint32_t>(Kvasir::Startup::PrimaryStackTop::value()));
     }
 

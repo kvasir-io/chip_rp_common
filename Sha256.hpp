@@ -128,7 +128,7 @@ namespace Kvasir { namespace Sha256 {
                                                              .incrementRead  = true,
                                                              .incrementWrite = false}>(
               Regs::WDATA::Addr::value,
-              reinterpret_cast<std::uint32_t>(data.data()),
+              data.data(),
               blocks / 4,
               [cb = std::forward<F>(f)]() {
                   update(tail_);

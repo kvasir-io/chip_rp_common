@@ -6,6 +6,7 @@
 #include "chip/rp_common/PioStateMachine.hpp"
 #include "chip/rp_common/pio/PioQspiProgram.hpp"
 #include "kvasir/Io/Types.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/Link.hpp"
 #include "peripherals/PIO.hpp"
@@ -259,8 +260,8 @@ namespace Kvasir { namespace Display {
 
         template<typename Dma::TransferSize Size,
                  bool                       IncrementSource>
-        static void startPayloadDma(std::uint32_t source,
-                                    std::size_t   count) {
+        static void startPayloadDma(BusAddress  source,
+                                    std::size_t count) {
             // A narrow write is replicated across the 32 bit word, so an 8 bit transfer
             // lands in OSR[31:24]: no alignment or byte swapping (as ws2812.hpp does).
             Dma::template start<DmaChannel,
@@ -331,9 +332,7 @@ namespace Kvasir { namespace Display {
 
             enterPhase(Program::offset("quad"));
             configureWriteShift<8>();
-            startPayloadDma<Dma::TransferSize::size8, true>(
-              reinterpret_cast<std::uint32_t>(data.data()),
-              data.size());
+            startPayloadDma<Dma::TransferSize::size8, true>(data.data(), data.size());
             setEnabled(true);
 
             deadline_ = Clock::now() + Config::timeout;
@@ -360,9 +359,7 @@ namespace Kvasir { namespace Display {
 
             enterPhase(Program::offset("quad"));
             configureWriteShift<16>();
-            startPayloadDma<Dma::TransferSize::size16, false>(
-              reinterpret_cast<std::uint32_t>(&fillWord_),
-              pixels);
+            startPayloadDma<Dma::TransferSize::size16, false>(&fillWord_, pixels);
             setEnabled(true);
 
             deadline_ = Clock::now() + Config::timeout;

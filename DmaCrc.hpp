@@ -45,6 +45,7 @@
 #include "kvasir/Register/Wait.hpp"
 #include "kvasir/Runtime/CrcImageEngine.hpp"
 #include "kvasir/StartUp/Resources.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/Crc.hpp"
 #include "kvasir/Util/Result.hpp"
 
@@ -208,16 +209,13 @@ namespace Detail {
         while(count != 0) {
             std::uint32_t const n = std::min(count, maxTransfersPerStart);
             DMA::template start<Channel,
-                                ::Kvasir::DMA::ChannelConfig{.priority = DMA::Priority::low,
-                                                             .trigger
-                                                             = DMA::TriggerSource::permanent,
-                                                             .size           = Size,
-                                                             .incrementRead  = true,
-                                                             .incrementWrite = false,
-                                                             .sniff          = true}>(
-              reinterpret_cast<std::uint32_t>(std::addressof(sniffSink<DMA, Channel>)),
-              from,
-              n);
+                                ::Kvasir::DMA::ChannelConfig{
+                                  .priority       = DMA::Priority::low,
+                                  .trigger        = DMA::TriggerSource::permanent,
+                                  .size           = Size,
+                                  .incrementRead  = true,
+                                  .incrementWrite = false,
+                                  .sniff = true}>(std::addressof(sniffSink<DMA, Channel>), from, n);
             bool const done = static_cast<bool>(
               Kvasir::Register::waitUntil<SniffBusyBound, Kvasir::Register::OnTimeout::Report>(
                 Kvasir::Register::isClear(Ctrl::busy)));
@@ -249,7 +247,7 @@ namespace Detail {
     template<typename DMA,
              typename DMA::Channel Channel>
     [[nodiscard]] inline std::optional<Failure> feed(std::span<std::byte const> data) {
-        auto const          a     = reinterpret_cast<std::uint32_t>(data.data());
+        auto const          a     = Kvasir::busAddress(data.data());
         auto const          n     = static_cast<std::uint32_t>(data.size());
         std::uint32_t const head  = std::min<std::uint32_t>((4U - (a & 3U)) & 3U, n);
         std::uint32_t const words = (n - head) / 4U;
@@ -309,7 +307,7 @@ sniff(std::span<std::byte const> data) {
     armSniffer<S, DMA, Channel>();
     if(!data.empty()) {
         if(auto const f = Detail::sniffed<DMA, Channel, DMA::TransferSize::size8>(
-             reinterpret_cast<std::uint32_t>(data.data()),
+             Kvasir::busAddress(data.data()),
              static_cast<std::uint32_t>(data.size())))
         {
             return std::unexpected{*f};

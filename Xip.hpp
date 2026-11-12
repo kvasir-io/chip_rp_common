@@ -80,7 +80,7 @@ namespace Kvasir { namespace Xip {
                                                          .size     = Dma::TransferSize::size32,
                                                          .incrementRead  = false,
                                                          .incrementWrite = true}>(
-          reinterpret_cast<std::uint32_t>(into),
+          into,
           streamFifoAux,
           words,
           std::forward<F>(f));

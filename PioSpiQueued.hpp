@@ -351,7 +351,7 @@ namespace Kvasir { namespace SPI {
                                           .size           = Dma::TransferSize::size8,
                                           .incrementRead  = false,
                                           .incrementWrite = Inc}>(
-                      reinterpret_cast<std::uint32_t>(t.rx),
+                      t.rx,
                       Sm::rxFifoAddress,
                       t.frames,
                       [gen]() {
@@ -381,10 +381,9 @@ namespace Kvasir { namespace SPI {
                                           .trigger        = Sm::template txDmaTrigger<Dma>(),
                                           .size           = Dma::TransferSize::size8,
                                           .incrementRead  = Inc,
-                                          .incrementWrite = false}>(
-                      Sm::txFifoAddress,
-                      reinterpret_cast<std::uint32_t>(t.tx),
-                      t.frames);
+                                          .incrementWrite = false}>(Sm::txFifoAddress,
+                                                                    t.tx,
+                                                                    t.frames);
                 }
 
                 static void startRx_(Transfer const& t,

@@ -184,15 +184,14 @@ namespace Kvasir { namespace Pio {
             Sm::clearTxStall();
 
             Dma::template start<DmaChannel,
-                                ::Kvasir::DMA::ChannelConfig{.priority = DmaPriority,
-                                                             .trigger
-                                                             = Sm::template txDmaTrigger<Dma>(),
-                                                             .size = Dma::TransferSize::size8,
-                                                             .incrementRead  = true,
-                                                             .incrementWrite = false}>(
-              Sm::txFifoAddress,
-              reinterpret_cast<std::uint32_t>(leds.data()),
-              leds.size() * sizeof(RGB));
+                                ::Kvasir::DMA::ChannelConfig{
+                                  .priority       = DmaPriority,
+                                  .trigger        = Sm::template txDmaTrigger<Dma>(),
+                                  .size           = Dma::TransferSize::size8,
+                                  .incrementRead  = true,
+                                  .incrementWrite = false}>(Sm::txFifoAddress,
+                                                            leds.data(),
+                                                            leds.size() * sizeof(RGB));
 
             running = true;
             return true;

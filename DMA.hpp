@@ -8,6 +8,7 @@
 #include "kvasir/Atomic/CriticalSection.hpp"
 #include "kvasir/Hal/Dma.hpp"
 #include "kvasir/StartUp/Resources.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/StaticFunction.hpp"
 #include "peripherals/DMA.hpp"
@@ -162,8 +163,7 @@ namespace Kvasir { namespace DMA {
 
         template<typename T>
         static ControlBlock of(std::span<T const> data) {
-            return {static_cast<std::uint32_t>(data.size()),
-                    reinterpret_cast<std::uint32_t>(data.data())};
+            return {static_cast<std::uint32_t>(data.size()), busAddress(data.data())};
         }
     };
 
@@ -378,14 +378,14 @@ namespace Kvasir { namespace DMA {
         // register keeps the program order; CTRL_TRIG, the trigger, is written last.
         template<DMAChannel    Channel,
                  ChannelConfig Cfg>
-        static void program(std::uint32_t dest,
-                            std::uint32_t source,
-                            std::size_t   count) {
+        static void program(BusAddress  dest,
+                            BusAddress  source,
+                            std::size_t count) {
             using CHRegs = typename Regs::template CH<static_cast<unsigned>(Channel)>;
 
             beforeTrigger();
-            apply(write(CHRegs::READ_ADDR::read_addr, source));
-            apply(write(CHRegs::WRITE_ADDR::write_addr, dest));
+            apply(write(CHRegs::READ_ADDR::read_addr, source.value));
+            apply(write(CHRegs::WRITE_ADDR::write_addr, dest.value));
             apply(write(CHRegs::TRANS_COUNT::trans_count, static_cast<std::uint32_t>(count)));
             apply(write(CHRegs::CTRL_TRIG::FULLREGISTER,
                         Register::value<controlWord<Channel, Cfg>()>()));
@@ -393,23 +393,25 @@ namespace Kvasir { namespace DMA {
 
     public:
         /// Program `Channel` for `Cfg` and start it (CTRL_TRIG): `count` transfers from `source` to `dest`.
-        /// `f` runs on completion; std::nullopt clears the channel's callback.
+        /// `f` runs on completion; std::nullopt clears the channel's callback. Either side is a register's
+        /// address (`Regs::X::Addr::value`) or memory (a pointer, `buffer.data()`): Kvasir::BusAddress takes both,
+        /// in every function here.
         template<DMAChannel    Channel,
                  ChannelConfig Cfg,
                  typename F>
-        static void start(std::uint32_t dest,
-                          std::uint32_t source,
-                          std::size_t   count,
-                          F&&           f) {
+        static void start(BusAddress  dest,
+                          BusAddress  source,
+                          std::size_t count,
+                          F&&         f) {
             installCallback<Channel>(std::forward<F>(f));
             program<Channel, Cfg>(dest, source, count);
         }
 
         template<DMAChannel    Channel,
                  ChannelConfig Cfg>
-        static void start(std::uint32_t dest,
-                          std::uint32_t source,
-                          std::size_t   count) {
+        static void start(BusAddress  dest,
+                          BusAddress  source,
+                          std::size_t count) {
             start<Channel, Cfg>(dest, source, count, std::nullopt);
         }
 
@@ -428,10 +430,7 @@ namespace Kvasir { namespace DMA {
             static_assert(sizeof(T) == (1U << static_cast<unsigned>(Cfg.size)),
                           "element width does not match the transfer size");
             if(dest.size() < source.size()) { return false; }
-            start<Channel, Cfg>(std::bit_cast<std::uint32_t>(dest.data()),
-                                std::bit_cast<std::uint32_t>(source.data()),
-                                source.size(),
-                                std::forward<F>(f));
+            start<Channel, Cfg>(dest.data(), source.data(), source.size(), std::forward<F>(f));
             return true;
         }
 
@@ -439,9 +438,9 @@ namespace Kvasir { namespace DMA {
         // it. Needs a prior start(); abort() clears the callback.
         template<DMAChannel    Channel,
                  ChannelConfig Cfg>
-        static void retrigger(std::uint32_t dest,
-                              std::uint32_t source,
-                              std::size_t   count) {
+        static void retrigger(BusAddress  dest,
+                              BusAddress  source,
+                              std::size_t count) {
             program<Channel, Cfg>(dest, source, count);
         }
 
@@ -479,24 +478,24 @@ namespace Kvasir { namespace DMA {
         template<DMAChannel    Channel,
                  ChannelConfig Cfg,
                  typename F>
-        static void configure(std::uint32_t dest,
-                              std::uint32_t source,
-                              std::size_t   count,
-                              F&&           f) {
+        static void configure(BusAddress  dest,
+                              BusAddress  source,
+                              std::size_t count,
+                              F&&         f) {
             using CHRegs = typename Regs::template CH<static_cast<unsigned>(Channel)>;
             installCallback<Channel>(std::forward<F>(f));
             beforeTrigger();   // AL1_CTRL enables it: a running channel may chain to it at once
-            apply(write(CHRegs::READ_ADDR::read_addr, source));
-            apply(write(CHRegs::WRITE_ADDR::write_addr, dest));
+            apply(write(CHRegs::READ_ADDR::read_addr, source.value));
+            apply(write(CHRegs::WRITE_ADDR::write_addr, dest.value));
             apply(write(CHRegs::TRANS_COUNT::trans_count, static_cast<std::uint32_t>(count)));
             apply(write(CHRegs::AL1_CTRL::FULLREGISTER, controlWord<Channel, Cfg>()));
         }
 
         template<DMAChannel    Channel,
                  ChannelConfig Cfg>
-        static void configure(std::uint32_t dest,
-                              std::uint32_t source,
-                              std::size_t   count) {
+        static void configure(BusAddress  dest,
+                              BusAddress  source,
+                              std::size_t count) {
             configure<Channel, Cfg>(dest, source, count, std::nullopt);
         }
 
@@ -525,7 +524,7 @@ namespace Kvasir { namespace DMA {
                  DMAChannel    Data,
                  ChannelConfig DataCfg,
                  typename F>
-        static void startControlBlocks(std::uint32_t                 dest,
+        static void startControlBlocks(BusAddress                    dest,
                                        std::span<ControlBlock const> blocks,
                                        F&&                           f) {
             static_assert(ownsChannel(Ctrl) && ownsChannel(Data),
@@ -549,17 +548,15 @@ namespace Kvasir { namespace DMA {
             static_assert((al3TransCountAddress<Data> & 0x7U) == 0,
                           "the AL3 TRANS_COUNT / READ_ADDR_TRIG pair must be 8-byte aligned "
                           "for the control channel's ring");
-            configure<Data, dataCfg>(dest, 0, 0, std::forward<F>(f));
-            configure<Ctrl, ctrlCfg>(al3TransCountAddress<Data>,
-                                     reinterpret_cast<std::uint32_t>(blocks.data()),
-                                     2);
+            configure<Data, dataCfg>(dest, 0U, 0, std::forward<F>(f));
+            configure<Ctrl, ctrlCfg>(al3TransCountAddress<Data>, blocks.data(), 2);
             trigger<Ctrl>();
         }
 
         template<DMAChannel    Ctrl,
                  DMAChannel    Data,
                  ChannelConfig DataCfg>
-        static void startControlBlocks(std::uint32_t                 dest,
+        static void startControlBlocks(BusAddress                    dest,
                                        std::span<ControlBlock const> blocks) {
             startControlBlocks<Ctrl, Data, DataCfg>(dest, blocks, std::nullopt);
         }

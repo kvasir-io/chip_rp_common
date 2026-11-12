@@ -300,7 +300,7 @@ namespace Kvasir { namespace SPI {
                                                                      .size     = Size,
                                                                      .incrementRead  = false,
                                                                      .incrementWrite = Inc}>(
-                      reinterpret_cast<std::uint32_t>(t.rx),
+                      t.rx,
                       Regs::SSPDR::Addr::value,
                       t.frames,
                       [gen]() {
@@ -320,7 +320,7 @@ namespace Kvasir { namespace SPI {
                                                                      .incrementRead  = Inc,
                                                                      .incrementWrite = false}>(
                       Regs::SSPDR::Addr::value,
-                      reinterpret_cast<std::uint32_t>(t.tx),
+                      t.tx,
                       t.frames);
                 }
 

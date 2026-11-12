@@ -74,9 +74,7 @@ struct RpStream {
                                   .size           = Dma::TransferSize::size32,
                                   .incrementRead  = false,
                                   .incrementWrite = false,
-                                  .sniff          = true}>(reinterpret_cast<std::uint32_t>(&sink_),
-                                                  Kvasir::Xip::streamFifoAux,
-                                                  words);
+                                  .sniff = true}>(&sink_, Kvasir::Xip::streamFifoAux, words);
             if(!finished()) { return false; }
             a += words * 4U;
         }
@@ -98,10 +96,9 @@ private:
                                                          .size     = Dma::TransferSize::size8,
                                                          .incrementRead  = true,
                                                          .incrementWrite = false,
-                                                         .sniff          = true}>(
-          reinterpret_cast<std::uint32_t>(&sink_),
-          Kvasir::Flash::uncached(a),
-          n);
+                                                         .sniff = true}>(&sink_,
+                                                                         Kvasir::Flash::uncached(a),
+                                                                         n);
         return finished();
     }
 

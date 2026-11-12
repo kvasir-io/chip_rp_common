@@ -79,6 +79,7 @@
 #include "UARTStreamCursor.hpp"
 #include "kvasir/Atomic/BipBuffer.hpp"
 #include "kvasir/Atomic/CriticalSection.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 
 #include <algorithm>
 #include <array>
@@ -395,7 +396,7 @@ namespace Kvasir { namespace UART {
                 tx_.active = false;
                 return;
             }
-            auto const from = reinterpret_cast<std::uint32_t>(s.data());
+            auto const from = Kvasir::busAddress(s.data());
             tx_.inflight    = s.size();
             tx_.runEnd      = from + static_cast<std::uint32_t>(s.size());
             tx_.active      = true;
@@ -705,11 +706,10 @@ namespace Kvasir { namespace UART {
         static void startRxAt_(std::uint32_t at)
             requires streamsRx
         {
-            Dma::template configure<Rx::channel, rxConfig()>(
-              reinterpret_cast<std::uint32_t>(ring_.data() + (at & (ringElems - 1U))),
-              base::rxDmaSource,
-              segmentElems,
-              &onRxSegmentDone);
+            Dma::template configure<Rx::channel, rxConfig()>(ring_.data() + (at & (ringElems - 1U)),
+                                                             base::rxDmaSource,
+                                                             segmentElems,
+                                                             &onRxSegmentDone);
             Dma::template trigger<Rx::channel>();
         }
 

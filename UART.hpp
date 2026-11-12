@@ -14,6 +14,7 @@
 #include "kvasir/Io/Types.hpp"
 #include "kvasir/Log/LogLimited.hpp"
 #include "kvasir/Log/RateLimiter.hpp"
+#include "kvasir/Util/BusAddress.hpp"
 #include "kvasir/Util/Config.hpp"
 #include "kvasir/Util/Prescaler.hpp"
 #include "peripherals/UART.hpp"
@@ -532,7 +533,7 @@ namespace Kvasir { namespace UART {
                       + std::chrono::ceil<typename TimeClock::duration>(txTimeout(span.size())) +
                         typename TimeClock::duration{1};   // the tick in progress
             failed_   = false;
-            auto const from = reinterpret_cast<std::uint32_t>(span.data());
+            auto const from = Kvasir::busAddress(span.data());
             end_            = from + static_cast<std::uint32_t>(span.size());
             busy.store(true, std::memory_order_relaxed);
 

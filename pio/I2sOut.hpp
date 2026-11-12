@@ -284,7 +284,7 @@ namespace Kvasir { namespace Pio {
                 .size           = Dma::TransferSize::size32,
                 .incrementRead  = true,   // the buffer moves, the FIFO does not
                 .incrementWrite = false}>(Sm::txFifoAddress,
-                                          reinterpret_cast<std::uint32_t>(buffers[which].data()),
+                                          buffers[which].data(),
                                           bufferFrames,
                                           [] { onComplete_(); });
         }
@@ -303,9 +303,7 @@ namespace Kvasir { namespace Pio {
                   template dreqTxOf<Config_::smInstance>(),
                 .size           = Dma::TransferSize::size32,
                 .incrementRead  = true,
-                .incrementWrite = false}>(Sm::txFifoAddress,
-                                          reinterpret_cast<std::uint32_t>(buffers[next].data()),
-                                          bufferFrames);
+                .incrementWrite = false}>(Sm::txFifoAddress, buffers[next].data(), bufferFrames);
             next = static_cast<std::uint8_t>(1U - next);
 
             if constexpr(statistics) {

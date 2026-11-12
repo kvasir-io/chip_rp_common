@@ -432,7 +432,7 @@ namespace Kvasir { namespace ADC {
                                                              .size     = Dma::TransferSize::size16,
                                                              .incrementRead  = false,
                                                              .incrementWrite = true}>(
-              reinterpret_cast<std::uint32_t>(bufferA_.data()),
+              bufferA_.data(),
               Regs::FIFO::Addr::value,
               BufferSize,
               []() { dmaComplete(); });
@@ -522,7 +522,7 @@ namespace Kvasir { namespace ADC {
                                                                  .size = Dma::TransferSize::size16,
                                                                  .incrementRead  = false,
                                                                  .incrementWrite = true}>(
-              reinterpret_cast<std::uint32_t>(next.data()),
+              next.data(),
               Regs::FIFO::Addr::value,
               BufferSize);
 
