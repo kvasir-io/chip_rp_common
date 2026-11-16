@@ -49,12 +49,14 @@ namespace Kvasir { namespace Detail {
 
     // One transaction on chip select 0 in QMI direct mode (RP2350 datasheet 12.14.5) at
     // clk_sys / clkdiv: byte i of `rx` arrives while byte i of `tx` goes out, the first `rxSize`
-    // are kept. XIP must be off. Plain pointers: hardened span accessors live in flash.
-    [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline void directTransaction(std::byte const* tx,
-                                                                 std::size_t      n,
-                                                                 std::byte*       rx,
-                                                                 std::size_t      rxSize,
-                                                                 std::uint32_t    clkdiv) {
+    // are kept. Returns the first four bytes that arrived, packed into a word, first byte lowest
+    // (a short command's reply needs no buffer). XIP must be off. Plain pointers: hardened span
+    // accessors live in flash.
+    [[KVASIR_RAM_FUNC_ATTRIBUTES]] inline std::uint32_t directTransaction(std::byte const* tx,
+                                                                          std::size_t      n,
+                                                                          std::byte*       rx,
+                                                                          std::size_t      rxSize,
+                                                                          std::uint32_t    clkdiv) {
         KVASIR_RAM_FUNC_MARK();
         using QMI = Kvasir::Peripheral::QMI::Registers<0>;
         using Csr = QMI::DIRECT_CSR;
@@ -69,8 +71,9 @@ namespace Kvasir { namespace Detail {
               clear(Csr::assert_cs1n),
               set(Csr::assert_cs0n),
               set(Csr::en));
-        std::size_t sent = 0;
-        std::size_t got  = 0;
+        std::size_t   sent  = 0;
+        std::size_t   got   = 0;
+        std::uint32_t first = 0;
         while(got < n) {
             auto const s = apply(read(Csr::txfull, Csr::rxempty));   // one load
             if(sent < n && s[Csr::txfull] == 0 && sent - got < 4) {
@@ -81,11 +84,13 @@ namespace Kvasir { namespace Detail {
             if(s[Csr::rxempty] == 0) {
                 auto const v = readWhole(QMI::DIRECT_RX::FULLREGISTER);   // the FIFO's data word
                 if(got < rxSize) { rx[got] = static_cast<std::byte>(v & 0xFFU); }
+                if(got < 4) { first |= (v & 0xFFU) << (8U * got); }
                 ++got;
             }
         }
         while(std::uint32_t{apply(read(Csr::busy))} != 0) {}
         directModeOff();
+        return first;
     }
 
     // A command of N bytes packed into a word, first byte lowest; returns the reply packed the
@@ -95,13 +100,8 @@ namespace Kvasir { namespace Detail {
                                                                       std::uint32_t clkdiv) {
         KVASIR_RAM_FUNC_MARK();
         static_assert(N >= 1 && N <= 4);
-        std::uint32_t rx = 0;
-        directTransaction(reinterpret_cast<std::byte const*>(&tx),
-                          N,
-                          reinterpret_cast<std::byte*>(&rx),
-                          N,
-                          clkdiv);
-        return rx;
+        // the reply comes back as a value: nothing is written into a word through a view of its bytes
+        return directTransaction(reinterpret_cast<std::byte const*>(&tx), N, nullptr, 0, clkdiv);
     }
 
     // 25 MHz at 150 MHz clk_sys, below the W25Q16JV's 104 MHz (datasheet rev H, AC

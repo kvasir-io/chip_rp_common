@@ -19,13 +19,13 @@
 #include "chip/Blocks.hpp"   // the chip's block table (Rp::Block)
 #include "chip/Interrupt.hpp"
 #include "core/core.hpp"
-#include "detail.hpp"
 #include "endpointOps.hpp"
 #include "kvasir/Hal/Owns.hpp"
 #include "kvasir/Log/FaultLog.hpp"
 #include "kvasir/Log/LogLimited.hpp"
 #include "kvasir/Log/RateLimiter.hpp"
 #include "kvasir/Register/Flags.hpp"
+#include "kvasir/Register/Memory.hpp"
 #include "kvasir/Util/Config.hpp"
 #include "peripherals/CLOCKS.hpp"
 #include "peripherals/PLL.hpp"
@@ -33,6 +33,7 @@
 #include "peripherals/USB.hpp"
 #include "peripherals/USB_DPRAM.hpp"
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -91,13 +92,15 @@ private:
 
     static constexpr auto interruptIndexes = brigand::list<decltype(Kvasir::Interrupt::usbctrl)>{};
 
+    // The last SETUP's eight bytes are the first eight of the device memory (RP2040 datasheet 4.1.2.7.2, RP2350
+    // datasheet 12.7.3.7.2). They are copied out as bytes, and the packet is their value ([bit.cast]) - nothing is
+    // copied into a SetupPacket from bytes that never were one.
     static SetupPacket getSetupPacket() {
-        SetupPacket ret;
-        Detail::deviceMemoryMemcpy(
-          std::addressof(ret),
-          reinterpret_cast<void const*>(BufferRegs::SETUP_PACKET_LOW::Addr::value),
-          sizeof(SetupPacket));
-        return ret;
+        std::array<std::byte, sizeof(SetupPacket)> raw;
+        Kvasir::Memory::loadBytesAligned(BufferRegs::SETUP_PACKET_LOW::Addr::value,
+                                         raw.data(),
+                                         raw.size());
+        return std::bit_cast<SetupPacket>(raw);
     }
 
     // IN transfer for an even bit index, OUT transfer for an odd one. Each bit is cleared before
@@ -341,8 +344,8 @@ public:
     }
 
     static void prepare() {
-        //can use std::memset here since it should always make alligned access.
-        std::memset(reinterpret_cast<void*>(BufferRegs::baseAddr), 0, dpsramSize);
+        // memset writes whole words where it can: no unaligned access to the device memory
+        Kvasir::Memory::fillBytes(BufferRegs::baseAddr, std::byte{0}, dpsramSize);
     }
 
     static void connect() {

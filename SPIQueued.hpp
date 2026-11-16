@@ -14,6 +14,8 @@
 #include "kvasir/Devices/SPI/QueuedFront.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -274,9 +276,8 @@ namespace Kvasir { namespace SPI {
                                               std::uint32_t    i,
                                               bool             wide) {
                     if(!wide) { return std::to_integer<std::uint32_t>(p[i]); }
-                    std::uint16_t h{};
-                    std::memcpy(&h, p + (2U * i), sizeof h);
-                    return h;
+                    // the halfword these two bytes are the value of ([bit.cast]), whatever object they belong to
+                    return std::bit_cast<std::uint16_t>(std::array{p[2U * i], p[(2U * i) + 1U]});
                 }
 
                 static void storeFrame_(std::byte*    p,

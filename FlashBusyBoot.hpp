@@ -238,6 +238,9 @@ struct Guard {
 /// Whether this boot follows entry()'s reboot - a reset stopped a flash operation and found the flash busy - and what
 /// entry() saw. The same answer for every call of a boot (PM::takeCarriedReason, the boot's first step).
 [[nodiscard]] inline std::optional<Report> atBoot() {
+    // A plain read on purpose. The record's writers are in this image or nowhere: where entry() is linked the
+    // compiler sees its stores, and in an image without it the compiler knows the record is never written and drops
+    // this report - right too, a record another image left in RAM is not this one's.
     Detail::Record const r = Detail::record;
     if(!PM::followsCarriedReset() || r.magic != Detail::recordMagic) { return std::nullopt; }
     return Report{.polls         = r.polls,

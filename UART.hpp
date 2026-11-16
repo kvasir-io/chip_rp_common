@@ -740,6 +740,18 @@ namespace Kvasir { namespace UART {
         // How often the receive interrupt ran: with the FIFO on, a fraction of the bytes.
         inline static std::atomic<std::uint32_t> rxInterrupts{0};
 
+        // Characters received as a break (UARTDR.BE: the line held low longer than a whole
+        // character, RP2040 datasheet md l.20107-20135; the same PL011 on the RP2350): the peer
+        // reset, lost its supply or let go of the line. A state of the line, not a character
+        // broken on its way, so it is counted here and not logged as a character error - whose
+        // driver expects it (a module it just reset) knows, the UART does not. Pushed as an empty
+        // optional like any character error.
+        inline static std::atomic<std::uint32_t> rxBreaks_{0};
+
+        [[nodiscard]] static std::uint32_t rxBreaks() {
+            return rxBreaks_.load(std::memory_order_relaxed);
+        }
+
         static void onIsr() {
             rxInterrupts.fetch_add(1, std::memory_order_relaxed);
             // what a give-up's set-up lost, before the first character after it (the comment above UartBehaviorImpl)
@@ -759,10 +771,14 @@ namespace Kvasir { namespace UART {
             // (RP2040 datasheet 4.2.6.2 / 4.2.6.4; the same PL011 on the RP2350).
             // One read per character (it pops the FIFO): the byte in bits 7:0 and its framing,
             // parity and break errors in bits 8-10 (UARTDR, RP2040 datasheet md l.20107-20135;
-            // the same PL011 on the RP2350). A character with one of them is pushed as empty.
+            // the same PL011 on the RP2350). A character with one of them is pushed as empty; a
+            // break (BE) is counted in rxBreaks(), the others logged.
             for(std::uint32_t n = 0; n != rxFifoDepth && !apply(read(Regs::UARTFR::rxfe)); ++n) {
                 auto const dr = static_cast<std::uint32_t>(apply(read(Regs::UARTDR::FULLREGISTER)));
-                if((dr & characterErrors) != 0) {
+                if(Kvasir::Register::extract(Regs::UARTDR::be, dr) != 0) {
+                    rxBreaks_.fetch_add(1, std::memory_order_relaxed);
+                    base::rxbuffer_.push(std::nullopt);
+                } else if((dr & characterErrors) != 0) {
                     KVASIR_LOG_LIMITED(characterErrorLog_.allow(),
                                        UC_LOG_E,
                                        "uart rx character error: DR {:#06x}",
@@ -779,7 +795,7 @@ namespace Kvasir { namespace UART {
         /// Detached, neither pin is the UART's: both are inputs without pulls, so nothing is
         /// driven into an unpowered module (an idle TX is high, and a high line into a chip
         /// without supply feeds it through its input) and nothing is taken from it -- its TX,
-        /// pulled low by the dead module, no longer reads as an endless break (a character error
+        /// pulled low by the dead module, no longer reads as an endless break (an rxBreaks() count
         /// per frame time). The receive interrupts are masked and a transmit in progress is
         /// abandoned: its DMA stops, and what the transmitter still holds (up to 32 bytes in the
         /// FIFO and the character in the shift register) is thrown away by a block reset - the

@@ -2,10 +2,10 @@
 
 #include "core/Barrier.hpp"
 #include "core/Delay.hpp"
-#include "detail.hpp"
 #include "kvasir/Log/FaultLog.hpp"
 #include "kvasir/Log/LogLimited.hpp"
 #include "kvasir/Log/RateLimiter.hpp"
+#include "kvasir/Register/Memory.hpp"
 
 #include <algorithm>
 #include <array>
@@ -168,9 +168,7 @@ private:
         static_assert(Buffer == 0 || Buffer == 1, "only dual buffered");
         static_assert(isIn, "span data transfer only for IN endpoints");
         if(!data.empty()) {
-            deviceMemoryMemcpy(reinterpret_cast<void*>(getBufferAddress<Buffer>()),
-                               data.data(),
-                               data.size());
+            Kvasir::Memory::storeBytesAligned(getBufferAddress<Buffer>(), data.data(), data.size());
         }
         writeBufferControl<Buffer, Last>(pid, static_cast<std::uint16_t>(data.size()));
     }
@@ -232,9 +230,7 @@ private:
               = std::min<std::uint16_t>(transferLength, static_cast<std::uint16_t>(dest.size()));
         }
 
-        deviceMemoryMemcpy(dest.data(),
-                           reinterpret_cast<void const*>(getBufferAddress<Buffer>()),
-                           transferLength);
+        Kvasir::Memory::loadBytesAligned(getBufferAddress<Buffer>(), dest.data(), transferLength);
 
         return transferLength;
     }
@@ -462,6 +458,26 @@ public:
               set(EPReg::interrupt_per_buff),
               write(EPReg::buffer_address, Kvasir::Register::value<getBufferOffset()>())));
         }
+    }
+
+    // OUT, optional in Backend.hpp: zero this endpoint's DPRAM buffers, both of a double-buffered one. A packet read
+    // out of a buffer stays there until the next one fills it, so a request that carried something secret (a key) is
+    // still in the controller's memory. Nothing is touched while a completed packet waits there to be read (its
+    // BUFF_STATUS bit: the interrupt has not taken it yet) - false then, try again once it is read. A buffer armed for
+    // the next packet is zeroed too: call it with the controller's interrupt masked, where the host sends nothing (it
+    // waits for an answer). A packet arriving in the middle of it reaches the application damaged: a framed protocol's
+    // check has to find that.
+    static bool wipeBuffers()
+        requires(!isIn)
+    {
+        constexpr auto pending = Kvasir::Register::bit<epBit>(Regs::BUFF_STATUS::FULLREGISTER);
+        if(apply(read(pending)) != 0) { return false; }
+        static constexpr std::array<std::byte, Kvasir::USB::maxPacketSize> zeros{};
+        Kvasir::Memory::storeBytesAligned(getBufferAddress<0>(), zeros.data(), zeros.size());
+        if constexpr(doubleBuffered) {
+            Kvasir::Memory::storeBytesAligned(getBufferAddress<1>(), zeros.data(), zeros.size());
+        }
+        return true;
     }
 };
 }   // namespace Kvasir::USB::Detail

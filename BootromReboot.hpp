@@ -54,6 +54,9 @@ namespace Bootrom {
     namespace RebootFlags {
         constexpr std::uint32_t rebootTypeNormal  = 0x0000;
         constexpr std::uint32_t rebootTypeBootsel = 0x0002;
+        // p0/p1: a window of SRAM the boot ROM searches for an image and launches in place, verified as a flash image
+        // is (pico-bootrom varm_boot_path.c, BOOT_TYPE_RAM_IMAGE); nothing valid there: BOOTSEL
+        constexpr std::uint32_t rebootTypeRamImage = 0x0003;
         // p0: the XIP address of the first byte of the flash just written (5.4.8.24; the boot ROM takes p0 - XIP_BASE
         // as the flash offset, pico-bootrom varm_boot_path.c)
         constexpr std::uint32_t rebootTypeFlashUpdate = 0x0004;

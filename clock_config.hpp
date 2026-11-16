@@ -1617,6 +1617,8 @@ namespace Kvasir { namespace Clocks {
     template<typename... Dep>
     [[nodiscard]] inline std::optional<CrystalCheck> lastInitCrystalCheck() {
         if constexpr(Detail::recordsCrystalCheck<Dep...>()) {
+            // A plain read: this run's own clock init wrote the record (through crystalCheckTarget's pointer), and
+            // the memory initialisation between the two leaves .noInit alone - no other run's content is read here.
             CrystalCheck const c = Detail::crystalCheckOfInit;
             if(c.magic != Detail::crystalCheckMagic) { return std::nullopt; }
             return c;

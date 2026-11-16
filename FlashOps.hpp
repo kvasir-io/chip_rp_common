@@ -73,6 +73,7 @@ namespace Flash {
         inline OpInFlight::Kind longestOpKind{OpInFlight::Kind::none};
 
         inline void takeAtBoot() {
+            // a plain read: this image's own operations are the record's only writers (as FlashBusyBoot's record)
             OpInFlight const op = opInFlight;
             opInFlight.magic    = 0;
             atBootTaken         = true;
